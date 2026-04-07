@@ -33,16 +33,12 @@ pub struct Config {
 
 fn default_port() -> u16 { 8080 }
 
-#[allow(dead_code)]
 pub struct ArchiveFileEntry {
     pub path: String,
     pub compressed_size: usize,
     pub uncompressed_size: usize,
-    pub compression_method: u16,
     pub local_header_offset: u64,
 }
-
-#[allow(dead_code)]
 pub struct FileEntry {
     pub name: String,
     // Optional directory path (relative virtual path) where the file is served.
@@ -69,7 +65,19 @@ pub enum FileType {
     Zip,
 }
 
-#[allow(dead_code)]
+impl FileEntry {
+    pub fn first_doc(&self) -> &Document {
+        match &self.doc {
+            Either::Left(d) => d,
+            Either::Right(v) => &v[0],
+        }
+    }
+
+    pub fn doc_name(&self) -> &str {
+        self.first_doc().name().unwrap_or(&self.name)
+    }
+}
+
 pub struct AppState {
     pub client: Client,
     pub index: HashMap<String, Vec<FileEntry>>,
@@ -101,19 +109,17 @@ pub struct Entry {
 }
 
 pub fn dir_listing(title: &str, parent: Option<&str>, entries: &[Entry]) -> String {
-    let mut body = format!(
-        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n\
-         <html>\n<head><title>{title}</title></head>\n<body>\n\
-         <h1>{title}</h1>\n<pre>\n"
-    );
+    use std::fmt::Write;
+    let mut body = String::new();
+    write!(body, "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<html>\n<head><title>{}</title></head>\n<body>\n<h1>{}</h1>\n<pre>\n", title, title).unwrap();
     if let Some(p) = parent {
-        body.push_str(&format!("<a href=\"{p}\">../</a>\n"));
+        write!(body, "<a href=\"{}\">../</a>\n", p).unwrap();
     }
     for e in entries {
         let size_str = e.size.map_or("-".to_string(), |s| human_size(s));
-        body.push_str(&format!("<a href=\"{}\">{}</a>  {}\n", e.href, e.label, size_str));
+        write!(body, "<a href=\"{}\">{}</a>  {}\n", e.href, e.label, size_str).unwrap();
     }
-    body.push_str("</pre>\n</body>\n</html>");
+    write!(body, "</pre>\n</body>\n</html>").unwrap();
     body
 }
 

@@ -27,7 +27,7 @@ struct AuthConfig {
 fn prompt(label: &str) -> String {
     print!("{}: ", label);
     io::stdout().flush().unwrap();
-    io::stdin().lock().lines().next().unwrap().unwrap()
+    io::stdin().lock().lines().next().unwrap().unwrap().trim().to_string()
 }
 
 fn load_or_create_auth() -> AuthConfig {
@@ -42,16 +42,11 @@ fn load_or_create_auth() -> AuthConfig {
     println!("No auth data found. Please enter your Telegram credentials.");
     println!("Get api_id and api_hash from https://my.telegram.org/apps");
 
-    let api_id_str = prompt("api_id");
-    let api_id: i32 = api_id_str.trim().parse().expect("api_id must be a number");
+    let api_id: i32 = prompt("api_id").parse().expect("api_id must be a number");
     let api_hash = prompt("api_hash");
     let phone = prompt("phone (e.g. +12345678900)");
 
-    let cfg = AuthConfig {
-        api_id,
-        api_hash: api_hash.trim().to_string(),
-        phone: phone.trim().to_string(),
-    };
+    let cfg = AuthConfig { api_id, api_hash, phone };
 
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     std::fs::write(AUTH_FILE, json).expect("failed to write auth file");
@@ -88,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
         let code = prompt("Enter the code you received");
 
-        match client.sign_in(&token, code.trim()).await {
+        match client.sign_in(&token, &code).await {
             Ok(_) => {}
             Err(SignInError::PasswordRequired(mut password_token)) => loop {
                 let password = rpassword::prompt_password("2FA password: ").unwrap();
@@ -106,10 +101,9 @@ async fn main() -> anyhow::Result<()> {
         println!("Signed in successfully.");
     }
 
-    let (index, mime_pool, channel_archive_view) = indexer::build_index(client.clone(), &config).await?;
+    let indexer::IndexBuildResult { index, mime_vec: mime_pool, channel_view_map: channel_archive_view } =
+        indexer::build_index(client.clone(), &config).await?;
     let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view });
-
-    
 
     let app = server::make_router(state);
 

@@ -1,12 +1,42 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::convert::TryInto;
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
 // tokio_stream::StreamExt not required; `.next()` is available on the iterator types used
 use crate::index::{Config, FileEntry, ArchiveFileEntry, ArchiveView};
 use either::Either;
+
+fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
+fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o+4].try_into().unwrap()) }
+
+fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
+    if raw.contains('/') {
+        let p = std::path::Path::new(raw);
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(raw).to_string();
+        let dir = p.parent().map(|pp| pp.to_path_buf());
+        (fname, dir)
+    } else {
+        (raw.to_string(), None)
+    }
+}
+
+fn classify_file_type(type_override: &Option<crate::index::FileType>, mime_type: &str, doc_name: &str) -> crate::index::FileType {
+    if let Some(t) = type_override { return t.clone(); }
+    if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
+        crate::index::FileType::Media
+    } else if mime_type == "application/zip" || doc_name.to_lowercase().ends_with(".zip") {
+        crate::index::FileType::Zip
+    } else {
+        crate::index::FileType::File
+    }
+}
+
+pub struct IndexBuildResult {
+    pub index: HashMap<String, Vec<FileEntry>>,
+    pub mime_vec: Vec<String>,
+    pub channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView>,
+}
 
 // Download a byte range from a concatenation of documents (parts).
 async fn download_range_concat(
@@ -90,8 +120,8 @@ fn find_eocd(tail: &[u8]) -> Option<(u64, u64)> {
     if tail.len() < 22 { return None; }
     for i in (0..=tail.len() - 22).rev() {
         if &tail[i..i+4] == [0x50,0x4b,0x05,0x06] {
-            let cd_size = u32::from_le_bytes(tail[i+12..i+16].try_into().unwrap()) as u64;
-            let cd_offset = u32::from_le_bytes(tail[i+16..i+20].try_into().unwrap()) as u64;
+            let cd_size = u32le(tail, i+12) as u64;
+            let cd_offset = u32le(tail, i+16) as u64;
             return Some((cd_offset, cd_size));
         }
     }
@@ -103,13 +133,12 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
     let mut entries = Vec::new();
     while i + 46 <= cd.len() {
         if &cd[i..i+4] != [0x50,0x4b,0x01,0x02] { break; }
-        let compression_method = u16::from_le_bytes(cd[i+10..i+12].try_into().unwrap());
-        let compressed_size = u32::from_le_bytes(cd[i+20..i+24].try_into().unwrap()) as usize;
-        let uncompressed_size = u32::from_le_bytes(cd[i+24..i+28].try_into().unwrap()) as usize;
-        let name_len = u16::from_le_bytes(cd[i+28..i+30].try_into().unwrap()) as usize;
-        let extra_len = u16::from_le_bytes(cd[i+30..i+32].try_into().unwrap()) as usize;
-        let comment_len = u16::from_le_bytes(cd[i+32..i+34].try_into().unwrap()) as usize;
-        let local_header_offset = u32::from_le_bytes(cd[i+42..i+46].try_into().unwrap()) as u64;
+        let compressed_size = u32le(cd, i+20) as usize;
+        let uncompressed_size = u32le(cd, i+24) as usize;
+        let name_len = u16le(cd, i+28) as usize;
+        let extra_len = u16le(cd, i+30) as usize;
+        let comment_len = u16le(cd, i+32) as usize;
+        let local_header_offset = u32le(cd, i+42) as u64;
         let var_start = i + 46;
         if var_start + name_len > cd.len() { break; }
         let name = String::from_utf8_lossy(&cd[var_start..var_start+name_len]).to_string();
@@ -119,7 +148,6 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
             path: name,
             compressed_size,
             uncompressed_size,
-            compression_method,
             local_header_offset,
         });
     }
@@ -154,7 +182,7 @@ fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<crat
     None
 }
 
-pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(HashMap<String, Vec<FileEntry>>, Vec<String>, std::collections::HashMap<String, crate::index::ArchiveView>)> {
+pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<IndexBuildResult> {
     let mut channel_peers = HashMap::new();
     let mut dialogs = client.iter_dialogs();
     while let Some(dialog) = dialogs.next().await? {
@@ -172,10 +200,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
     let mut mime_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut mime_vec: Vec<String> = Vec::new();
     // build channel -> archive_view map
-    let mut channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView> = std::collections::HashMap::new();
-    for ce in &config.channels {
-        channel_view_map.insert(ce.name.clone(), ce.archive_view);
-    }
+    let channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView> = config.channels.iter().map(|c| (c.name.clone(), c.archive_view)).collect();
 
     for entry in &config.channels {
         let name = &entry.name;
@@ -193,14 +218,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
             if let Some(Media::Document(doc)) = msg.media() {
                 let raw_name = resolve_filename(&msg, &doc);
                 // parse out optional path prefix from message `name:` override
-                let (file_name, path_opt) = if raw_name.contains('/') {
-                    let p = std::path::Path::new(&raw_name);
-                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(&raw_name).to_string();
-                    let dir = p.parent().map(|pp| pp.to_path_buf());
-                    (fname, dir)
-                } else {
-                    (raw_name, None)
-                };
+                let (file_name, path_opt) = split_name(&raw_name);
                 let type_override = resolve_type_override(&msg);
                 println!("Processing file: {}", file_name);
                 io::stdout().flush().ok();
@@ -211,16 +229,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
                 // 2) MIME/type (audio/video => media, application/zip => zip),
                 // 3) document filename extension (using the underlying
                 //    `Document` name, not a `name:` override).
-                let doc_name = doc.name().unwrap_or(&file_name).to_string();
-                let final_type = if let Some(t) = &type_override {
-                    t.clone()
-                } else if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
-                    crate::index::FileType::Media
-                } else if mime_type == "application/zip" || doc_name.to_lowercase().ends_with(".zip") {
-                    crate::index::FileType::Zip
-                } else {
-                    crate::index::FileType::File
-                };
+                let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
                 let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
                 if final_type == crate::index::FileType::Zip && entry.archive_view != ArchiveView::File {
                     println!("  fetching EOCD tail of '{}' for indexing", file_name);
@@ -240,15 +249,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
                     }
                 }
                 // intern mime_type
-                let mime_idx = match mime_map.get(&mime_type) {
-                    Some(&i) => i,
-                    None => {
-                        let i = mime_vec.len();
-                        mime_vec.push(mime_type.clone());
-                        mime_map.insert(mime_type.clone(), i);
-                        i
-                    }
-                };
+                let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
                 files.push(FileEntry { name: file_name, path: path_opt, doc: either::Either::Left(doc), size, mime_idx, archive_entries, file_type: final_type.clone() });
             }
         }
@@ -261,10 +262,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
         let re = Regex::new(r"^(?P<base>.+)\.(?P<part>\d{2})$").unwrap();
         let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
         for (i, f) in files.iter().enumerate() {
-            let doc_name = match &f.doc {
-                Either::Left(d) => d.name().unwrap_or(&f.name),
-                Either::Right(v) => v.get(0).and_then(|d| d.name()).unwrap_or(&f.name),
-            };
+            let doc_name = f.doc_name();
             if let Some(caps) = re.captures(doc_name) {
                 let base = caps.name("base").unwrap().as_str().to_string();
                 let part_num = caps.name("part").unwrap().as_str().parse::<usize>().unwrap_or(0);
@@ -289,10 +287,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
             // collect docs and sizes
             let mut docs: Vec<Document> = Vec::new();
             let mut total_size: Option<usize> = Some(0);
-            let mut parts_indices: Vec<usize> = Vec::new();
-            for (idx, _part) in &entries {
-                parts_indices.push(*idx);
-            }
+            let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
             for idx in &parts_indices {
                 let f = &files[*idx];
                 match &f.doc {
@@ -311,10 +306,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
             // find index with part == 0
                 if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
                 let f0 = &files[*first_idx];
-                let doc_name = match &f0.doc {
-                    Either::Left(d) => d.name().unwrap_or(&f0.name).to_string(),
-                    Either::Right(v) => v.get(0).and_then(|d| d.name()).unwrap_or(&f0.name).to_string(),
-                };
+                let doc_name = f0.doc_name().to_string();
                 if f0.name != doc_name { // message override present
                     exposed_name = f0.name.clone();
                 }
@@ -348,14 +340,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
             let combined_file_type = first.file_type.clone();
 
             // For combined entries the `exposed_name` may include a path.
-            let (exposed_base, exposed_path) = if exposed_name.contains('/') {
-                let p = std::path::Path::new(&exposed_name);
-                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(&exposed_name).to_string();
-                let dir = p.parent().map(|pp| pp.to_path_buf());
-                (fname, dir)
-            } else {
-                (exposed_name.clone(), None)
-            };
+            let (exposed_base, exposed_path) = split_name(&exposed_name);
 
             let combined = FileEntry {
                 name: exposed_base,
@@ -384,5 +369,5 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
         index.insert(name.clone(), new_files);
     }
 
-    Ok((index, mime_vec, channel_view_map))
+    Ok(IndexBuildResult { index, mime_vec, channel_view_map })
 }
