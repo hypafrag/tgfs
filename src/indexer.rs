@@ -3,12 +3,20 @@ use std::io::{self, Write};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
-// tokio_stream::StreamExt not required; `.next()` is available on the iterator types used
-use crate::index::{Config, FileEntry, ArchiveFileEntry, ArchiveView};
-use either::Either;
+use crate::index::{Config, FileEntry, ArchiveFileEntry, ArchiveView, DocParts};
+use smallvec::smallvec;
 
 fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
 fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o+4].try_into().unwrap()) }
+
+/// Detect a multipart-file suffix: `<base>.<digits>`. Returns `(base, part_num)`.
+/// Requires at least one digit after the final `.`.
+fn split_part_suffix(name: &str) -> Option<(&str, usize)> {
+    let dot = name.rfind('.')?;
+    let (base, rest) = (&name[..dot], &name[dot + 1..]);
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    Some((base, rest.parse().ok()?))
+}
 
 fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
     if raw.contains('/') {
@@ -38,82 +46,56 @@ pub struct IndexBuildResult {
     pub channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView>,
 }
 
-// Download a byte range from a concatenation of documents (parts).
-async fn download_range_concat(
+// Download a byte range [offset, offset+length) from Telegram, spanning one or
+// more concatenated document parts. A single-document file is just a 1-element
+// slice. Used by both the indexer (central-directory parsing, local-header reads)
+// and the server (archive inner-file header reads).
+pub async fn download_range(
     client: &Client,
     parts: &[Document],
     offset: usize,
     length: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    // build prefix sums of sizes
-    let mut sizes: Vec<usize> = Vec::with_capacity(parts.len());
-    for d in parts {
-        sizes.push(d.size().unwrap_or(0) as usize);
-    }
+    let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
     let total: usize = sizes.iter().sum();
     if offset >= total { return Ok(Vec::new()); }
     let to_read = std::cmp::min(length, total - offset);
 
-    let mut buf: Vec<u8> = Vec::with_capacity(to_read);
-
-    // find starting part
+    // locate starting part and in-part offset
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < sizes.len() && pos + sizes[i] <= offset { pos += sizes[i]; i += 1; }
+    let mut start_in_part = offset - pos;
 
+    let chunk_size: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(to_read);
     let mut need = to_read;
-    let mut start_in_part = offset.saturating_sub(pos);
     while i < parts.len() && need > 0 {
-        let doc = &parts[i];
         let avail = sizes[i].saturating_sub(start_in_part);
         if avail == 0 { i += 1; start_in_part = 0; continue; }
         let read_len = std::cmp::min(avail, need);
-        let chunk = download_range(client, doc, start_in_part, read_len).await?;
-        buf.extend_from_slice(&chunk);
-        need = need.saturating_sub(chunk.len());
+        let first_chunk = (start_in_part / chunk_size) as i32;
+        let offset_in_first = start_in_part % chunk_size;
+        let mut dl = client
+            .iter_download(&parts[i])
+            .chunk_size(chunk_size as i32)
+            .skip_chunks(first_chunk);
+        let mut part_buf: Vec<u8> = Vec::with_capacity(offset_in_first + read_len);
+        while let Ok(Some(chunk)) = dl.next().await {
+            part_buf.extend_from_slice(&chunk);
+            if part_buf.len() >= offset_in_first + read_len { break; }
+        }
+        if part_buf.len() <= offset_in_first {
+            return Err(anyhow::anyhow!("failed to download requested range"));
+        }
+        let end = std::cmp::min(part_buf.len(), offset_in_first + read_len);
+        buf.extend_from_slice(&part_buf[offset_in_first..end]);
+        need = need.saturating_sub(end - offset_in_first);
         i += 1;
         start_in_part = 0;
     }
 
     Ok(buf)
-}
-
-// Download a byte range [offset, offset+length) from Telegram using the chunked
-// downloader. Reused by server for ranged extraction as well.
-pub async fn download_range(
-    client: &Client,
-    doc: &Document,
-    offset: usize,
-    length: usize,
-) -> anyhow::Result<Vec<u8>> {
-    let size = doc.size().unwrap_or(0) as usize;
-    if offset >= size {
-        return Ok(Vec::new());
-    }
-    let to_read = std::cmp::min(length, size - offset);
-
-    let chunk_size: usize = 64 * 1024;
-    let first_chunk = (offset / chunk_size) as i32;
-    let offset_in_first = offset % chunk_size;
-
-    let mut dl = client
-        .iter_download(doc)
-        .chunk_size(chunk_size as i32)
-        .skip_chunks(first_chunk);
-
-    let mut buf: Vec<u8> = Vec::with_capacity(offset_in_first + to_read);
-    while let Ok(Some(chunk)) = dl.next().await {
-        buf.extend_from_slice(&chunk);
-        if buf.len() >= offset_in_first + to_read {
-            break;
-        }
-    }
-
-    if buf.len() <= offset_in_first {
-        return Err(anyhow::anyhow!("failed to download requested range"));
-    }
-
-    Ok(buf[offset_in_first..offset_in_first + to_read].to_vec())
 }
 
 fn find_eocd(tail: &[u8]) -> Option<(u64, u64)> {
@@ -237,10 +219,11 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     let size_usize = doc.size().unwrap_or(0) as usize;
                     let tail_len = std::cmp::min(size_usize, 70_000);
                     let tail_offset = size_usize.saturating_sub(tail_len);
-                    let tail = download_range(&client, &doc, tail_offset, tail_len).await?;
+                    let parts_one = [doc.clone()];
+                    let tail = download_range(&client, &parts_one, tail_offset, tail_len).await?;
                     if let Some((cd_off, cd_size)) = find_eocd(&tail) {
                         println!("    central directory at {} ({} bytes)", cd_off, cd_size);
-                        let cd_bytes = download_range(&client, &doc, cd_off as usize, cd_size as usize).await?;
+                        let cd_bytes = download_range(&client, &parts_one, cd_off as usize, cd_size as usize).await?;
                         let ae_list = parse_central_directory(&cd_bytes)?;
                         println!("  zip entries read: {}", ae_list.len());
                         archive_entries = Some(ae_list);
@@ -250,23 +233,19 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 }
                 // intern mime_type
                 let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                files.push(FileEntry { name: file_name, path: path_opt, doc: either::Either::Left(doc), size, mime_idx, archive_entries, file_type: final_type.clone() });
+                files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![doc], size, mime_idx, archive_entries, file_type: final_type.clone() });
             }
         }
         println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
         println!(" {} files (pre-group)", files.len());
 
         // Detect multipart files by inspecting the document filename (not message overrides).
-        // Pattern: <base>.<partnum> where <partnum> is two digits like 00, 01, 02...
-        use regex::Regex;
-        let re = Regex::new(r"^(?P<base>.+)\.(?P<part>\d{2})$").unwrap();
+        // Pattern: <base>.<N digits> e.g. foo.00, foo.01, ... Numbering must start at 0
+        // and be contiguous.
         let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
         for (i, f) in files.iter().enumerate() {
-            let doc_name = f.doc_name();
-            if let Some(caps) = re.captures(doc_name) {
-                let base = caps.name("base").unwrap().as_str().to_string();
-                let part_num = caps.name("part").unwrap().as_str().parse::<usize>().unwrap_or(0);
-                groups.entry(base).or_default().push((i, part_num));
+            if let Some((base, part)) = split_part_suffix(f.doc_name()) {
+                groups.entry(base.to_string()).or_default().push((i, part));
             }
         }
 
@@ -275,25 +254,15 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         let mut new_files: Vec<FileEntry> = Vec::new();
         for (base, mut entries) in groups.into_iter() {
             if entries.len() < 2 { continue; }
-            // sort by part number
             entries.sort_by_key(|&(_, p)| p);
-            // require numbering to start at 0 and be continuous (0,1,2,...)
-            if entries[0].1 != 0 { continue; }
-            let mut continuous = true;
-            for (idx, &(_, part)) in entries.iter().enumerate() {
-                if part != idx { continuous = false; break; }
-            }
-            if !continuous { continue; }
+            if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
             // collect docs and sizes
-            let mut docs: Vec<Document> = Vec::new();
+            let mut docs: DocParts = DocParts::new();
             let mut total_size: Option<usize> = Some(0);
             let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
             for idx in &parts_indices {
                 let f = &files[*idx];
-                match &f.doc {
-                    Either::Left(d) => docs.push(d.clone()),
-                    Either::Right(v) => docs.extend_from_slice(&v[..]),
-                }
+                docs.extend(f.parts.iter().cloned());
                 match (total_size, f.size) {
                     (Some(acc), Some(s)) => total_size = Some(acc + s),
                     _ => total_size = None,
@@ -317,19 +286,15 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             // If the base name looks like a .zip, attempt to parse its central directory
             // across the concatenated parts so we can expose inner entries.
             let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
-            if base.to_lowercase().ends_with(".zip") {
-                if !docs.is_empty() {
-                    // attempt to parse EOCD and central directory from concatenated parts
-                    let parts_vec = docs.clone();
-                    let total_bytes = parts_vec.iter().map(|d| d.size().unwrap_or(0) as usize).sum::<usize>();
-                    let tail_len = std::cmp::min(total_bytes, 70_000);
-                    let tail_offset = total_bytes.saturating_sub(tail_len);
-                    if let Ok(tail) = download_range_concat(&client, &parts_vec, tail_offset, tail_len).await {
-                        if let Some((cd_off, cd_size)) = find_eocd(&tail) {
-                            if let Ok(cd_bytes) = download_range_concat(&client, &parts_vec, cd_off as usize, cd_size as usize).await {
-                                if let Ok(ae_list) = parse_central_directory(&cd_bytes) {
-                                    archive_entries_combined = Some(ae_list);
-                                }
+            if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
+                let total_bytes = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum::<usize>();
+                let tail_len = std::cmp::min(total_bytes, 70_000);
+                let tail_offset = total_bytes.saturating_sub(tail_len);
+                if let Ok(tail) = download_range(&client, &docs, tail_offset, tail_len).await {
+                    if let Some((cd_off, cd_size)) = find_eocd(&tail) {
+                        if let Ok(cd_bytes) = download_range(&client, &docs, cd_off as usize, cd_size as usize).await {
+                            if let Ok(ae_list) = parse_central_directory(&cd_bytes) {
+                                archive_entries_combined = Some(ae_list);
                             }
                         }
                     }
@@ -345,7 +310,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             let combined = FileEntry {
                 name: exposed_base,
                 path: exposed_path,
-                doc: either::Either::Right(docs),
+                parts: docs,
                 size: total_size,
                 mime_idx: first.mime_idx,
                 archive_entries: archive_entries_combined,

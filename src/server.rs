@@ -13,11 +13,9 @@ use tokio::io::BufReader;
 use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
-use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry};
-use either::Either;
+use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
 use crate::indexer::download_range;
 use grammers_client::Client;
-use grammers_client::media::Document;
 use tokio_stream::Stream;
 
 fn normalize_path(p: &std::path::Path) -> String {
@@ -84,50 +82,33 @@ fn encode_segments(p: &str) -> String {
 
 const DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
-fn stream_single_doc(client: Client, doc: Document) -> ReceiverStream<Result<Bytes, std::io::Error>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
-        let mut dl = client.iter_download(&doc);
-        while let Ok(Some(chunk)) = dl.next().await {
-            if tx.send(Ok(Bytes::from(chunk))).await.is_err() { break; }
-        }
-    });
-    ReceiverStream::new(rx)
-}
-
-fn stream_multipart(client: Client, parts: Vec<Document>) -> ReceiverStream<Result<Bytes, std::io::Error>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
-        for doc_part in parts {
-            let mut dl = client.iter_download(&doc_part);
-            while let Ok(Some(chunk)) = dl.next().await {
-                if tx.send(Ok(Bytes::from(chunk))).await.is_err() { return; }
-            }
-        }
-    });
-    ReceiverStream::new(rx)
-}
-
-fn stream_multipart_range(
+/// Single streaming primitive: stream `length` bytes starting at `start` across
+/// a list of concatenated document parts. `length = None` means stream to EOF.
+/// Handles single-doc files, multipart files, and ranged reads over archive parts
+/// (used for inner-file extraction, where `parts` is the archive's own part list).
+fn stream_parts_range(
     client: Client,
-    parts: Vec<Document>,
-    sizes: Vec<usize>,
+    parts: DocParts,
     start: usize,
-    wanted: usize,
+    length: Option<usize>,
 ) -> ReceiverStream<Result<Bytes, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
-        // find starting part index and in-part offset
+        // locate starting part index and in-part offset
+        let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
         let mut accum = 0usize;
         let mut part_idx = 0usize;
         let mut offset_in_part = 0usize;
         for (i, s) in sizes.iter().enumerate() {
             if start < accum + s { part_idx = i; offset_in_part = start - accum; break; }
             accum += s;
+            part_idx = i + 1;
         }
-        let mut remaining = wanted;
+        if part_idx >= parts.len() { return; }
+
+        let mut remaining: Option<usize> = length;
         for idx in part_idx..parts.len() {
-            if remaining == 0 { break; }
+            if remaining == Some(0) { break; }
             let doc = &parts[idx];
             let start_off = if idx == part_idx { offset_in_part } else { 0 };
             let first_chunk = (start_off / DOWNLOAD_CHUNK_SIZE) as i32;
@@ -140,41 +121,17 @@ fn stream_multipart_range(
                     if slice.len() <= offset_in_first { continue; }
                     slice = &slice[offset_in_first..];
                 }
-                let take = std::cmp::min(remaining, slice.len());
+                let take = match remaining {
+                    Some(r) => std::cmp::min(r, slice.len()),
+                    None => slice.len(),
+                };
                 if tx.send(Ok(Bytes::from(slice[..take].to_vec()))).await.is_err() { return; }
-                remaining = remaining.saturating_sub(take);
                 bytes_sent += take;
-                if remaining == 0 { break; }
+                if let Some(r) = remaining.as_mut() {
+                    *r -= take;
+                    if *r == 0 { break; }
+                }
             }
-        }
-    });
-    ReceiverStream::new(rx)
-}
-
-fn stream_compressed_slice(
-    client: Client,
-    doc: Document,
-    data_offset: usize,
-    compressed_size: usize,
-) -> ReceiverStream<Result<Bytes, std::io::Error>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
-        let first_chunk = (data_offset / DOWNLOAD_CHUNK_SIZE) as i32;
-        let offset_in_first = data_offset % DOWNLOAD_CHUNK_SIZE;
-        let mut dl = client.iter_download(&doc).chunk_size(DOWNLOAD_CHUNK_SIZE as i32).skip_chunks(first_chunk);
-        let mut bytes_sent: usize = 0;
-        while let Ok(Some(chunk)) = dl.next().await {
-            let mut slice = &chunk[..];
-            if bytes_sent == 0 && offset_in_first > 0 {
-                if slice.len() <= offset_in_first { continue; }
-                slice = &slice[offset_in_first..];
-            }
-            let remaining = compressed_size.saturating_sub(bytes_sent);
-            if remaining == 0 { break; }
-            let take = std::cmp::min(remaining, slice.len());
-            if tx.send(Ok(Bytes::from(slice[..take].to_vec()))).await.is_err() { break; }
-            bytes_sent += take;
-            if bytes_sent >= compressed_size { break; }
         }
     });
     ReceiverStream::new(rx)
@@ -425,35 +382,20 @@ pub async fn handle_channel_path(
 
         let client = state.client.clone();
         let mime = state.mime_pool.get(fentry.mime_idx).cloned().unwrap_or_else(|| "application/octet-stream".to_string());
-        let size = fentry.size;
         let encoded_name = urlencoding::encode(&fentry.name).into_owned();
-
         let disposition = content_disposition(&fentry.file_type, &encoded_name);
 
-        if let Either::Right(parts) = &fentry.doc {
-            let sizes: Vec<Option<usize>> = parts.iter().map(|d| d.size().map(|s| s as usize)).collect();
-            let total = if sizes.iter().all(|s| s.is_some()) {
-                Some(sizes.iter().map(|s| s.unwrap()).sum::<usize>())
-            } else { None };
-
-            if let Some(total_size) = total {
-                if let Some((start, end)) = parse_range(&headers, total_size)? {
-                    let wanted = end - start + 1;
-                    let sizes_known: Vec<usize> = sizes.iter().map(|s| s.unwrap()).collect();
-                    let stream = stream_multipart_range(client, parts.clone(), sizes_known, start, wanted);
-                    let body = Body::from_stream(stream);
-                    return Ok(partial_response(&mime, &disposition, body, start, end, total_size));
-                }
+        if let Some(total_size) = fentry.size {
+            if let Some((start, end)) = parse_range(&headers, total_size)? {
+                let wanted = end - start + 1;
+                let stream = stream_parts_range(client, fentry.parts.clone(), start, Some(wanted));
+                let body = Body::from_stream(stream);
+                return Ok(partial_response(&mime, &disposition, body, start, end, total_size));
             }
-
-            let body = Body::from_stream(stream_multipart(client, parts.clone()));
-            return Ok(full_download_response(&mime, &disposition, body, total));
         }
 
-        // single-part streaming
-        let doc = fentry.first_doc().clone();
-        let body = Body::from_stream(stream_single_doc(client, doc));
-        return Ok(full_download_response(&mime, &disposition, body, size));
+        let body = Body::from_stream(stream_parts_range(client, fentry.parts.clone(), 0, None));
+        return Ok(full_download_response(&mime, &disposition, body, fentry.size));
     }
 
     // inner archive file download: match an archive whose virtual full path or stem-full
@@ -481,15 +423,16 @@ pub async fn handle_channel_path(
     }
     let archive_entry = archive_entry_opt.ok_or(StatusCode::NOT_FOUND)?;
 
-    // ranged-extract the requested file from the archive without downloading the whole archive
+    // ranged-extract the requested file from the archive without downloading the whole archive.
+    // The archive itself may be multipart, so we thread its full `parts` list through every read.
     let client = state.client.clone();
-    let doc = archive_entry.first_doc().clone();
+    let archive_parts = archive_entry.parts.clone();
 
     let archive_entries = archive_entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let ae = archive_entries.iter().find(|x| x.path == inner).ok_or(StatusCode::NOT_FOUND)?;
 
     // read local file header to determine extra field length and filename length
-    let lh = download_range(&client, &doc, ae.local_header_offset as usize, 30)
+    let lh = download_range(&client, &archive_parts, ae.local_header_offset as usize, 30)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] {
@@ -499,8 +442,8 @@ pub async fn handle_channel_path(
     let extra_len = u16le(&lh, 28) as usize;
     let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
 
-    // stream compressed data and asynchronously inflate on-the-fly
-    let compressed = stream_compressed_slice(client, doc, data_offset, ae.compressed_size);
+    // stream compressed data across all archive parts and inflate on-the-fly
+    let compressed = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
     let buf = BufReader::new(StreamReader::new(compressed));
     let decompressed = ReaderStream::new(AsyncDeflateDecoder::new(buf));
 

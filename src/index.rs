@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use grammers_client::media::Document;
-use either::Either;
 use std::path::PathBuf;
 use grammers_client::Client;
+use smallvec::SmallVec;
+
+pub type DocParts = SmallVec<[Document; 1]>;
 
 #[derive(Deserialize)]
 pub struct ChannelEntry {
@@ -45,7 +47,10 @@ pub struct FileEntry {
     // Parsed at indexing time from the `name:` message override if it contains
     // path separators. Example: `dir/subdir/file.ext` -> path=Some("dir/subdir"), name="file.ext".
     pub path: Option<PathBuf>,
-    pub doc: Either<Document, Vec<Document>>,
+    // One or more concatenated document parts. A simple file has a single element
+    // stored inline (no heap allocation); multipart files (`<base>.NN` detection)
+    // spill to the heap.
+    pub parts: DocParts,
     pub size: Option<usize>,
     // Index into the global MIME pool in `AppState`.
     pub mime_idx: usize,
@@ -55,7 +60,6 @@ pub struct FileEntry {
     // the document MIME/type and the original document filename (not the
     // message `name:` override).
     pub file_type: FileType,
-    // `doc` is either a single `Document` (Left) or multiple parts (Right).
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -67,10 +71,7 @@ pub enum FileType {
 
 impl FileEntry {
     pub fn first_doc(&self) -> &Document {
-        match &self.doc {
-            Either::Left(d) => d,
-            Either::Right(v) => &v[0],
-        }
+        &self.parts[0]
     }
 
     pub fn doc_name(&self) -> &str {
