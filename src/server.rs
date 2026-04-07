@@ -13,7 +13,7 @@ use tokio::io::BufReader;
 use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
-use crate::index::{AppState, Entry, dir_listing, FileType};
+use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry};
 use either::Either;
 use crate::indexer::download_range;
 
@@ -50,60 +50,205 @@ pub async fn handle_channel_path(
     let is_dir_request = orig_path.is_empty() || orig_path.ends_with('/');
     let trimmed = orig_path.trim_end_matches('/');
 
+    // helper: compute virtual full path for an entry (path + name)
+    fn full_for(e: &FileEntry) -> String {
+        if let Some(p) = &e.path {
+            // normalize to forward-slash separated relative path
+            let mut s = p.to_string_lossy().to_string();
+            if std::path::MAIN_SEPARATOR != '/' {
+                s = s.replace(std::path::MAIN_SEPARATOR, "/");
+            }
+            // also handle any backslashes that may have been provided
+            if s.contains('\\') { s = s.replace('\\', "/"); }
+            // strip leading ./ or /
+            while s.starts_with("./") { s = s.replacen("./", "", 1); }
+            while s.starts_with('/') { s = s.replacen("/", "", 1); }
+            // collapse duplicate slashes
+            while s.contains("//") { s = s.replace("//", "/"); }
+            if s.is_empty() { return e.name.clone(); }
+            format!("{}/{}", s, e.name)
+        } else {
+            // also normalize any stray backslashes in the bare name
+            if e.name.contains('\\') { return e.name.replace('\\', "/"); }
+            e.name.clone()
+        }
+    }
+
+    // helper: compute virtual path using the file stem (filename without extension)
+    fn stem_full_for(e: &FileEntry) -> String {
+        let stem = std::path::Path::new(&e.name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&e.name)
+            .to_string();
+        if let Some(p) = &e.path {
+            let mut s = p.to_string_lossy().to_string();
+            if std::path::MAIN_SEPARATOR != '/' {
+                s = s.replace(std::path::MAIN_SEPARATOR, "/");
+            }
+            if s.contains('\\') { s = s.replace('\\', "/"); }
+            while s.starts_with("./") { s = s.replacen("./", "", 1); }
+            while s.starts_with('/') { s = s.replacen("/", "", 1); }
+            while s.contains("//") { s = s.replace("//", "/"); }
+            if s.is_empty() { return stem; }
+            format!("{}/{}", s, stem)
+        } else {
+            stem
+        }
+    }
+
+    fn encode_segments(p: &str) -> String {
+        p.split('/').map(|seg| urlencoding::encode(seg).into_owned()).collect::<Vec<_>>().join("/")
+    }
+
     if is_dir_request {
         if trimmed.is_empty() {
-            let mut entries: Vec<Entry> = Vec::new();
+            use std::collections::BTreeSet;
+            let mut dirs: BTreeSet<String> = BTreeSet::new();
+            let mut top_files: Vec<&FileEntry> = Vec::new();
             for f in files.iter() {
+                let full = full_for(f);
+                if full.contains('/') {
+                    let first = full.splitn(2, '/').next().unwrap().to_string();
+                    dirs.insert(first);
+                } else {
+                    top_files.push(f);
+                }
+            }
+
+            let mut entries: Vec<Entry> = Vec::new();
+            // directories first (dirs is a BTreeSet so already sorted)
+            for d in dirs.iter() {
+                entries.push(Entry { href: format!("/{}/{}/", urlencoding::encode(&channel), encode_segments(d)), label: format!("{}/", d), size: None });
+            }
+            // then top-level files
+            for f in top_files.iter() {
+                let full = full_for(f);
                 if f.file_type == FileType::Zip && f.archive_entries.is_some() {
+                    let stem_full = stem_full_for(f);
                     let stem = std::path::Path::new(&f.name)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(&f.name)
                         .to_string();
-                    entries.push(Entry { href: format!("{}/", urlencoding::encode(&f.name)), label: format!("{}/", stem), size: None });
-                    // channel-level archive_view controls whether to list raw file
+                    entries.push(Entry { href: format!("/{}/{}/", urlencoding::encode(&channel), encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
                     if state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::FileAndDirectory {
-                        entries.push(Entry { href: urlencoding::encode(&f.name).into_owned(), label: f.name.clone(), size: f.size });
+                        entries.push(Entry { href: format!("/{}/{}", urlencoding::encode(&channel), encode_segments(&full)), label: f.name.clone(), size: f.size });
                     }
                 } else {
-                    entries.push(Entry { href: urlencoding::encode(&f.name).into_owned(), label: f.name.clone(), size: f.size });
+                    entries.push(Entry { href: format!("/{}/{}", urlencoding::encode(&channel), encode_segments(&full)), label: f.name.clone(), size: f.size });
                 }
             }
+            // sort files (directories are already sorted)
+            entries.sort_by_key(|e| e.label.to_lowercase());
+
             let title = format!("Index of /{channel}/");
             let body = dir_listing(&title, Some("/"), &entries);
             return Ok(Response::builder().header(header::CONTENT_TYPE, "text/html; charset=utf-8").body(Body::from(body)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
         }
 
-        // inner listing logic (kept simple)
-        let mut parts = trimmed.splitn(2, '/');
-        let archive_name = parts.next().unwrap();
-        let inner_path = parts.next().unwrap_or("");
-        let entry = files.iter().find(|e| e.name == archive_name && e.file_type == FileType::Zip).ok_or(StatusCode::NOT_FOUND)?;
-        let archive_entries = entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-        use std::collections::BTreeSet;
-        let mut seen = BTreeSet::new();
-        let mut listing: Vec<Entry> = Vec::new();
-        // Build relative links for items inside the archive (do not prefix archive name again)
-        let prefix = if inner_path.is_empty() { String::new() } else { format!("{}/", inner_path) };
-        for ae in archive_entries.iter() {
-            if !ae.path.starts_with(prefix.as_str()) { continue; }
-            let rest = &ae.path[prefix.len()..];
-            if rest.is_empty() { continue; }
-            let mut seg_iter = rest.splitn(2, '/');
-            let name = seg_iter.next().unwrap();
-            let is_dir = seg_iter.next().is_some();
-            if !seen.insert((name.to_string(), is_dir)) { continue; }
-            let combined = if inner_path.is_empty() { name.to_string() } else { format!("{}/{}", inner_path, name) };
-            if is_dir {
-                listing.push(Entry { href: format!("{}/", urlencoding::encode(&combined)), label: format!("{}/", name), size: None });
-            } else {
-                let ae_size = archive_entries.iter().find(|x| x.path == format!("{}{}", prefix, name)).map(|x| x.uncompressed_size);
-                listing.push(Entry { href: urlencoding::encode(&combined).into_owned(), label: name.to_string(), size: ae_size });
+        // Determine whether this directory refers to an archive (either the archive root
+        // or a path inside the archive) by checking if any zip entry's full or stem-full
+        // path equals or prefixes `trimmed`. If so, render the archive internal listing
+        // for the matching inner prefix.
+        let mut matched_archive: Option<&FileEntry> = None;
+        let mut inner_prefix: String = String::new();
+        for e in files.iter() {
+            if e.file_type != FileType::Zip { continue; }
+            if e.archive_entries.is_none() { continue; }
+            let full = full_for(e);
+            let stem = stem_full_for(e);
+            if trimmed == full || trimmed == stem {
+                matched_archive = Some(e);
+                inner_prefix.clear();
+                break;
+            }
+            let full_pref = format!("{}/", full);
+            if trimmed.starts_with(&full_pref) {
+                matched_archive = Some(e);
+                inner_prefix = trimmed[full_pref.len()..].to_string();
+                break;
+            }
+            let stem_pref = format!("{}/", stem);
+            if trimmed.starts_with(&stem_pref) {
+                matched_archive = Some(e);
+                inner_prefix = trimmed[stem_pref.len()..].to_string();
+                break;
             }
         }
-        let title = format!("Index of /{channel}/{trimmed}/");
-        let body = dir_listing(&title, Some(&format!("/{channel}/")), &listing);
-        return Ok(Response::builder().header(header::CONTENT_TYPE, "text/html; charset=utf-8").body(Body::from(body)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+
+        if let Some(archive_entry) = matched_archive {
+            let archive_entries = archive_entry.archive_entries.as_ref().unwrap();
+            use std::collections::BTreeSet;
+            let mut seen = BTreeSet::new();
+            let mut listing: Vec<Entry> = Vec::new();
+            let prefix = if inner_prefix.is_empty() { String::new() } else { format!("{}/", inner_prefix) };
+            // prepare base path for archive internal links: /{channel}/{trimmed}
+            let base_path = format!("/{}/{}", urlencoding::encode(&channel), encode_segments(trimmed));
+            for ae in archive_entries.iter() {
+                if !ae.path.starts_with(prefix.as_str()) { continue; }
+                let rest = &ae.path[prefix.len()..];
+                if rest.is_empty() { continue; }
+                let mut seg_iter = rest.splitn(2, '/');
+                let name = seg_iter.next().unwrap();
+                let is_dir = seg_iter.next().is_some();
+                if !seen.insert((name.to_string(), is_dir)) { continue; }
+                let combined = name.to_string();
+                if is_dir {
+                    listing.push(Entry { href: format!("{}/{}/", base_path, encode_segments(&combined)), label: format!("{}/", name), size: None });
+                } else {
+                    let ae_size = archive_entries.iter().find(|x| x.path == format!("{}{}", prefix, name)).map(|x| x.uncompressed_size);
+                    listing.push(Entry { href: format!("{}/{}", base_path, encode_segments(&combined)), label: name.to_string(), size: ae_size });
+                }
+            }
+            // sort archive listing by label
+            listing.sort_by_key(|e| e.label.to_lowercase());
+            let title = format!("Index of /{channel}/{trimmed}/");
+            let parent_href = if let Some(idx) = trimmed.rfind('/') {
+                format!("/{}/{}/", urlencoding::encode(&channel), encode_segments(&trimmed[..idx]))
+            } else {
+                format!("/{}/", urlencoding::encode(&channel))
+            };
+            let body = dir_listing(&title, Some(&parent_href), &listing);
+            return Ok(Response::builder().header(header::CONTENT_TYPE, "text/html; charset=utf-8").body(Body::from(body)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+        }
+
+        // Virtual directory listing: list immediate children (dirs and files) under trimmed/
+        {
+            use std::collections::BTreeSet;
+            let mut seen = BTreeSet::new();
+            let mut listing: Vec<Entry> = Vec::new();
+            let prefix = format!("{}/", trimmed);
+            for f in files.iter() {
+                let full = full_for(f);
+                if !full.starts_with(&prefix) { continue; }
+                let rest = &full[prefix.len()..];
+                if rest.is_empty() { continue; }
+                let mut seg_iter = rest.splitn(2, '/');
+                let name = seg_iter.next().unwrap();
+                let is_dir = seg_iter.next().is_some();
+                if !seen.insert((name.to_string(), is_dir)) { continue; }
+                let combined = format!("{}/{}", trimmed, name);
+                if is_dir {
+                    listing.push(Entry { href: format!("/{}/{}/", urlencoding::encode(&channel), encode_segments(&combined)), label: format!("{}/", name), size: None });
+                } else {
+                    // top-level file under this virtual dir
+                    // find size if this is a file entry
+                    let size = files.iter().find(|x| full_for(x) == combined).and_then(|x| x.size);
+                    listing.push(Entry { href: format!("/{}/{}", urlencoding::encode(&channel), encode_segments(&combined)), label: name.to_string(), size });
+                }
+            }
+            // sort entries by label
+            listing.sort_by_key(|e| e.label.to_lowercase());
+            let title = format!("Index of /{channel}/{trimmed}/");
+            let parent_href = if let Some(idx) = trimmed.rfind('/') {
+                format!("/{}/{}/", urlencoding::encode(&channel), encode_segments(&trimmed[..idx]))
+            } else {
+                format!("/{}/", urlencoding::encode(&channel))
+            };
+            let body = dir_listing(&title, Some(&parent_href), &listing);
+            return Ok(Response::builder().header(header::CONTENT_TYPE, "text/html; charset=utf-8").body(Body::from(body)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+        }
     }
 
     // File download path (orig_path does not end with '/')
@@ -111,7 +256,7 @@ pub async fn handle_channel_path(
     if !trimmed.contains('/') {
         // top-level file download
         let files_vec = files;
-        let fentry = files_vec.iter().find(|e| e.name == trimmed).ok_or(StatusCode::NOT_FOUND)?;
+        let fentry = files_vec.iter().find(|e| full_for(e) == trimmed).ok_or(StatusCode::NOT_FOUND)?;
         // if zip and archive_view is Directory-only, then we do not offer raw download; return 404
         if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::Directory {
             return Err(StatusCode::NOT_FOUND);
@@ -272,15 +417,30 @@ pub async fn handle_channel_path(
         return Ok(builder.body(body).unwrap());
     }
 
-    // inner archive file download: "archive.zip/path/to/file"
-    let mut parts = trimmed.splitn(2, '/');
-    let archive_name = parts.next().unwrap();
-    let inner = parts.next().unwrap_or("");
-
-    let archive_entry = files
-        .iter()
-        .find(|e| e.name == archive_name && e.file_type == FileType::Zip && e.archive_entries.is_some())
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // inner archive file download: match an archive whose virtual full path or stem-full
+    // path is a prefix of the request path: "<archive_full_path>/path/to/file" or
+    // "<archive_stem_path>/path/to/file" (where stem_path omits the .zip extension).
+    let mut archive_entry_opt: Option<&FileEntry> = None;
+    let mut inner: &str = "";
+    for e in files.iter() {
+        if e.file_type != FileType::Zip { continue; }
+        if e.archive_entries.is_none() { continue; }
+        let full = full_for(e);
+        let stem_full = stem_full_for(e);
+        let prefix_full = format!("{}/", full);
+        let prefix_stem = format!("{}/", stem_full);
+        if trimmed.starts_with(&prefix_full) {
+            archive_entry_opt = Some(e);
+            inner = &trimmed[prefix_full.len()..];
+            break;
+        }
+        if trimmed.starts_with(&prefix_stem) {
+            archive_entry_opt = Some(e);
+            inner = &trimmed[prefix_stem.len()..];
+            break;
+        }
+    }
+    let archive_entry = archive_entry_opt.ok_or(StatusCode::NOT_FOUND)?;
 
     // ranged-extract the requested file from the archive without downloading the whole archive
     let client = state.client.clone();

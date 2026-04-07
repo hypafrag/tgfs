@@ -109,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
     let (index, mime_pool, channel_archive_view) = indexer::build_index(client.clone(), &config).await?;
     let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view });
 
+    
+
     let app = server::make_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

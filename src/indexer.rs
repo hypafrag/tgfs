@@ -190,9 +190,17 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
         let mut processed_msgs: usize = 0;
         while let Some(msg) = messages.next().await? {
             processed_msgs += 1;
-            println!("Indexed {} messages so far for channel '{}'...", processed_msgs, name);
             if let Some(Media::Document(doc)) = msg.media() {
-                let file_name = resolve_filename(&msg, &doc);
+                let raw_name = resolve_filename(&msg, &doc);
+                // parse out optional path prefix from message `name:` override
+                let (file_name, path_opt) = if raw_name.contains('/') {
+                    let p = std::path::Path::new(&raw_name);
+                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(&raw_name).to_string();
+                    let dir = p.parent().map(|pp| pp.to_path_buf());
+                    (fname, dir)
+                } else {
+                    (raw_name, None)
+                };
                 let type_override = resolve_type_override(&msg);
                 println!("Processing file: {}", file_name);
                 io::stdout().flush().ok();
@@ -241,7 +249,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
                         i
                     }
                 };
-                files.push(FileEntry { name: file_name, doc: either::Either::Left(doc), size, mime_idx, archive_entries, file_type: final_type.clone() });
+                files.push(FileEntry { name: file_name, path: path_opt, doc: either::Either::Left(doc), size, mime_idx, archive_entries, file_type: final_type.clone() });
             }
         }
         println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
@@ -339,8 +347,19 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(Has
             // Determine combined file_type: prefer the first part's resolved file_type.
             let combined_file_type = first.file_type.clone();
 
+            // For combined entries the `exposed_name` may include a path.
+            let (exposed_base, exposed_path) = if exposed_name.contains('/') {
+                let p = std::path::Path::new(&exposed_name);
+                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(&exposed_name).to_string();
+                let dir = p.parent().map(|pp| pp.to_path_buf());
+                (fname, dir)
+            } else {
+                (exposed_name.clone(), None)
+            };
+
             let combined = FileEntry {
-                name: exposed_name,
+                name: exposed_base,
+                path: exposed_path,
                 doc: either::Either::Right(docs),
                 size: total_size,
                 mime_idx: first.mime_idx,

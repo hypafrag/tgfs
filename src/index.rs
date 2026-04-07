@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use grammers_client::media::Document;
 use either::Either;
+use std::path::PathBuf;
 use grammers_client::Client;
 
 #[derive(Deserialize)]
@@ -44,6 +45,10 @@ pub struct ArchiveFileEntry {
 #[allow(dead_code)]
 pub struct FileEntry {
     pub name: String,
+    // Optional directory path (relative virtual path) where the file is served.
+    // Parsed at indexing time from the `name:` message override if it contains
+    // path separators. Example: `dir/subdir/file.ext` -> path=Some("dir/subdir"), name="file.ext".
+    pub path: Option<PathBuf>,
     pub doc: Either<Document, Vec<Document>>,
     pub size: Option<usize>,
     // Index into the global MIME pool in `AppState`.
