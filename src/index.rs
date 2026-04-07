@@ -49,6 +49,9 @@ pub struct FileEntry {
     pub is_zip: bool,
     pub archive_entries: Option<Vec<ArchiveFileEntry>>,
     pub archive_view: ArchiveView,
+    // If this entry represents a concatenation of multiple parts, `parts` holds
+    // the ordered list of `Document`s and `doc` is the first part's document.
+    pub parts: Option<Vec<Document>>,
 }
 
 #[allow(dead_code)]

@@ -116,11 +116,129 @@ pub async fn handle_channel_path(
         }
 
         let client = state.client.clone();
-        let doc = fentry.doc.clone();
         let mime = fentry.mime_type.clone();
         let size = fentry.size;
         let encoded_name = urlencoding::encode(&fentry.name).into_owned();
 
+        // Multipart support: if this FileEntry is composed of parts, allow seeking across
+        // the concatenated uncompressed stream when all part sizes are known.
+        let is_media = mime.starts_with("audio/") || mime.starts_with("video/");
+        let content_disposition = if is_media {
+            format!("inline; filename*=UTF-8''{encoded_name}")
+        } else {
+            format!("attachment; filename*=UTF-8''{encoded_name}")
+        };
+
+        if let Some(parts) = &fentry.parts {
+            // gather sizes
+            let sizes: Vec<Option<usize>> = parts.iter().map(|d| d.size().map(|s| s as usize)).collect();
+            let all_known = sizes.iter().all(|s| s.is_some());
+            let total = if all_known { Some(sizes.iter().map(|s| s.unwrap()).sum::<usize>()) } else { None };
+
+            // If there's a Range header and sizes are known, satisfy the range by locating
+            // the part containing the start offset and streaming from there.
+            if let Some(range_hdr) = headers.get(header::RANGE) {
+                if let (Some(total_size), Ok(range_str)) = (total, range_hdr.to_str()) {
+                    if let Some(r) = range_str.strip_prefix("bytes=") {
+                        let mut parts_r = r.splitn(2, '-');
+                        let start_opt = parts_r.next().and_then(|s| if s.is_empty() { None } else { s.parse::<usize>().ok() });
+                        let end_opt = parts_r.next().and_then(|s| if s.is_empty() { None } else { s.parse::<usize>().ok() });
+                        let start = start_opt.unwrap_or(0);
+                        let end = end_opt.unwrap_or(total_size.saturating_sub(1));
+                        if start > end || start >= total_size {
+                            return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+                        }
+                        let wanted = end - start + 1;
+
+                        // find starting part index and in-part offset
+                        let mut accum = 0usize;
+                        let mut part_idx = 0usize;
+                        let mut offset_in_part = 0usize;
+                        for (i, s) in sizes.iter().enumerate() {
+                            let s = s.unwrap();
+                            if start < accum + s {
+                                part_idx = i;
+                                offset_in_part = start - accum;
+                                break;
+                            }
+                            accum += s;
+                        }
+
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+                        let client_clone = client.clone();
+                        let parts_clone = parts.clone();
+                        tokio::spawn(async move {
+                            let chunk_size: usize = 64 * 1024;
+                            let mut remaining = wanted;
+
+                            for idx in part_idx..parts_clone.len() {
+                                if remaining == 0 { break; }
+                                let doc = parts_clone[idx].clone();
+                                let _part_size = doc.size().unwrap_or(0) as usize;
+                                // determine start offset in this part
+                                let start_off = if idx == part_idx { offset_in_part } else { 0 };
+                                let first_chunk = (start_off / chunk_size) as i32;
+                                let offset_in_first = start_off % chunk_size;
+
+                                let mut dl = client_clone.iter_download(&doc).chunk_size(chunk_size as i32).skip_chunks(first_chunk);
+                                let mut bytes_sent: usize = 0;
+                                while let Ok(Some(chunk)) = dl.next().await {
+                                    let mut slice = &chunk[..];
+                                    if bytes_sent == 0 && offset_in_first > 0 {
+                                        if slice.len() <= offset_in_first {
+                                            // still in the skipped prefix
+                                            continue;
+                                        }
+                                        slice = &slice[offset_in_first..];
+                                    }
+                                    let take = std::cmp::min(remaining, slice.len());
+                                    if tx.send(Ok(Bytes::from(slice[..take].to_vec()))).await.is_err() { return; }
+                                    remaining = remaining.saturating_sub(take);
+                                    bytes_sent += take;
+                                    if remaining == 0 { break; }
+                                }
+                            }
+                        });
+
+                        let body = Body::from_stream(ReceiverStream::new(rx));
+                        let builder = Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::ACCEPT_RANGES, "bytes")
+                            .header(header::CONTENT_TYPE, mime)
+                            .header(header::CONTENT_DISPOSITION, content_disposition)
+                            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, start + wanted - 1, total_size))
+                            .header(header::CONTENT_LENGTH, wanted.to_string());
+                        return Ok(builder.body(body).unwrap());
+                    }
+                }
+            }
+
+            // No range requested or sizes unknown: stream full concatenated parts
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let parts_clone = parts.clone();
+            let client_clone = client.clone();
+            tokio::spawn(async move {
+                for doc_part in parts_clone {
+                    let mut dl = client_clone.iter_download(&doc_part);
+                    while let Ok(Some(chunk)) = dl.next().await {
+                        if tx.send(Ok::<Bytes, std::io::Error>(Bytes::from(chunk))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let mut builder = Response::builder()
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_DISPOSITION, content_disposition)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if let Some(t) = total { builder = builder.header(header::CONTENT_LENGTH, t.to_string()); }
+            let body = Body::from_stream(ReceiverStream::new(rx));
+            return Ok(builder.body(body).unwrap());
+        }
+
+        // single-part: fallthrough to existing single-doc streaming
+        let doc = fentry.doc.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let mut dl = client.iter_download(&doc);
@@ -136,13 +254,6 @@ pub async fn handle_channel_path(
         });
 
         let body = Body::from_stream(ReceiverStream::new(rx));
-        let is_media = mime.starts_with("audio/") || mime.starts_with("video/");
-        let content_disposition = if is_media {
-            format!("inline; filename*=UTF-8''{encoded_name}")
-        } else {
-            format!("attachment; filename*=UTF-8''{encoded_name}")
-        };
-
         let mut builder = Response::builder()
             .header(header::CONTENT_TYPE, mime)
             .header(header::CONTENT_DISPOSITION, content_disposition);

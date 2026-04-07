@@ -1608,6 +1608,7 @@ dependencies = [
  "grammers-mtsender",
  "grammers-session",
  "mime_guess",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

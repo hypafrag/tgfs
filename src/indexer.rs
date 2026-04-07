@@ -149,12 +149,96 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
                         println!("  EOCD not found for '{}', skipping archive index", file_name);
                     }
                 }
-                files.push(FileEntry { name: file_name, doc, size, mime_type, is_zip, archive_entries, archive_view: entry.archive_view });
+                files.push(FileEntry { name: file_name, doc, size, mime_type, is_zip, archive_entries, archive_view: entry.archive_view, parts: None });
             }
         }
         println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
-        println!(" {} files", files.len());
-        index.insert(name.clone(), files);
+        println!(" {} files (pre-group)", files.len());
+
+        // Detect multipart files by inspecting the document filename (not message overrides).
+        // Pattern: <base>.<partnum> where <partnum> is two digits like 00, 01, 02...
+        use regex::Regex;
+        let re = Regex::new(r"^(?P<base>.+)\.(?P<part>\d{2})$").unwrap();
+        let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
+        for (i, f) in files.iter().enumerate() {
+            let doc_name = f.doc.name().unwrap_or(&f.name);
+            if let Some(caps) = re.captures(doc_name) {
+                let base = caps.name("base").unwrap().as_str().to_string();
+                let part_num = caps.name("part").unwrap().as_str().parse::<usize>().unwrap_or(0);
+                groups.entry(base).or_default().push((i, part_num));
+            }
+        }
+
+        // Build new files vector merging detected groups of >= 2 parts
+        let mut removed = std::collections::BTreeSet::new();
+        let mut new_files: Vec<FileEntry> = Vec::new();
+        for (base, mut entries) in groups.into_iter() {
+            if entries.len() < 2 { continue; }
+            // sort by part number
+            entries.sort_by_key(|&(_, p)| p);
+            // require numbering to start at 0 and be continuous (0,1,2,...)
+            if entries[0].1 != 0 { continue; }
+            let mut continuous = true;
+            for (idx, &(_, part)) in entries.iter().enumerate() {
+                if part != idx { continuous = false; break; }
+            }
+            if !continuous { continue; }
+            // collect docs and sizes
+            let mut docs: Vec<Document> = Vec::new();
+            let mut total_size: Option<usize> = Some(0);
+            let mut parts_indices: Vec<usize> = Vec::new();
+            for (idx, _part) in &entries {
+                parts_indices.push(*idx);
+            }
+            for idx in &parts_indices {
+                let f = &files[*idx];
+                docs.push(f.doc.clone());
+                match (total_size, f.size) {
+                    (Some(acc), Some(s)) => total_size = Some(acc + s),
+                    _ => total_size = None,
+                }
+            }
+
+            // Determine exposed name: if the .00 part (part 0) has a message override name, use it.
+            // Otherwise use the doc-derived base name.
+            let mut exposed_name = base.clone();
+            // find index with part == 0
+            if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
+                let f0 = &files[*first_idx];
+                let doc_name = f0.doc.name().unwrap_or(&f0.name).to_string();
+                if f0.name != doc_name { // message override present
+                    exposed_name = f0.name.clone();
+                }
+            }
+
+            // Build a combined FileEntry using the first part as representative
+            let first = &files[parts_indices[0]];
+            let combined = FileEntry {
+                name: exposed_name,
+                doc: first.doc.clone(),
+                size: total_size,
+                mime_type: first.mime_type.clone(),
+                is_zip: false,
+                archive_entries: None,
+                archive_view: first.archive_view,
+                parts: Some(docs),
+            };
+
+            // mark removed indices
+            for idx in parts_indices { removed.insert(idx); }
+            new_files.push(combined);
+        }
+
+        // Append non-removed original entries
+        for (i, f) in files.into_iter().enumerate() {
+            if removed.contains(&i) { continue; }
+            new_files.push(f);
+        }
+
+        // sort files by exposed name
+        new_files.sort_by_key(|f| f.name.to_lowercase());
+        println!(" {} files (post-group)", new_files.len());
+        index.insert(name.clone(), new_files);
     }
 
     Ok(index)
