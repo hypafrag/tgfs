@@ -1,0 +1,4 @@
+.claude
+/target
+/auth.json
+/session.sqlite3

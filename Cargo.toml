@@ -1,0 +1,14 @@
+[package]
+name = "tgfs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+grammers-client = "0.9"
+grammers-mtsender = "0.9"
+grammers-session = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rpassword = "7"
