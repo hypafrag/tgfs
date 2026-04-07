@@ -6,6 +6,47 @@ use grammers_client::peer::Peer;
 use grammers_client::Client;
 // tokio_stream::StreamExt not required; `.next()` is available on the iterator types used
 use crate::index::{Config, FileEntry, ArchiveFileEntry, ArchiveView};
+use either::Either;
+
+// Download a byte range from a concatenation of documents (parts).
+async fn download_range_concat(
+    client: &Client,
+    parts: &[Document],
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    // build prefix sums of sizes
+    let mut sizes: Vec<usize> = Vec::with_capacity(parts.len());
+    for d in parts {
+        sizes.push(d.size().unwrap_or(0) as usize);
+    }
+    let total: usize = sizes.iter().sum();
+    if offset >= total { return Ok(Vec::new()); }
+    let to_read = std::cmp::min(length, total - offset);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(to_read);
+
+    // find starting part
+    let mut pos = 0usize;
+    let mut i = 0usize;
+    while i < sizes.len() && pos + sizes[i] <= offset { pos += sizes[i]; i += 1; }
+
+    let mut need = to_read;
+    let mut start_in_part = offset.saturating_sub(pos);
+    while i < parts.len() && need > 0 {
+        let doc = &parts[i];
+        let avail = sizes[i].saturating_sub(start_in_part);
+        if avail == 0 { i += 1; start_in_part = 0; continue; }
+        let read_len = std::cmp::min(avail, need);
+        let chunk = download_range(client, doc, start_in_part, read_len).await?;
+        buf.extend_from_slice(&chunk);
+        need = need.saturating_sub(chunk.len());
+        i += 1;
+        start_in_part = 0;
+    }
+
+    Ok(buf)
+}
 
 // Download a byte range [offset, offset+length) from Telegram using the chunked
 // downloader. Reused by server for ranged extraction as well.
@@ -96,7 +137,24 @@ fn resolve_filename(msg: &grammers_client::message::Message, doc: &Document) -> 
     doc.name().unwrap_or("<unnamed>").to_string()
 }
 
-pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<HashMap<String, Vec<FileEntry>>> {
+fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<crate::index::FileType> {
+    if msg.grouped_id().is_none() {
+        for line in msg.text().lines() {
+            if let Some(value) = line.strip_prefix("type:") {
+                let v = value.trim().to_lowercase();
+                return match v.as_str() {
+                    "file" => Some(crate::index::FileType::File),
+                    "media" => Some(crate::index::FileType::Media),
+                    "zip" => Some(crate::index::FileType::Zip),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<(HashMap<String, Vec<FileEntry>>, Vec<String>, std::collections::HashMap<String, crate::index::ArchiveView>)> {
     let mut channel_peers = HashMap::new();
     let mut dialogs = client.iter_dialogs();
     while let Some(dialog) = dialogs.next().await? {
@@ -110,6 +168,15 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
     }
 
     let mut index: HashMap<String, Vec<FileEntry>> = HashMap::new();
+    // MIME interning structures
+    let mut mime_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut mime_vec: Vec<String> = Vec::new();
+    // build channel -> archive_view map
+    let mut channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView> = std::collections::HashMap::new();
+    for ce in &config.channels {
+        channel_view_map.insert(ce.name.clone(), ce.archive_view);
+    }
+
     for entry in &config.channels {
         let name = &entry.name;
         let peer_ref = match channel_peers.get(name) {
@@ -126,13 +193,28 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
             println!("Indexed {} messages so far for channel '{}'...", processed_msgs, name);
             if let Some(Media::Document(doc)) = msg.media() {
                 let file_name = resolve_filename(&msg, &doc);
+                let type_override = resolve_type_override(&msg);
                 println!("Processing file: {}", file_name);
                 io::stdout().flush().ok();
                 let size = doc.size();
                 let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
-                let is_zip = mime_type == "application/zip" || file_name.to_lowercase().ends_with(".zip");
+                // Determine the final `file_type` for this entry. Preference order:
+                // 1) explicit `type:` override in the message,
+                // 2) MIME/type (audio/video => media, application/zip => zip),
+                // 3) document filename extension (using the underlying
+                //    `Document` name, not a `name:` override).
+                let doc_name = doc.name().unwrap_or(&file_name).to_string();
+                let final_type = if let Some(t) = &type_override {
+                    t.clone()
+                } else if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
+                    crate::index::FileType::Media
+                } else if mime_type == "application/zip" || doc_name.to_lowercase().ends_with(".zip") {
+                    crate::index::FileType::Zip
+                } else {
+                    crate::index::FileType::File
+                };
                 let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
-                if is_zip && entry.archive_view != ArchiveView::File {
+                if final_type == crate::index::FileType::Zip && entry.archive_view != ArchiveView::File {
                     println!("  fetching EOCD tail of '{}' for indexing", file_name);
                     io::stdout().flush().ok();
                     let size_usize = doc.size().unwrap_or(0) as usize;
@@ -149,7 +231,17 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
                         println!("  EOCD not found for '{}', skipping archive index", file_name);
                     }
                 }
-                files.push(FileEntry { name: file_name, doc, size, mime_type, is_zip, archive_entries, archive_view: entry.archive_view, parts: None });
+                // intern mime_type
+                let mime_idx = match mime_map.get(&mime_type) {
+                    Some(&i) => i,
+                    None => {
+                        let i = mime_vec.len();
+                        mime_vec.push(mime_type.clone());
+                        mime_map.insert(mime_type.clone(), i);
+                        i
+                    }
+                };
+                files.push(FileEntry { name: file_name, doc: either::Either::Left(doc), size, mime_idx, archive_entries, file_type: final_type.clone() });
             }
         }
         println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
@@ -161,7 +253,10 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
         let re = Regex::new(r"^(?P<base>.+)\.(?P<part>\d{2})$").unwrap();
         let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
         for (i, f) in files.iter().enumerate() {
-            let doc_name = f.doc.name().unwrap_or(&f.name);
+            let doc_name = match &f.doc {
+                Either::Left(d) => d.name().unwrap_or(&f.name),
+                Either::Right(v) => v.get(0).and_then(|d| d.name()).unwrap_or(&f.name),
+            };
             if let Some(caps) = re.captures(doc_name) {
                 let base = caps.name("base").unwrap().as_str().to_string();
                 let part_num = caps.name("part").unwrap().as_str().parse::<usize>().unwrap_or(0);
@@ -192,7 +287,10 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
             }
             for idx in &parts_indices {
                 let f = &files[*idx];
-                docs.push(f.doc.clone());
+                match &f.doc {
+                    Either::Left(d) => docs.push(d.clone()),
+                    Either::Right(v) => docs.extend_from_slice(&v[..]),
+                }
                 match (total_size, f.size) {
                     (Some(acc), Some(s)) => total_size = Some(acc + s),
                     _ => total_size = None,
@@ -203,9 +301,12 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
             // Otherwise use the doc-derived base name.
             let mut exposed_name = base.clone();
             // find index with part == 0
-            if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
+                if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
                 let f0 = &files[*first_idx];
-                let doc_name = f0.doc.name().unwrap_or(&f0.name).to_string();
+                let doc_name = match &f0.doc {
+                    Either::Left(d) => d.name().unwrap_or(&f0.name).to_string(),
+                    Either::Right(v) => v.get(0).and_then(|d| d.name()).unwrap_or(&f0.name).to_string(),
+                };
                 if f0.name != doc_name { // message override present
                     exposed_name = f0.name.clone();
                 }
@@ -213,15 +314,38 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
 
             // Build a combined FileEntry using the first part as representative
             let first = &files[parts_indices[0]];
+            // If the base name looks like a .zip, attempt to parse its central directory
+            // across the concatenated parts so we can expose inner entries.
+            let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
+            if base.to_lowercase().ends_with(".zip") {
+                if !docs.is_empty() {
+                    // attempt to parse EOCD and central directory from concatenated parts
+                    let parts_vec = docs.clone();
+                    let total_bytes = parts_vec.iter().map(|d| d.size().unwrap_or(0) as usize).sum::<usize>();
+                    let tail_len = std::cmp::min(total_bytes, 70_000);
+                    let tail_offset = total_bytes.saturating_sub(tail_len);
+                    if let Ok(tail) = download_range_concat(&client, &parts_vec, tail_offset, tail_len).await {
+                        if let Some((cd_off, cd_size)) = find_eocd(&tail) {
+                            if let Ok(cd_bytes) = download_range_concat(&client, &parts_vec, cd_off as usize, cd_size as usize).await {
+                                if let Ok(ae_list) = parse_central_directory(&cd_bytes) {
+                                    archive_entries_combined = Some(ae_list);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Determine combined file_type: prefer the first part's resolved file_type.
+            let combined_file_type = first.file_type.clone();
+
             let combined = FileEntry {
                 name: exposed_name,
-                doc: first.doc.clone(),
+                doc: either::Either::Right(docs),
                 size: total_size,
-                mime_type: first.mime_type.clone(),
-                is_zip: false,
-                archive_entries: None,
-                archive_view: first.archive_view,
-                parts: Some(docs),
+                mime_idx: first.mime_idx,
+                archive_entries: archive_entries_combined,
+                file_type: combined_file_type,
             };
 
             // mark removed indices
@@ -241,5 +365,5 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Hash
         index.insert(name.clone(), new_files);
     }
 
-    Ok(index)
+    Ok((index, mime_vec, channel_view_map))
 }

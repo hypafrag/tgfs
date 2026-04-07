@@ -106,8 +106,8 @@ async fn main() -> anyhow::Result<()> {
         println!("Signed in successfully.");
     }
 
-    let index = indexer::build_index(client.clone(), &config).await?;
-    let state = Arc::new(AppState { client, index });
+    let (index, mime_pool, channel_archive_view) = indexer::build_index(client.clone(), &config).await?;
+    let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view });
 
     let app = server::make_router(state);
 

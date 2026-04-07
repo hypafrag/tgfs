@@ -13,7 +13,8 @@ use tokio::io::BufReader;
 use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
-use crate::index::{AppState, Entry, dir_listing};
+use crate::index::{AppState, Entry, dir_listing, FileType};
+use either::Either;
 use crate::indexer::download_range;
 
 pub async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -53,14 +54,15 @@ pub async fn handle_channel_path(
         if trimmed.is_empty() {
             let mut entries: Vec<Entry> = Vec::new();
             for f in files.iter() {
-                if f.is_zip && f.archive_entries.is_some() {
+                if f.file_type == FileType::Zip && f.archive_entries.is_some() {
                     let stem = std::path::Path::new(&f.name)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(&f.name)
                         .to_string();
                     entries.push(Entry { href: format!("{}/", urlencoding::encode(&f.name)), label: format!("{}/", stem), size: None });
-                    if f.archive_entries.is_some() && f.archive_view == crate::index::ArchiveView::FileAndDirectory {
+                    // channel-level archive_view controls whether to list raw file
+                    if state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::FileAndDirectory {
                         entries.push(Entry { href: urlencoding::encode(&f.name).into_owned(), label: f.name.clone(), size: f.size });
                     }
                 } else {
@@ -76,7 +78,7 @@ pub async fn handle_channel_path(
         let mut parts = trimmed.splitn(2, '/');
         let archive_name = parts.next().unwrap();
         let inner_path = parts.next().unwrap_or("");
-        let entry = files.iter().find(|e| e.name == archive_name && e.is_zip).ok_or(StatusCode::NOT_FOUND)?;
+        let entry = files.iter().find(|e| e.name == archive_name && e.file_type == FileType::Zip).ok_or(StatusCode::NOT_FOUND)?;
         let archive_entries = entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
         use std::collections::BTreeSet;
         let mut seen = BTreeSet::new();
@@ -111,25 +113,29 @@ pub async fn handle_channel_path(
         let files_vec = files;
         let fentry = files_vec.iter().find(|e| e.name == trimmed).ok_or(StatusCode::NOT_FOUND)?;
         // if zip and archive_view is Directory-only, then we do not offer raw download; return 404
-        if fentry.is_zip && fentry.archive_entries.is_some() && fentry.archive_view == crate::index::ArchiveView::Directory {
+        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::Directory {
             return Err(StatusCode::NOT_FOUND);
         }
 
         let client = state.client.clone();
-        let mime = fentry.mime_type.clone();
+        let mime = state.mime_pool.get(fentry.mime_idx).cloned().unwrap_or_else(|| "application/octet-stream".to_string());
         let size = fentry.size;
         let encoded_name = urlencoding::encode(&fentry.name).into_owned();
 
-        // Multipart support: if this FileEntry is composed of parts, allow seeking across
-        // the concatenated uncompressed stream when all part sizes are known.
-        let is_media = mime.starts_with("audio/") || mime.starts_with("video/");
+        // Determine whether to treat this entry as media (inline) based on an
+        // optional per-message `type:` override. If absent, fall back to MIME.
+        let is_media = match fentry.file_type {
+            FileType::Media => true,
+            FileType::File => false,
+            FileType::Zip => false,
+        };
         let content_disposition = if is_media {
             format!("inline; filename*=UTF-8''{encoded_name}")
         } else {
             format!("attachment; filename*=UTF-8''{encoded_name}")
         };
 
-        if let Some(parts) = &fentry.parts {
+        if let Either::Right(parts) = &fentry.doc {
             // gather sizes
             let sizes: Vec<Option<usize>> = parts.iter().map(|d| d.size().map(|s| s as usize)).collect();
             let all_known = sizes.iter().all(|s| s.is_some());
@@ -229,7 +235,7 @@ pub async fn handle_channel_path(
             });
 
             let mut builder = Response::builder()
-                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_TYPE, mime.clone())
                 .header(header::CONTENT_DISPOSITION, content_disposition)
                 .header(header::ACCEPT_RANGES, "bytes");
             if let Some(t) = total { builder = builder.header(header::CONTENT_LENGTH, t.to_string()); }
@@ -238,7 +244,10 @@ pub async fn handle_channel_path(
         }
 
         // single-part: fallthrough to existing single-doc streaming
-        let doc = fentry.doc.clone();
+        let doc = match &fentry.doc {
+            Either::Left(d) => d.clone(),
+            Either::Right(v) => v[0].clone(),
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let mut dl = client.iter_download(&doc);
@@ -270,12 +279,15 @@ pub async fn handle_channel_path(
 
     let archive_entry = files
         .iter()
-        .find(|e| e.name == archive_name && e.is_zip && e.archive_entries.is_some())
+        .find(|e| e.name == archive_name && e.file_type == FileType::Zip && e.archive_entries.is_some())
         .ok_or(StatusCode::NOT_FOUND)?;
 
     // ranged-extract the requested file from the archive without downloading the whole archive
     let client = state.client.clone();
-    let doc = archive_entry.doc.clone();
+    let doc = match &archive_entry.doc {
+        Either::Left(d) => d.clone(),
+        Either::Right(v) => v[0].clone(),
+    };
 
     let archive_entries = archive_entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let ae = archive_entries.iter().find(|x| x.path == inner).ok_or(StatusCode::NOT_FOUND)?;
@@ -333,7 +345,11 @@ pub async fn handle_channel_path(
 
     let mime = guess_mime(inner).first_or_octet_stream().essence_str().to_string();
     let encoded_name = urlencoding::encode(inner).into_owned();
-    let is_media = mime.starts_with("audio/") || mime.starts_with("video/");
+    let is_media = match archive_entry.file_type {
+        FileType::Media => true,
+        FileType::File => false,
+        FileType::Zip => false,
+    };
     let content_disposition = if is_media {
         format!("inline; filename*=UTF-8''{encoded_name}")
     } else {

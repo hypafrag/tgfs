@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use grammers_client::media::Document;
+use either::Either;
 use grammers_client::Client;
 
 #[derive(Deserialize)]
@@ -43,21 +44,34 @@ pub struct ArchiveFileEntry {
 #[allow(dead_code)]
 pub struct FileEntry {
     pub name: String,
-    pub doc: Document,
+    pub doc: Either<Document, Vec<Document>>,
     pub size: Option<usize>,
-    pub mime_type: String,
-    pub is_zip: bool,
+    // Index into the global MIME pool in `AppState`.
+    pub mime_idx: usize,
     pub archive_entries: Option<Vec<ArchiveFileEntry>>,
-    pub archive_view: ArchiveView,
-    // If this entry represents a concatenation of multiple parts, `parts` holds
-    // the ordered list of `Document`s and `doc` is the first part's document.
-    pub parts: Option<Vec<Document>>,
+    // Final computed type for the entry: "file", "media", or "zip".
+    // This is either parsed from a `type:` message override or derived from
+    // the document MIME/type and the original document filename (not the
+    // message `name:` override).
+    pub file_type: FileType,
+    // `doc` is either a single `Document` (Left) or multiple parts (Right).
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Media,
+    Zip,
 }
 
 #[allow(dead_code)]
 pub struct AppState {
     pub client: Client,
     pub index: HashMap<String, Vec<FileEntry>>,
+    // Deduplicated pool of MIME type strings shared across entries.
+    pub mime_pool: Vec<String>,
+    // Channel-level archive view settings (from `tgfs.yml`).
+    pub channel_archive_view: HashMap<String, ArchiveView>,
 }
 
 pub fn human_size(bytes: usize) -> String {
