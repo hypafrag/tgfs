@@ -1,6 +1,7 @@
 mod index;
 mod indexer;
 mod server;
+mod fuse;
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
@@ -104,6 +105,26 @@ async fn main() -> anyhow::Result<()> {
     let indexer::IndexBuildResult { index, mime_vec: mime_pool, channel_view_map: channel_archive_view } =
         indexer::build_index(client.clone(), &config).await?;
     let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view });
+
+    // Check for FUSE mode: `--fuse <mountpoint>`
+    let mut args = std::env::args().skip(1);
+    if let Some(first) = args.next() {
+        if first == "--fuse" {
+            if let Some(mountpoint) = args.next() {
+                println!("Mounting FUSE filesystem at {mountpoint}");
+                let fs = fuse::TgfsFS::new(Arc::clone(&state));
+                // Mount in blocking thread to avoid blocking the async runtime
+                tokio::task::spawn_blocking(move || {
+                    // Mount options omitted — default
+                    fuser::mount2(fs, mountpoint, &[]).expect("FUSE mount failed");
+                }).await.expect("spawn failed");
+                return Ok(());
+            } else {
+                eprintln!("--fuse requires a mountpoint argument");
+                return Ok(());
+            }
+        }
+    }
 
     let app = server::make_router(state);
 
