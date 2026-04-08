@@ -126,6 +126,23 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // On SIGTERM or SIGINT, unmount the FUSE filesystem (if any) so the mount point
+    // is clean on container restart, then exit.
+    if let Some(mp) = config.mount_at.clone() {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint  = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv()  => {}
+            }
+            println!("Shutting down, unmounting {mp}...");
+            std::process::Command::new("fusermount").args(["-u", &mp]).status().ok();
+            std::process::exit(0);
+        });
+    }
+
     // Wait for whichever services are running.
     match (fuse_handle, http_handle) {
         (Some(f), Some(h)) => { let _ = tokio::try_join!(f, h)?; }
