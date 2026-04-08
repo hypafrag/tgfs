@@ -411,15 +411,7 @@ impl Filesystem for TgfsFS {
                 None => { reply.error(libc::ENOENT); return; }
             };
             let parts_docs: Vec<_> = f.parts.iter().cloned().collect();
-            // read local header to compute data_offset
-            let lh = match self.block_download(&parts_docs, ae.local_header_offset as usize, 30) {
-                Ok(b) => b,
-                Err(_) => { reply.error(libc::EIO); return; }
-            };
-            if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { reply.error(libc::EIO); return; }
-            let name_len = u16::from_le_bytes([lh[26], lh[27]]) as usize;
-            let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
-            let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
+            let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {
                 0 => {

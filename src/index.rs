@@ -64,7 +64,7 @@ pub struct ArchiveFileEntry {
     pub path: String,
     pub compressed_size: usize,
     pub uncompressed_size: usize,
-    pub local_header_offset: u64,
+    pub data_offset: u64,
     pub compression_method: u16,
     /// Unix permission bits (lower 12 bits of st_mode), present when the archive
     /// was created on a Unix system (Info-ZIP "version made by" OS byte == 3).

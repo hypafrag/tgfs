@@ -66,7 +66,17 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str) -> Optio
     };
     println!("    central directory at {} ({} bytes)", cd_off, cd_size);
     let cd_bytes = download_range(client, docs, cd_off as usize, cd_size as usize).await.ok()?;
-    let ae_list = parse_central_directory(&cd_bytes).ok()?;
+    let (mut ae_list, lh_offsets) = parse_central_directory(&cd_bytes).ok()?;
+    // Fetch each local file header to resolve the true data offset.
+    // The local extra field length can differ from the central directory,
+    // so we must read it — but only once per entry, here at index time.
+    for (ae, lh_offset) in ae_list.iter_mut().zip(lh_offsets.iter()) {
+        let lh = download_range(client, docs, *lh_offset as usize, 30).await.ok()?;
+        if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { return None; }
+        let name_len = u16::from_le_bytes([lh[26], lh[27]]) as usize;
+        let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
+        ae.data_offset = lh_offset + 30 + name_len as u64 + extra_len as u64;
+    }
     println!("  zip entries read: {}", ae_list.len());
     Some(ae_list)
 }
@@ -163,9 +173,13 @@ fn find_zip64_eocd(tail: &[u8], eocd_pos: usize, tail_offset: u64) -> Option<(u6
     Some((cd_offset, cd_size))
 }
 
-fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
+/// Returns parsed entries alongside their local header offsets.
+/// `try_index_zip` uses the offsets to fetch each local header once and
+/// compute the true data offset (local extra_len can differ from the CD).
+fn parse_central_directory(cd: &[u8]) -> anyhow::Result<(Vec<ArchiveFileEntry>, Vec<u64>)> {
     let mut i: usize = 0;
     let mut entries = Vec::new();
+    let mut lh_offsets: Vec<u64> = Vec::new();
     while i + 46 <= cd.len() {
         if &cd[i..i+4] != [0x50,0x4b,0x01,0x02] { break; }
         let version_made_by = u16le(cd, i+4);
@@ -191,8 +205,6 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
         i = var_start + name_len + extra_len + comment_len;
         if name.ends_with('/') { continue; }
 
-        // Info-ZIP / Unix: upper byte of version_made_by == 3 means the upper 16 bits
-        // of external_attrs are Unix st_mode. Extract permission bits (lower 12).
         let unix_mode = if (version_made_by >> 8) == 3 {
             let mode = (external_attrs >> 16) as u16;
             if mode != 0 { Some(mode & 0o7777) } else { None }
@@ -200,16 +212,17 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
             None
         };
 
+        lh_offsets.push(local_header_offset);
         entries.push(ArchiveFileEntry {
             path: name,
             compressed_size: compressed_size as usize,
             uncompressed_size: uncompressed_size as usize,
-            local_header_offset,
+            data_offset: 0, // filled in by try_index_zip after fetching local headers
             compression_method,
             unix_mode,
         });
     }
-    Ok(entries)
+    Ok((entries, lh_offsets))
 }
 
 /// Parse ZIP64 extended information extra field (tag 0x0001). Values appear in

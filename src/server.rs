@@ -43,7 +43,6 @@ fn stem_full_for(e: &FileEntry) -> String {
     }
 }
 
-fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
 
 fn content_disposition(ft: &FileType, encoded_name: &str) -> String {
     match ft {
@@ -411,16 +410,7 @@ pub async fn handle_channel_path(
     let archive_entries = archive_entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let ae = archive_entries.iter().find(|x| x.path == inner).ok_or(StatusCode::NOT_FOUND)?;
 
-    // read local file header to determine extra field length and filename length
-    let lh = download_range(&client, &archive_parts, ae.local_header_offset as usize, 30)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    let name_len = u16le(&lh, 26) as usize;
-    let extra_len = u16le(&lh, 28) as usize;
-    let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
+    let data_offset = ae.data_offset as usize;
 
     // Choose handling based on compression method: 0 = stored (no compression),
     // 8 = deflate. For stored entries we stream the raw bytes directly; for
