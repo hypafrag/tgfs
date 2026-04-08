@@ -287,8 +287,12 @@ impl Filesystem for TgfsFS {
         };
         let ptrim = path.trim_start_matches('/');
         let mut parts = ptrim.splitn(2, '/');
-        let channel = parts.next().unwrap_or("");
+        let dir = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
+        let channel = match self.state.dir_to_channel.get(dir) {
+            Some(c) => c,
+            None => { reply.error(libc::ENOENT); return; }
+        };
         let files = match self.state.index.get(channel) {
             Some(f) => f,
             None => { reply.error(libc::ENOENT); return; }
