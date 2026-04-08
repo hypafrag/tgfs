@@ -16,7 +16,21 @@ use index::AppState;
 
 const AUTH_FILE: &str = "auth.json";
 const SESSION_FILE: &str = "session.sqlite3";
-const CONFIG_FILE: &str = "tgfs.yml";
+const DEFAULT_CONFIG_FILE: &str = "tgfs.yml";
+
+/// Parse `--config <path>` from CLI args. Defaults to `tgfs.yml`.
+fn parse_config_path() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            return args.next().unwrap_or_else(|| {
+                eprintln!("--config requires a path argument");
+                std::process::exit(2);
+            });
+        }
+    }
+    DEFAULT_CONFIG_FILE.to_string()
+}
 
 #[derive(Serialize, Deserialize)]
 struct AuthConfig {
@@ -64,8 +78,12 @@ async fn make_client(api_id: i32) -> anyhow::Result<Client> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let config_path = parse_config_path();
     let auth = load_or_create_auth();
-    let config = index::load_config(CONFIG_FILE)?;
+    let config = index::load_config(&config_path)?;
+    if config.http_port.is_none() && config.mount_at.is_none() {
+        return Err(anyhow::anyhow!("config must set at least one of `http_port` or `mount_at`"));
+    }
 
     let mut client = make_client(auth.api_id).await?;
 
@@ -106,32 +124,36 @@ async fn main() -> anyhow::Result<()> {
         indexer::build_index(client.clone(), &config).await?;
     let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view });
 
-    // Check for FUSE mode: `--fuse <mountpoint>`
-    let mut args = std::env::args().skip(1);
-    if let Some(first) = args.next() {
-        if first == "--fuse" {
-            if let Some(mountpoint) = args.next() {
-                println!("Mounting FUSE filesystem at {mountpoint}");
-                let fs = fuse::TgfsFS::new(Arc::clone(&state));
-                // Mount in blocking thread to avoid blocking the async runtime
-                tokio::task::spawn_blocking(move || {
-                    // Mount options omitted — default
-                    fuser::mount2(fs, mountpoint, &[]).expect("FUSE mount failed");
-                }).await.expect("spawn failed");
-                return Ok(());
-            } else {
-                eprintln!("--fuse requires a mountpoint argument");
-                return Ok(());
-            }
-        }
+    // Optionally mount FUSE filesystem in a blocking task.
+    let fuse_handle = config.mount_at.as_ref().map(|mountpoint| {
+        println!("Mounting FUSE filesystem at {mountpoint}");
+        let fs = fuse::TgfsFS::new(Arc::clone(&state));
+        let mp = mountpoint.clone();
+        tokio::task::spawn_blocking(move || {
+            fuser::mount2(fs, mp, &[]).expect("FUSE mount failed");
+        })
+    });
+
+    // Optionally serve HTTP index.
+    let http_handle = if let Some(port) = config.http_port {
+        let app = server::make_router(state);
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        println!("Serving on http://{addr}");
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("HTTP server failed");
+        }))
+    } else {
+        None
+    };
+
+    // Wait for whichever services are running.
+    match (fuse_handle, http_handle) {
+        (Some(f), Some(h)) => { let _ = tokio::try_join!(f, h)?; }
+        (Some(f), None) => { f.await?; }
+        (None, Some(h)) => { h.await?; }
+        (None, None) => unreachable!("validated above"),
     }
-
-    let app = server::make_router(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    println!("Serving on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
 
     Ok(())
 }

@@ -28,12 +28,12 @@ fn default_archive_view() -> ArchiveView {
 
 #[derive(Deserialize)]
 pub struct Config {
-    #[serde(default = "default_port")]
-    pub port: u16,
+    #[serde(default)]
+    pub http_port: Option<u16>,
+    #[serde(default)]
+    pub mount_at: Option<String>,
     pub channels: Vec<ChannelEntry>,
 }
-
-fn default_port() -> u16 { 8080 }
 
 pub struct ArchiveFileEntry {
     pub path: String,
