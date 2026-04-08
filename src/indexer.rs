@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
-use crate::index::{Config, FileEntry, ArchiveFileEntry, ArchiveView, DocParts};
+use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts};
 use smallvec::smallvec;
 
 fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
@@ -30,21 +30,44 @@ fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
     }
 }
 
-fn classify_file_type(type_override: &Option<crate::index::FileType>, mime_type: &str, doc_name: &str) -> crate::index::FileType {
+fn classify_file_type(type_override: &Option<FileType>, mime_type: &str, doc_name: &str) -> FileType {
     if let Some(t) = type_override { return t.clone(); }
     if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
-        crate::index::FileType::Media
+        FileType::Media
     } else if mime_type == "application/zip" || doc_name.to_lowercase().ends_with(".zip") {
-        crate::index::FileType::Zip
+        FileType::Zip
     } else {
-        crate::index::FileType::File
+        FileType::File
     }
 }
 
 pub struct IndexBuildResult {
     pub index: HashMap<String, Vec<FileEntry>>,
     pub mime_vec: Vec<String>,
-    pub channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView>,
+    pub channel_view_map: HashMap<String, ArchiveView>,
+}
+
+/// Fetch and parse the ZIP central directory for `docs` (one or more concatenated parts).
+/// Returns `None` if the archive can't be indexed (no EOCD, download failure, etc.).
+async fn try_index_zip(client: &Client, docs: &[Document], label: &str) -> Option<Vec<ArchiveFileEntry>> {
+    println!("  fetching EOCD tail of '{}' for indexing", label);
+    io::stdout().flush().ok();
+    let total: usize = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum();
+    let tail_len = std::cmp::min(total, 70_000);
+    let tail_offset = total.saturating_sub(tail_len);
+    let tail = download_range(client, docs, tail_offset, tail_len).await.ok()?;
+    let (cd_off, cd_size) = match find_eocd(&tail, tail_offset as u64) {
+        Some(v) => v,
+        None => {
+            println!("  EOCD not found for '{}', skipping archive index", label);
+            return None;
+        }
+    };
+    println!("    central directory at {} ({} bytes)", cd_off, cd_size);
+    let cd_bytes = download_range(client, docs, cd_off as usize, cd_size as usize).await.ok()?;
+    let ae_list = parse_central_directory(&cd_bytes).ok()?;
+    println!("  zip entries read: {}", ae_list.len());
+    Some(ae_list)
 }
 
 // Download a byte range [offset, offset+length) from Telegram, spanning one or
@@ -203,32 +226,29 @@ fn parse_zip64_extra(extra: &[u8], uncompressed: &mut u64, compressed: &mut u64,
     }
 }
 
-fn resolve_filename(msg: &grammers_client::message::Message, doc: &Document) -> String {
-    if msg.grouped_id().is_none() {
-        for line in msg.text().lines() {
-            if let Some(value) = line.strip_prefix("name:") {
-                return value.trim().to_string();
-            }
-        }
-    }
-    doc.name().unwrap_or("<unnamed>").to_string()
-}
-
-fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<crate::index::FileType> {
-    if msg.grouped_id().is_none() {
-        for line in msg.text().lines() {
-            if let Some(value) = line.strip_prefix("type:") {
-                let v = value.trim().to_lowercase();
-                return match v.as_str() {
-                    "file" => Some(crate::index::FileType::File),
-                    "media" => Some(crate::index::FileType::Media),
-                    "zip" => Some(crate::index::FileType::Zip),
-                    _ => None,
-                };
-            }
+/// Look up a `key:` field in a single (non-grouped) message's text.
+fn message_field(msg: &grammers_client::message::Message, key: &str) -> Option<String> {
+    if msg.grouped_id().is_some() { return None; }
+    for line in msg.text().lines() {
+        if let Some(value) = line.strip_prefix(key) {
+            return Some(value.trim().to_string());
         }
     }
     None
+}
+
+fn resolve_filename(msg: &grammers_client::message::Message, doc: &Document) -> String {
+    message_field(msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string())
+}
+
+fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<FileType> {
+    let v = message_field(msg, "type:")?.to_lowercase();
+    match v.as_str() {
+        "file" => Some(FileType::File),
+        "media" => Some(FileType::Media),
+        "zip" => Some(FileType::Zip),
+        _ => None,
+    }
 }
 
 pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<IndexBuildResult> {
@@ -249,7 +269,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
     let mut mime_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut mime_vec: Vec<String> = Vec::new();
     // build channel -> archive_view map
-    let channel_view_map: std::collections::HashMap<String, crate::index::ArchiveView> = config.channels.iter().map(|c| (c.name.clone(), c.archive_view)).collect();
+    let channel_view_map: HashMap<String, ArchiveView> = config.channels.iter().map(|c| (c.name.clone(), c.archive_view)).collect();
 
     for entry in &config.channels {
         let name = &entry.name;
@@ -281,23 +301,8 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
                 let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
                 let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
-                if final_type == crate::index::FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
-                    println!("  fetching EOCD tail of '{}' for indexing", file_name);
-                    io::stdout().flush().ok();
-                    let size_usize = doc.size().unwrap_or(0) as usize;
-                    let tail_len = std::cmp::min(size_usize, 70_000);
-                    let tail_offset = size_usize.saturating_sub(tail_len);
-                    let parts_one = [doc.clone()];
-                    let tail = download_range(&client, &parts_one, tail_offset, tail_len).await?;
-                    if let Some((cd_off, cd_size)) = find_eocd(&tail, tail_offset as u64) {
-                        println!("    central directory at {} ({} bytes)", cd_off, cd_size);
-                        let cd_bytes = download_range(&client, &parts_one, cd_off as usize, cd_size as usize).await?;
-                        let ae_list = parse_central_directory(&cd_bytes)?;
-                        println!("  zip entries read: {}", ae_list.len());
-                        archive_entries = Some(ae_list);
-                    } else {
-                        println!("  EOCD not found for '{}', skipping archive index", file_name);
-                    }
+                if final_type == FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
+                    archive_entries = try_index_zip(&client, &[doc.clone()], &file_name).await;
                 }
                 // intern mime_type
                 let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
@@ -356,24 +361,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
             if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
                 println!("Processing multipart archive: {}", exposed_name);
-                println!("  fetching EOCD tail of '{}' for indexing", exposed_name);
-                io::stdout().flush().ok();
-                let total_bytes = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum::<usize>();
-                let tail_len = std::cmp::min(total_bytes, 70_000);
-                let tail_offset = total_bytes.saturating_sub(tail_len);
-                if let Ok(tail) = download_range(&client, &docs, tail_offset, tail_len).await {
-                    if let Some((cd_off, cd_size)) = find_eocd(&tail, tail_offset as u64) {
-                        println!("    central directory at {} ({} bytes)", cd_off, cd_size);
-                        if let Ok(cd_bytes) = download_range(&client, &docs, cd_off as usize, cd_size as usize).await {
-                            if let Ok(ae_list) = parse_central_directory(&cd_bytes) {
-                                println!("  zip entries read: {}", ae_list.len());
-                                archive_entries_combined = Some(ae_list);
-                            }
-                        }
-                    } else {
-                        println!("  EOCD not found for '{}', skipping archive index", exposed_name);
-                    }
-                }
+                archive_entries_combined = try_index_zip(&client, &docs, &exposed_name).await;
             }
 
             // Determine combined file_type: prefer the first part's resolved file_type.

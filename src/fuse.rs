@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen};
+use grammers_client::media::Document;
+use tokio::runtime::Handle;
 
 use crate::index::{AppState, ArchiveView, FileEntry, FileType};
 use crate::indexer::download_range;
@@ -31,11 +33,92 @@ fn full_for(e: &FileEntry) -> String {
     }
 }
 
+fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
+    FileAttr {
+        ino, size: 0, blocks: 0,
+        atime: now, mtime: now, ctime: now, crtime: now,
+        kind: FuseFileType::Directory,
+        perm: 0o755, nlink: 2,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        rdev: 0, flags: 0, blksize: 512,
+    }
+}
+
+fn file_attr(ino: u64, size: u64, now: SystemTime) -> FileAttr {
+    FileAttr {
+        ino, size, blocks: (size + 511) / 512,
+        atime: now, mtime: now, ctime: now, crtime: now,
+        kind: FuseFileType::RegularFile,
+        perm: 0o444, nlink: 1,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        rdev: 0, flags: 0, blksize: 512,
+    }
+}
+
+/// Add `name` as a child of `parent` if not already present.
+fn add_child(children: &mut HashMap<String, Vec<String>>, parent: &str, name: &str) {
+    let cv = children.entry(parent.to_string()).or_default();
+    if !cv.iter().any(|n| n == name) {
+        cv.push(name.to_string());
+    }
+}
+
+/// Ensure a directory entry exists at `path` with `parent` as its parent.
+fn ensure_dir(
+    path_to_attr: &mut HashMap<String, FileAttr>,
+    children: &mut HashMap<String, Vec<String>>,
+    parent: &str,
+    name: &str,
+    path: &str,
+    now: SystemTime,
+) {
+    add_child(children, parent, name);
+    path_to_attr.entry(path.to_string()).or_insert_with(|| dir_attr(path_hash(path), now));
+}
+
+/// Ensure all intermediate directories along `base/rel` exist. Returns the leaf
+/// path. If `rel` is empty, returns `base`.
+fn ensure_dirs_along(
+    path_to_attr: &mut HashMap<String, FileAttr>,
+    children: &mut HashMap<String, Vec<String>>,
+    base: &str,
+    rel: &str,
+    now: SystemTime,
+) -> String {
+    let mut parent = base.to_string();
+    if rel.is_empty() { return parent; }
+    for seg in rel.split('/') {
+        let child = format!("{}/{}", parent, seg);
+        ensure_dir(path_to_attr, children, &parent, seg, &child, now);
+        parent = child;
+    }
+    parent
+}
+
+/// Add a regular file at `<parent>/<name>` of the given size.
+fn add_file(
+    path_to_attr: &mut HashMap<String, FileAttr>,
+    children: &mut HashMap<String, Vec<String>>,
+    parent: &str,
+    name: &str,
+    size: u64,
+    now: SystemTime,
+) {
+    add_child(children, parent, name);
+    let path = format!("{}/{}", parent, name);
+    path_to_attr.insert(path.clone(), file_attr(path_hash(&path), size, now));
+}
+
 pub struct TgfsFS {
     state: Arc<AppState>,
     // mappings built at init
     path_to_attr: HashMap<String, FileAttr>,
+    ino_to_path: HashMap<u64, String>,
     children: HashMap<String, Vec<String>>,
+    // Captured at construction so blocking FUSE callbacks can drive async ops.
+    rt: Handle,
 }
 
 impl TgfsFS {
@@ -46,255 +129,70 @@ impl TgfsFS {
         let now = SystemTime::now();
 
         // root
-        let root_attr = FileAttr {
-            ino: path_hash("/"),
-            size: 0,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FuseFileType::Directory,
-            perm: 0o755,
-            nlink: 2,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-            rdev: 0,
-            flags: 0,
-            blksize: 512,
-        };
-        path_to_attr.insert("/".to_string(), root_attr);
+        path_to_attr.insert("/".to_string(), dir_attr(path_hash("/"), now));
 
         // channels as top-level dirs
         for channel in state.index.keys() {
             let ch_path = format!("/{}", channel);
-            let ch_attr = FileAttr {
-                ino: path_hash(&ch_path),
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FuseFileType::Directory,
-                perm: 0o755,
-                nlink: 2,
-                uid: unsafe { libc::geteuid() },
-                gid: unsafe { libc::getegid() },
-                rdev: 0,
-                flags: 0,
-                blksize: 512,
-            };
-            path_to_attr.insert(ch_path.clone(), ch_attr);
-            children.entry("/".to_string()).or_default().push(channel.clone());
+            ensure_dir(&mut path_to_attr, &mut children, "/", channel, &ch_path, now);
 
             let archive_view = state.channel_archive_view.get(channel).copied().unwrap_or(ArchiveView::File);
 
-            if let Some(files) = state.index.get(channel) {
-                // add files and directories
-                for f in files.iter() {
-                    let full = full_for(f);
-                    let is_browsable_zip = f.file_type == FileType::Zip
-                        && f.archive_entries.is_some()
-                        && archive_view != ArchiveView::File;
-                    let show_as_file = !is_browsable_zip || archive_view == ArchiveView::FileAndDirectory;
+            let files = match state.index.get(channel) {
+                Some(f) => f,
+                None => continue,
+            };
 
-                    // Build path components for this entry
-                    let mut comps: Vec<String> = Vec::new();
-                    let ch_prefix = format!("/{}", channel);
-                    comps.push(ch_prefix.clone());
-                    for seg in full.split('/') {
-                        let parent = comps.last().unwrap().clone();
-                        let child_path = if parent == "/" { format!("/{}", seg) } else { format!("{}/{}", parent, seg) };
-                        comps.push(child_path.clone());
-                    }
+            for f in files.iter() {
+                let full = full_for(f);
+                let is_browsable_zip = f.file_type == FileType::Zip
+                    && f.archive_entries.is_some()
+                    && archive_view != ArchiveView::File;
+                let show_as_file = !is_browsable_zip || archive_view == ArchiveView::FileAndDirectory;
 
-                    if show_as_file {
-                        // iterate comps to create directories and final file
-                        for i in 1..comps.len() {
-                            let p = comps[i - 1].clone();
-                            let c = comps[i].clone();
-                            let name = c.trim_start_matches(&format!("{}/", p)).trim_start_matches('/').to_string();
-                            if !children.get(&p).map_or(false, |v| v.contains(&name)) {
-                                children.entry(p.clone()).or_default().push(name.clone());
-                            }
-                            if i == comps.len() - 1 {
-                                let size = f.size.unwrap_or(0) as u64;
-                                let fa = FileAttr {
-                                    ino: path_hash(&c),
-                                    size,
-                                    blocks: (size + 511) / 512,
-                                    atime: now,
-                                    mtime: now,
-                                    ctime: now,
-                                    crtime: now,
-                                    kind: FuseFileType::RegularFile,
-                                    perm: 0o444,
-                                    nlink: 1,
-                                    uid: unsafe { libc::geteuid() },
-                                    gid: unsafe { libc::getegid() },
-                                    rdev: 0,
-                                    flags: 0,
-                                    blksize: 512,
-                                };
-                                path_to_attr.insert(c.clone(), fa);
-                            } else if !path_to_attr.contains_key(&comps[i]) {
-                                let da = FileAttr {
-                                    ino: path_hash(&comps[i]),
-                                    size: 0,
-                                    blocks: 0,
-                                    atime: now,
-                                    mtime: now,
-                                    ctime: now,
-                                    crtime: now,
-                                    kind: FuseFileType::Directory,
-                                    perm: 0o755,
-                                    nlink: 2,
-                                    uid: unsafe { libc::geteuid() },
-                                    gid: unsafe { libc::getegid() },
-                                    rdev: 0,
-                                    flags: 0,
-                                    blksize: 512,
-                                };
-                                path_to_attr.insert(comps[i].clone(), da);
-                            }
+                // Split `full` into parent dir path (relative) and final name.
+                let (parent_rel, fname) = match full.rfind('/') {
+                    Some(i) => (&full[..i], &full[i + 1..]),
+                    None => ("", full.as_str()),
+                };
+
+                if show_as_file {
+                    let parent_path = ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
+                    let size = f.size.unwrap_or(0) as u64;
+                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, now);
+                } else {
+                    // Directory-only zip: create intermediate dirs only (skip file leaf).
+                    ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
+                }
+
+                // Expose archive entries as a virtual directory named after the stem.
+                if is_browsable_zip {
+                    let ae_list = f.archive_entries.as_ref().unwrap();
+                    let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name);
+                    let stem_full = match &f.path {
+                        Some(p) => {
+                            let s = p.to_string_lossy().replace('\\', "/");
+                            if s.is_empty() { stem.to_string() } else { format!("{}/{}", s, stem) }
                         }
-                    } else {
-                        // Directory-only zip: create intermediate dirs but not the file itself
-                        for i in 1..comps.len() - 1 {
-                            let p = comps[i - 1].clone();
-                            let name = comps[i].trim_start_matches(&format!("{}/", p)).trim_start_matches('/').to_string();
-                            if !children.get(&p).map_or(false, |v| v.contains(&name)) {
-                                children.entry(p.clone()).or_default().push(name.clone());
-                            }
-                            if !path_to_attr.contains_key(&comps[i]) {
-                                let da = FileAttr {
-                                    ino: path_hash(&comps[i]),
-                                    size: 0,
-                                    blocks: 0,
-                                    atime: now,
-                                    mtime: now,
-                                    ctime: now,
-                                    crtime: now,
-                                    kind: FuseFileType::Directory,
-                                    perm: 0o755,
-                                    nlink: 2,
-                                    uid: unsafe { libc::geteuid() },
-                                    gid: unsafe { libc::getegid() },
-                                    rdev: 0,
-                                    flags: 0,
-                                    blksize: 512,
-                                };
-                                path_to_attr.insert(comps[i].clone(), da);
-                            }
-                        }
-                    }
+                        None => stem.to_string(),
+                    };
+                    let arc_dir = ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, &stem_full, now);
 
-                    // Expose archive entries as a virtual directory named after the stem
-                    if is_browsable_zip {
-                        let ae_list = f.archive_entries.as_ref().unwrap();
-                        let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name);
-                        // Build stem path respecting virtual path prefix (same as server's stem_full_for)
-                        let stem_full = match &f.path {
-                            Some(p) => {
-                                let s = p.to_string_lossy().replace('\\', "/");
-                                if s.is_empty() { stem.to_string() } else { format!("{}/{}", s, stem) }
-                            }
-                            None => stem.to_string(),
+                    for ae in ae_list.iter() {
+                        let (ae_parent_rel, ae_name) = match ae.path.rfind('/') {
+                            Some(i) => (&ae.path[..i], &ae.path[i + 1..]),
+                            None => ("", ae.path.as_str()),
                         };
-                        let arc_dir = format!("/{}/{}", channel, stem_full);
-
-                        // Ensure parent directories of arc_dir exist
-                        let mut arc_comps: Vec<String> = vec![ch_prefix.clone()];
-                        for seg in stem_full.split('/') {
-                            let parent = arc_comps.last().unwrap().clone();
-                            let child_path = format!("{}/{}", parent, seg);
-                            let name = seg.to_string();
-                            if !children.get(&parent).map_or(false, |v| v.contains(&name)) {
-                                children.entry(parent.clone()).or_default().push(name);
-                            }
-                            if !path_to_attr.contains_key(&child_path) {
-                                let da = FileAttr {
-                                    ino: path_hash(&child_path),
-                                    size: 0,
-                                    blocks: 0,
-                                    atime: now,
-                                    mtime: now,
-                                    ctime: now,
-                                    crtime: now,
-                                    kind: FuseFileType::Directory,
-                                    perm: 0o755,
-                                    nlink: 2,
-                                    uid: unsafe { libc::geteuid() },
-                                    gid: unsafe { libc::getegid() },
-                                    rdev: 0,
-                                    flags: 0,
-                                    blksize: 512,
-                                };
-                                path_to_attr.insert(child_path.clone(), da);
-                            }
-                            arc_comps.push(child_path);
-                        }
-
-                        for ae in ae_list.iter() {
-                            let inner_path = format!("{}/{}", arc_dir, ae.path);
-                            let mut parent = arc_dir.clone();
-                            let segs: Vec<&str> = ae.path.split('/').collect();
-                            for (si, seg) in segs.iter().enumerate() {
-                                let child = format!("{}/{}", parent, seg);
-                                let name = seg.to_string();
-                                if !children.get(&parent).map_or(false, |v| v.contains(&name)) {
-                                    children.entry(parent.clone()).or_default().push(name);
-                                }
-                                // intermediate dirs inside archive
-                                if si < segs.len() - 1 && !path_to_attr.contains_key(&child) {
-                                    let da = FileAttr {
-                                        ino: path_hash(&child),
-                                        size: 0,
-                                        blocks: 0,
-                                        atime: now,
-                                        mtime: now,
-                                        ctime: now,
-                                        crtime: now,
-                                        kind: FuseFileType::Directory,
-                                        perm: 0o755,
-                                        nlink: 2,
-                                        uid: unsafe { libc::geteuid() },
-                                        gid: unsafe { libc::getegid() },
-                                        rdev: 0,
-                                        flags: 0,
-                                        blksize: 512,
-                                    };
-                                    path_to_attr.insert(child.clone(), da);
-                                }
-                                parent = child;
-                            }
-                            let size = ae.uncompressed_size as u64;
-                            let fa = FileAttr {
-                                ino: path_hash(&inner_path),
-                                size,
-                                blocks: (size + 511) / 512,
-                                atime: now,
-                                mtime: now,
-                                ctime: now,
-                                crtime: now,
-                                kind: FuseFileType::RegularFile,
-                                perm: 0o444,
-                                nlink: 1,
-                                uid: unsafe { libc::geteuid() },
-                                gid: unsafe { libc::getegid() },
-                                rdev: 0,
-                                flags: 0,
-                                blksize: 512,
-                            };
-                            path_to_attr.insert(inner_path, fa);
-                        }
+                        let ae_parent = ensure_dirs_along(&mut path_to_attr, &mut children, &arc_dir, ae_parent_rel, now);
+                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, now);
                     }
                 }
             }
         }
 
-        Self { state, path_to_attr, children }
+        let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino, p.clone())).collect();
+
+        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current() }
     }
 
     fn lookup_path(&self, path: &str) -> Option<&FileAttr> {
@@ -302,17 +200,25 @@ impl TgfsFS {
         let p = if path == "/" { "/".to_string() } else { path.trim_end_matches('/').to_string() };
         self.path_to_attr.get(&p)
     }
+
+    fn path_for_ino(&self, ino: u64) -> Option<&str> {
+        self.ino_to_path.get(&ino).map(|s| s.as_str())
+    }
+
+    /// Synchronously download a byte range using the captured tokio runtime handle.
+    fn block_download(&self, parts: &[Document], offset: usize, length: usize) -> std::io::Result<Vec<u8>> {
+        let client = self.state.client.clone();
+        self.rt
+            .block_on(async move { download_range(&client, parts, offset, length).await })
+            .map_err(|_| std::io::Error::other("download failed"))
+    }
 }
 
 impl Filesystem for TgfsFS {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        let parent_path = if parent == path_hash("/") { "/".to_string() } else { 
-            // find path by inode
-            let mut found = None;
-            for (p, a) in self.path_to_attr.iter() {
-                if a.ino == parent { found = Some(p.clone()); break; }
-            }
-            if let Some(fp) = found { fp } else { reply.error(libc::ENOENT); return; }
+        let parent_path = match self.path_for_ino(parent) {
+            Some(p) => p.to_string(),
+            None => { reply.error(libc::ENOENT); return; }
         };
         let name_str = name.to_string_lossy();
         let target = if parent_path == "/" { format!("/{}", name_str) } else { format!("{}/{}", parent_path, name_str) };
@@ -324,21 +230,17 @@ impl Filesystem for TgfsFS {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        let mut found: Option<FileAttr> = None;
-        for a in self.path_to_attr.values() {
-            if a.ino == ino { found = Some(a.clone()); break; }
-        }
-        if let Some(a) = found {
-            reply.attr(&Duration::from_secs(1), &a);
-        } else {
-            reply.error(libc::ENOENT);
+        match self.path_for_ino(ino).and_then(|p| self.path_to_attr.get(p)) {
+            Some(a) => reply.attr(&Duration::from_secs(1), a),
+            None => reply.error(libc::ENOENT),
         }
     }
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        // find path for ino
-        let path = self.path_to_attr.iter().find(|(_, a)| a.ino == ino).map(|(p, _)| p.clone());
-        let path = if let Some(p) = path { p } else { reply.error(libc::ENOENT); return; };
+        let path = match self.path_for_ino(ino) {
+            Some(p) => p.to_string(),
+            None => { reply.error(libc::ENOENT); return; }
+        };
         let mut entries: Vec<(u64, FuseFileType, String)> = Vec::new();
         // . and ..
         entries.push((path_hash(&path), FuseFileType::Directory, ".".to_string()));
@@ -360,21 +262,25 @@ impl Filesystem for TgfsFS {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let exists = self.path_to_attr.values().any(|a| a.ino == ino && a.kind == FuseFileType::Directory);
+        let exists = self.path_for_ino(ino)
+            .and_then(|p| self.path_to_attr.get(p))
+            .map_or(false, |a| a.kind == FuseFileType::Directory);
         if exists { reply.opened(0, 0); } else { reply.error(libc::ENOENT); }
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         // Only allow reading of regular files
-        let exists = self.path_to_attr.values().any(|a| a.ino == ino && a.kind == FuseFileType::RegularFile);
+        let exists = self.path_for_ino(ino)
+            .and_then(|p| self.path_to_attr.get(p))
+            .map_or(false, |a| a.kind == FuseFileType::RegularFile);
         if exists { reply.opened(0, 0); } else { reply.error(libc::EISDIR); }
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        // find path
-        let path = self.path_to_attr.iter().find(|(_, a)| a.ino == ino).map(|(p, _)| p.clone());
-        let path = if let Some(p) = path { p } else { reply.error(libc::ENOENT); return; };
-        // find corresponding FileEntry (if any)
+        let path = match self.path_for_ino(ino) {
+            Some(p) => p.to_string(),
+            None => { reply.error(libc::ENOENT); return; }
+        };
         let ptrim = path.trim_start_matches('/');
         let mut parts = ptrim.splitn(2, '/');
         let channel = parts.next().unwrap_or("");
@@ -386,18 +292,10 @@ impl Filesystem for TgfsFS {
 
         // Try direct file match
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
-            let off = offset as usize;
-            let want = size as usize;
-            // use tokio runtime to call async download_range
-            // build parts slice
-            let client = self.state.client.clone();
             let parts_docs: Vec<_> = fentry.parts.iter().cloned().collect();
-            let res = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                download_range(&client, &parts_docs, off, want).await
-            });
-            match res {
-                Ok(buf) => { reply.data(&buf); }
-                Err(_) => { reply.error(libc::EIO); }
+            match self.block_download(&parts_docs, offset as usize, size as usize) {
+                Ok(buf) => reply.data(&buf),
+                Err(_) => reply.error(libc::EIO),
             }
             return;
         }
@@ -410,52 +308,52 @@ impl Filesystem for TgfsFS {
             let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name).to_string();
             let prefix_full = format!("{}/", full);
             let prefix_stem = format!("{}/", stem);
-            if rest.starts_with(&prefix_full) || rest.starts_with(&prefix_stem) {
-                let inner = if rest.starts_with(&prefix_full) { &rest[prefix_full.len()..] } else { &rest[prefix_stem.len()..] };
-                let ae_opt = f.archive_entries.as_ref().unwrap().iter().find(|x| x.path == inner);
-                if ae_opt.is_none() { reply.error(libc::ENOENT); return; }
-                let ae = ae_opt.unwrap();
-                // read local header to compute data_offset
-                let client = self.state.client.clone();
-                let parts_docs: Vec<_> = f.parts.iter().cloned().collect();
-                let header = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                    download_range(&client, &parts_docs, ae.local_header_offset as usize, 30).await
-                });
-                if header.is_err() { reply.error(libc::EIO); return; }
-                let lh = header.unwrap();
-                if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { reply.error(libc::EIO); return; }
-                let name_len = u16::from_le_bytes([lh[26], lh[27]]) as usize;
-                let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
-                let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
+            let inner = if rest.starts_with(&prefix_full) {
+                &rest[prefix_full.len()..]
+            } else if rest.starts_with(&prefix_stem) {
+                &rest[prefix_stem.len()..]
+            } else {
+                continue;
+            };
+            let ae = match f.archive_entries.as_ref().unwrap().iter().find(|x| x.path == inner) {
+                Some(a) => a,
+                None => { reply.error(libc::ENOENT); return; }
+            };
+            let parts_docs: Vec<_> = f.parts.iter().cloned().collect();
+            // read local header to compute data_offset
+            let lh = match self.block_download(&parts_docs, ae.local_header_offset as usize, 30) {
+                Ok(b) => b,
+                Err(_) => { reply.error(libc::EIO); return; }
+            };
+            if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { reply.error(libc::EIO); return; }
+            let name_len = u16::from_le_bytes([lh[26], lh[27]]) as usize;
+            let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
+            let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
 
-                match ae.compression_method {
-                    0 => {
-                        // stored
-                        let off = data_offset + offset as usize;
-                        let want = size as usize;
-                        let res = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                            download_range(&client, &parts_docs, off, want).await
-                        });
-                        match res { Ok(buf) => reply.data(&buf), Err(_) => reply.error(libc::EIO) }
-                        return;
+            match ae.compression_method {
+                0 => {
+                    let off = data_offset + offset as usize;
+                    match self.block_download(&parts_docs, off, size as usize) {
+                        Ok(buf) => reply.data(&buf),
+                        Err(_) => reply.error(libc::EIO),
                     }
-                    8 => {
-                        // deflate: download compressed payload then inflate synchronously
-                        let comp = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                            download_range(&client, &parts_docs, data_offset, ae.compressed_size).await
-                        });
-                        if comp.is_err() { reply.error(libc::EIO); return; }
-                        let comp_bytes = comp.unwrap();
-                        let mut decoder = DeflateDecoder::new(&comp_bytes[..]);
-                        let mut out = Vec::with_capacity(ae.uncompressed_size);
-                        if std::io::copy(&mut decoder, &mut out).is_err() { reply.error(libc::EIO); return; }
-                        let off = offset as usize;
-                        let end = std::cmp::min(out.len(), off + size as usize);
-                        if off >= out.len() { reply.data(&[]); } else { reply.data(&out[off..end]); }
-                        return;
-                    }
-                    _ => { reply.error(libc::ENOTSUP); return; }
+                    return;
                 }
+                8 => {
+                    // deflate: download compressed payload then inflate synchronously
+                    let comp_bytes = match self.block_download(&parts_docs, data_offset, ae.compressed_size) {
+                        Ok(b) => b,
+                        Err(_) => { reply.error(libc::EIO); return; }
+                    };
+                    let mut decoder = DeflateDecoder::new(&comp_bytes[..]);
+                    let mut out = Vec::with_capacity(ae.uncompressed_size);
+                    if std::io::copy(&mut decoder, &mut out).is_err() { reply.error(libc::EIO); return; }
+                    let off = offset as usize;
+                    let end = std::cmp::min(out.len(), off + size as usize);
+                    if off >= out.len() { reply.data(&[]); } else { reply.data(&out[off..end]); }
+                    return;
+                }
+                _ => { reply.error(libc::ENOTSUP); return; }
             }
         }
 

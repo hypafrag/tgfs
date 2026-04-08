@@ -202,6 +202,31 @@ fn parent_href(channel: &str, trimmed: &str) -> String {
     }
 }
 
+/// Find the archive entry whose virtual path (or stem-path, with `.zip` stripped)
+/// matches `trimmed`. Returns `(entry, inner_prefix)`. When `allow_exact` is true,
+/// an exact match returns `inner_prefix = ""`; otherwise only prefix matches are
+/// considered (used for inner-file downloads, where the archive root itself is
+/// served as a directory listing instead).
+fn match_archive<'a>(files: &'a [FileEntry], trimmed: &str, allow_exact: bool) -> Option<(&'a FileEntry, String)> {
+    for e in files.iter() {
+        if e.file_type != FileType::Zip || e.archive_entries.is_none() { continue; }
+        let full = full_for(e);
+        let stem = stem_full_for(e);
+        if allow_exact && (trimmed == full || trimmed == stem) {
+            return Some((e, String::new()));
+        }
+        let full_pref = format!("{}/", full);
+        if trimmed.starts_with(&full_pref) {
+            return Some((e, trimmed[full_pref.len()..].to_string()));
+        }
+        let stem_pref = format!("{}/", stem);
+        if trimmed.starts_with(&stem_pref) {
+            return Some((e, trimmed[stem_pref.len()..].to_string()));
+        }
+    }
+    None
+}
+
 fn entries_for_root(files: &[FileEntry], channel: &str, archive_view: crate::index::ArchiveView) -> (Vec<Entry>, String) {
     use std::collections::BTreeSet;
     let mut dirs: BTreeSet<String> = BTreeSet::new();
@@ -331,36 +356,9 @@ pub async fn handle_channel_path(
         }
 
         // Determine whether this directory refers to an archive (either the archive root
-        // or a path inside the archive) by checking if any zip entry's full or stem-full
-        // path equals or prefixes `trimmed`. If so, render the archive internal listing
+        // or a path inside the archive). If so, render the archive internal listing
         // for the matching inner prefix.
-        let mut matched_archive: Option<&FileEntry> = None;
-        let mut inner_prefix: String = String::new();
-        for e in files.iter() {
-            if e.file_type != FileType::Zip { continue; }
-            if e.archive_entries.is_none() { continue; }
-            let full = full_for(e);
-            let stem = stem_full_for(e);
-            if trimmed == full || trimmed == stem {
-                matched_archive = Some(e);
-                inner_prefix.clear();
-                break;
-            }
-            let full_pref = format!("{}/", full);
-            if trimmed.starts_with(&full_pref) {
-                matched_archive = Some(e);
-                inner_prefix = trimmed[full_pref.len()..].to_string();
-                break;
-            }
-            let stem_pref = format!("{}/", stem);
-            if trimmed.starts_with(&stem_pref) {
-                matched_archive = Some(e);
-                inner_prefix = trimmed[stem_pref.len()..].to_string();
-                break;
-            }
-        }
-
-        if let Some(archive_entry) = matched_archive {
+        if let Some((archive_entry, inner_prefix)) = match_archive(files, trimmed, true) {
             let listing = entries_for_archive_listing(archive_entry, &channel, trimmed, &inner_prefix);
             let title = format!("Index of /{channel}/{trimmed}/");
             return html_response(dir_listing(&title, Some(&parent_href(&channel, trimmed)), &listing));
@@ -401,27 +399,8 @@ pub async fn handle_channel_path(
     // inner archive file download: match an archive whose virtual full path or stem-full
     // path is a prefix of the request path: "<archive_full_path>/path/to/file" or
     // "<archive_stem_path>/path/to/file" (where stem_path omits the .zip extension).
-    let mut archive_entry_opt: Option<&FileEntry> = None;
-    let mut inner: &str = "";
-    for e in files.iter() {
-        if e.file_type != FileType::Zip { continue; }
-        if e.archive_entries.is_none() { continue; }
-        let full = full_for(e);
-        let stem_full = stem_full_for(e);
-        let prefix_full = format!("{}/", full);
-        let prefix_stem = format!("{}/", stem_full);
-        if trimmed.starts_with(&prefix_full) {
-            archive_entry_opt = Some(e);
-            inner = &trimmed[prefix_full.len()..];
-            break;
-        }
-        if trimmed.starts_with(&prefix_stem) {
-            archive_entry_opt = Some(e);
-            inner = &trimmed[prefix_stem.len()..];
-            break;
-        }
-    }
-    let archive_entry = archive_entry_opt.ok_or(StatusCode::NOT_FOUND)?;
+    let (archive_entry, inner) = match_archive(files, trimmed, false).ok_or(StatusCode::NOT_FOUND)?;
+    let inner = inner.as_str();
 
     // ranged-extract the requested file from the archive without downloading the whole archive.
     // The archive itself may be multipart, so we thread its full `parts` list through every read.
