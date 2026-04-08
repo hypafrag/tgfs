@@ -34,10 +34,11 @@ Once running, browse `http://localhost:8080/`.
 
 ## Configuration
 
-Create `tgfs.yml` in the working directory:
+Create `tgfs.yml` in the working directory (or pass `--config <path>`):
 
 ```yaml
-port: 8080
+http_port: 8080         # optional — serve HTTP index on this port
+mount_at: /mnt/tgfs     # optional — mount FUSE filesystem at this path
 channels:
   - name: Audiobooks
     archive_view: directory
@@ -45,6 +46,8 @@ channels:
   - name: ROMs
     archive_view: file_and_directory
 ```
+
+At least one of `http_port` or `mount_at` must be set; both can run simultaneously.
 
 ### `archive_view`
 
@@ -62,3 +65,51 @@ Single-message documents (not grouped albums) support caption directives:
 
 - `name: path/to/file.ext` — override the filename and/or place the file under a virtual directory.
 - `type: file|media|zip` — override auto-classification. `media` forces inline playback; `file` forces download; `zip` enables archive indexing.
+
+## Docker
+
+A multi-stage `Dockerfile` is provided. The runtime image is based on `debian:bookworm-slim` and contains only the stripped binary plus `ca-certificates` and `libfuse2` — no Rust toolchain or build artifacts.
+
+```bash
+docker build -t tgfs .
+```
+
+The container reads its config and persistent state from `/data`. Mount your `tgfs.yml`, `auth.json`, and `session.sqlite3` there:
+
+### HTTP only
+
+```bash
+docker run --rm -it \
+  -v $PWD/tgfs.yml:/data/tgfs.yml \
+  -v $PWD/auth.json:/data/auth.json \
+  -v $PWD/session.sqlite3:/data/session.sqlite3 \
+  -p 8080:8080 \
+  tgfs
+```
+
+On first run, omit `-v` for `auth.json`/`session.sqlite3` and use `-it` so you can complete interactive sign-in; the files will be created in `/data` and you can persist them on subsequent runs.
+
+### With FUSE mount
+
+FUSE inside a container needs `/dev/fuse`, the `SYS_ADMIN` capability, and a bind-mounted target directory with shared propagation so the mount is visible on the host:
+
+```bash
+docker run --rm -it \
+  --cap-add SYS_ADMIN \
+  --device /dev/fuse \
+  --security-opt apparmor:unconfined \
+  -v $PWD/tgfs.yml:/data/tgfs.yml \
+  -v $PWD/auth.json:/data/auth.json \
+  -v $PWD/session.sqlite3:/data/session.sqlite3 \
+  -v $PWD/mnt:/mnt/tgfs:rshared \
+  -p 8080:8080 \
+  tgfs
+```
+
+With `mount_at: /mnt/tgfs` and `http_port: 8080` both set in `tgfs.yml`, the container serves both the HTTP index and the FUSE mount in one process.
+
+### Custom config path
+
+```bash
+docker run --rm -it -v $PWD/my.yml:/data/my.yml tgfs --config /data/my.yml
+```
