@@ -131,9 +131,37 @@ pub fn dir_listing(title: &str, parent: Option<&str>, entries: &[Entry]) -> Stri
     body
 }
 
+/// Substitute `$VAR` and `${VAR}` references in `s` with values from the environment.
+/// Unset variables are replaced with an empty string.
+fn expand_env(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' { out.push(c); continue; }
+        match chars.peek() {
+            Some(&'{') => {
+                chars.next();
+                let name: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+            Some(&c2) if c2.is_ascii_alphanumeric() || c2 == '_' => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '_' { name.push(nc); chars.next(); }
+                    else { break; }
+                }
+                let _ = c2; // already consumed via peek-driven loop above
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 // convenience loader used by main
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let data = std::fs::read_to_string(path)
         .map_err(|_| anyhow::anyhow!("{} not found", path))?;
-    Ok(serde_yaml::from_str(&data)?)
+    Ok(serde_yaml::from_str(&expand_env(&data))?)
 }

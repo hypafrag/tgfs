@@ -53,6 +53,14 @@ channels:
 
 At least one of `http_port` or `mount_at` must be set; both can run simultaneously.
 
+`$VAR` and `${VAR}` references in the config file are expanded from the environment, so credentials can be kept out of the file:
+
+```yaml
+api_id: ${TG_API_ID}
+api_hash: ${TG_API_HASH}
+phone: "${TG_PHONE}"
+```
+
 ### `archive_view`
 
 Controls how `.zip` files are exposed:
