@@ -14,7 +14,6 @@ use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
 use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
-use crate::indexer::download_range;
 use grammers_client::Client;
 use tokio_stream::Stream;
 
