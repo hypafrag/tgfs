@@ -123,48 +123,75 @@ fn add_file(
     path_to_attr.insert(path, attr);
 }
 
-const DEFLATE_FETCH_INITIAL: usize = 64 * 1024;
-const DEFLATE_FETCH_READAHEAD: usize = 512 * 1024;
+const DEFLATE_FETCH: usize = 512 * 1024;
+// Trigger the next prefetch when this many bytes of the current buffer remain.
+const DEFLATE_PREFETCH_AT: usize = DEFLATE_FETCH / 2;
 
-/// Streams compressed bytes from Telegram on demand, one chunk at a time.
-/// Wrapped by `DeflateDecoder` so only the decoder's 32 KB window is held
-/// in memory — not the full compressed payload.
+/// Streams compressed bytes from Telegram on demand.
+/// Keeps one in-flight prefetch task so the next chunk is downloading
+/// while the DeflateDecoder consumes the current one.
 struct TelegramReader {
     client: Client,
     parts: Vec<Document>,
     /// Absolute byte offset in the Telegram file where compressed data begins.
     data_offset: usize,
     compressed_size: usize,
-    /// Compressed bytes consumed so far (relative to data_offset).
-    consumed: usize,
+    /// Compressed bytes scheduled for fetching so far (handed off to prefetch tasks).
+    scheduled: usize,
     buf: Vec<u8>,
     buf_pos: usize,
-    next_fetch: usize,
+    prefetch: Option<tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>>,
     rt: Handle,
+}
+
+impl TelegramReader {
+    fn new(client: Client, parts: Vec<Document>, data_offset: usize, compressed_size: usize, rt: Handle) -> Self {
+        let mut r = Self {
+            client, parts, data_offset, compressed_size,
+            scheduled: 0, buf: Vec::new(), buf_pos: 0,
+            prefetch: None, rt,
+        };
+        r.spawn_prefetch();
+        r
+    }
+
+    fn spawn_prefetch(&mut self) {
+        let remaining = self.compressed_size.saturating_sub(self.scheduled);
+        if remaining == 0 { return; }
+        let fetch = remaining.min(DEFLATE_FETCH);
+        let abs = self.data_offset + self.scheduled;
+        self.scheduled += fetch;
+        let client = self.client.clone();
+        let parts = self.parts.clone();
+        self.prefetch = Some(self.rt.spawn(async move {
+            download_range(&client, &parts, abs, fetch).await
+        }));
+    }
+}
+
+impl Drop for TelegramReader {
+    fn drop(&mut self) {
+        if let Some(h) = self.prefetch.take() { h.abort(); }
+    }
 }
 
 impl std::io::Read for TelegramReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // Kick off the next prefetch once we've consumed enough of the current
+        // buffer that the download can complete before we run out.
+        if self.prefetch.is_none() && self.buf_pos >= DEFLATE_PREFETCH_AT {
+            self.spawn_prefetch();
+        }
+
         if self.buf_pos >= self.buf.len() {
-            let remaining = self.compressed_size.saturating_sub(self.consumed);
-            if remaining == 0 {
-                return Ok(0);
-            }
-            let fetch = remaining.min(self.next_fetch);
-            self.next_fetch = DEFLATE_FETCH_READAHEAD;
-            let abs = self.data_offset + self.consumed;
-            // Use a block so borrows of self.rt/client/parts end before we write self.buf.
-            let chunk = {
-                let rt = &self.rt;
-                let client = &self.client;
-                let parts = &self.parts;
-                rt.block_on(download_range(client, parts, abs, fetch))
-                    .map_err(|_| std::io::Error::other("download failed"))?
+            let handle = match self.prefetch.take() {
+                Some(h) => h,
+                None => return Ok(0), // EOF
             };
-            if chunk.is_empty() {
-                return Ok(0);
-            }
-            self.consumed += chunk.len();
+            let chunk = self.rt.block_on(handle)
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)?;
+            if chunk.is_empty() { return Ok(0); }
             self.buf = chunk;
             self.buf_pos = 0;
         }
@@ -442,17 +469,13 @@ impl Filesystem for TgfsFS {
                     // TelegramReader fetches compressed data in small chunks on demand;
                     // the DeflateDecoder only buffers its 32 KB sliding window.
                     if !self.deflate_streams.contains_key(&fh) {
-                        let reader = TelegramReader {
-                            client: self.state.client.clone(),
-                            parts: parts_docs,
+                        let reader = TelegramReader::new(
+                            self.state.client.clone(),
+                            parts_docs,
                             data_offset,
                             compressed_size,
-                            consumed: 0,
-                            buf: Vec::new(),
-                            buf_pos: 0,
-                            next_fetch: DEFLATE_FETCH_INITIAL,
-                            rt: self.rt.clone(),
-                        };
+                            self.rt.clone(),
+                        );
                         self.deflate_streams.insert(fh, DeflateStream {
                             decoder: DeflateDecoder::new(reader),
                             pos: 0,
