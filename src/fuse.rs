@@ -10,12 +10,15 @@ use crate::indexer::download_range;
 use flate2::read::DeflateDecoder;
 
 fn path_hash(p: &str) -> u64 {
+    if p == "/" {
+        return fuser::FUSE_ROOT_ID;
+    }
     use std::collections::hash_map::DefaultHasher;
     let mut s = DefaultHasher::new();
     p.hash(&mut s);
     let v = s.finish();
-    // ensure non-zero inode
-    if v == 0 { 1 } else { v }
+    // avoid collisions with root inode and zero
+    if v == 0 || v == fuser::FUSE_ROOT_ID { v.wrapping_add(2) } else { v }
 }
 
 fn full_for(e: &FileEntry) -> String {
@@ -264,6 +267,11 @@ impl Filesystem for TgfsFS {
             if reply.add(ino, (i + 1) as i64, kind, name) { break; }
         }
         reply.ok();
+    }
+
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let exists = self.path_to_attr.values().any(|a| a.ino == ino && a.kind == FuseFileType::Directory);
+        if exists { reply.opened(0, 0); } else { reply.error(libc::ENOENT); }
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
