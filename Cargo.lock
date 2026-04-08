@@ -1643,7 +1643,6 @@ dependencies = [
  "mime_guess",
  "rpassword",
  "serde",
- "serde_json",
  "serde_yaml",
  "smallvec",
  "tokio",

@@ -98,17 +98,21 @@ fn ensure_dirs_along(
 }
 
 /// Add a regular file at `<parent>/<name>` of the given size.
+/// `perm` overrides the default 0o444 when non-zero.
 fn add_file(
     path_to_attr: &mut HashMap<String, FileAttr>,
     children: &mut HashMap<String, Vec<String>>,
     parent: &str,
     name: &str,
     size: u64,
+    perm: u16,
     now: SystemTime,
 ) {
     add_child(children, parent, name);
     let path = format!("{}/{}", parent, name);
-    path_to_attr.insert(path.clone(), file_attr(path_hash(&path), size, now));
+    let mut attr = file_attr(path_hash(&path), size, now);
+    if perm != 0 { attr.perm = perm & !0o222; } // strip write bits — read-only fs
+    path_to_attr.insert(path, attr);
 }
 
 pub struct TgfsFS {
@@ -159,7 +163,7 @@ impl TgfsFS {
                 if show_as_file {
                     let parent_path = ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
                     let size = f.size.unwrap_or(0) as u64;
-                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, now);
+                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, 0, now);
                 } else {
                     // Directory-only zip: create intermediate dirs only (skip file leaf).
                     ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
@@ -184,7 +188,7 @@ impl TgfsFS {
                             None => ("", ae.path.as_str()),
                         };
                         let ae_parent = ensure_dirs_along(&mut path_to_attr, &mut children, &arc_dir, ae_parent_rel, now);
-                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, now);
+                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), now);
                     }
                 }
             }

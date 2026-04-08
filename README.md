@@ -10,7 +10,7 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 - **Multipart files** — documents named `<base>.00`, `<base>.01`, … are auto-merged into a single logical file with seamless streaming.
 - **HTTP Range requests** — seeking works in browsers and media players for single files, multipart concatenations, and inner-archive entries.
 - **Media playback** — audio and video files are served with inline `Content-Disposition` for in-browser playback.
-- **FUSE mount** — mount channels as a local read-only filesystem (macOS/Linux) for use with standard file tools.
+- **FUSE mount** — mount channels as a local read-only filesystem (macOS/Linux) for use with standard file tools. Archive entries preserve their original Unix permissions (Info-ZIP `external file attributes`) when available.
 - **MIME interning** — MIME type strings are pooled across the index to reduce memory on large channels.
 
 ## Requirements

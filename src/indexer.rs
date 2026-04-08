@@ -167,12 +167,14 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
     let mut entries = Vec::new();
     while i + 46 <= cd.len() {
         if &cd[i..i+4] != [0x50,0x4b,0x01,0x02] { break; }
+        let version_made_by = u16le(cd, i+4);
         let mut compressed_size = u32le(cd, i+20) as u64;
         let mut uncompressed_size = u32le(cd, i+24) as u64;
         let compression_method = u16le(cd, i+10);
         let name_len = u16le(cd, i+28) as usize;
         let extra_len = u16le(cd, i+30) as usize;
         let comment_len = u16le(cd, i+32) as usize;
+        let external_attrs = u32le(cd, i+38);
         let mut local_header_offset = u32le(cd, i+42) as u64;
         let var_start = i + 46;
         if var_start + name_len > cd.len() { break; }
@@ -187,13 +189,23 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
 
         i = var_start + name_len + extra_len + comment_len;
         if name.ends_with('/') { continue; }
-        
+
+        // Info-ZIP / Unix: upper byte of version_made_by == 3 means the upper 16 bits
+        // of external_attrs are Unix st_mode. Extract permission bits (lower 12).
+        let unix_mode = if (version_made_by >> 8) == 3 {
+            let mode = (external_attrs >> 16) as u16;
+            if mode != 0 { Some(mode & 0o7777) } else { None }
+        } else {
+            None
+        };
+
         entries.push(ArchiveFileEntry {
             path: name,
             compressed_size: compressed_size as usize,
             uncompressed_size: uncompressed_size as usize,
             local_header_offset,
             compression_method,
+            unix_mode,
         });
     }
     Ok(entries)
