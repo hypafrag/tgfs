@@ -28,6 +28,9 @@ fn default_archive_view() -> ArchiveView {
 
 #[derive(Deserialize)]
 pub struct Config {
+    pub api_id: i32,
+    pub api_hash: String,
+    pub phone: String,
     #[serde(default)]
     pub http_port: Option<u16>,
     #[serde(default)]

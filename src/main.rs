@@ -3,7 +3,6 @@ mod indexer;
 mod server;
 mod fuse;
 
-use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,7 +13,6 @@ use rpassword;
 
 use index::AppState;
 
-const AUTH_FILE: &str = "auth.json";
 const SESSION_FILE: &str = "session.sqlite3";
 const DEFAULT_CONFIG_FILE: &str = "tgfs.yml";
 
@@ -32,41 +30,10 @@ fn parse_config_path() -> String {
     DEFAULT_CONFIG_FILE.to_string()
 }
 
-#[derive(Serialize, Deserialize)]
-struct AuthConfig {
-    api_id: i32,
-    api_hash: String,
-    phone: String,
-}
-
 fn prompt(label: &str) -> String {
     print!("{}: ", label);
     io::stdout().flush().unwrap();
     io::stdin().lock().lines().next().unwrap().unwrap().trim().to_string()
-}
-
-fn load_or_create_auth() -> AuthConfig {
-    if std::path::Path::new(AUTH_FILE).exists() {
-        let data = std::fs::read_to_string(AUTH_FILE).expect("failed to read auth file");
-        if let Ok(cfg) = serde_json::from_str::<AuthConfig>(&data) {
-            return cfg;
-        }
-        eprintln!("auth file is invalid, re-entering credentials");
-    }
-
-    println!("No auth data found. Please enter your Telegram credentials.");
-    println!("Get api_id and api_hash from https://my.telegram.org/apps");
-
-    let api_id: i32 = prompt("api_id").parse().expect("api_id must be a number");
-    let api_hash = prompt("api_hash");
-    let phone = prompt("phone (e.g. +12345678900)");
-
-    let cfg = AuthConfig { api_id, api_hash, phone };
-
-    let json = serde_json::to_string_pretty(&cfg).unwrap();
-    std::fs::write(AUTH_FILE, json).expect("failed to write auth file");
-    println!("Credentials saved to {AUTH_FILE}");
-    cfg
 }
 
 async fn make_client(api_id: i32) -> anyhow::Result<Client> {
@@ -79,23 +46,22 @@ async fn make_client(api_id: i32) -> anyhow::Result<Client> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config_path = parse_config_path();
-    let auth = load_or_create_auth();
     let config = index::load_config(&config_path)?;
     if config.http_port.is_none() && config.mount_at.is_none() {
         return Err(anyhow::anyhow!("config must set at least one of `http_port` or `mount_at`"));
     }
 
-    let mut client = make_client(auth.api_id).await?;
+    let mut client = make_client(config.api_id).await?;
 
     if !client.is_authorized().await? {
-        println!("Sending sign-in code to {}...", auth.phone);
-        let token = match client.request_login_code(&auth.phone, &auth.api_hash).await {
+        println!("Sending sign-in code to {}...", config.phone);
+        let token = match client.request_login_code(&config.phone, &config.api_hash).await {
             Ok(t) => t,
             Err(InvocationError::Rpc(e)) if e.is("AUTH_RESTART") => {
                 eprintln!("Session invalidated by Telegram, resetting...");
                 std::fs::remove_file(SESSION_FILE).ok();
-                client = make_client(auth.api_id).await?;
-                client.request_login_code(&auth.phone, &auth.api_hash).await?
+                client = make_client(config.api_id).await?;
+                client.request_login_code(&config.phone, &config.api_hash).await?
             }
             Err(e) => return Err(e.into()),
         };

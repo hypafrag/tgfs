@@ -16,7 +16,7 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 ## Requirements
 
 - Rust 2024 edition
-- A Telegram API ID and API hash ([my.telegram.org](https://my.telegram.org))
+- A Telegram API ID and API hash from [my.telegram.org/apps](https://my.telegram.org/apps)
 
 ## Quick start
 
@@ -24,11 +24,11 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 # Build
 cargo build --release
 
-# Run (interactive auth on first launch)
+# Configure (see below), then run
 cargo run --release
 ```
 
-On first run the binary will prompt for your phone number, SMS code, and optional 2FA password. Credentials are saved to `auth.json` and the session is persisted in `session.sqlite3`.
+On first run the binary will prompt for your SMS code and optional 2FA password. The session is persisted in `session.sqlite3`.
 
 Once running, browse `http://localhost:8080/`.
 
@@ -37,6 +37,10 @@ Once running, browse `http://localhost:8080/`.
 Create `tgfs.yml` in the working directory (or pass `--config <path>`):
 
 ```yaml
+api_id: 12345678        # from https://my.telegram.org/apps
+api_hash: abc123...     # from https://my.telegram.org/apps
+phone: "+12345678900"   # your Telegram phone number
+
 http_port: 8080         # optional — serve HTTP index on this port
 mount_at: /mnt/tgfs     # optional — mount FUSE filesystem at this path
 channels:
@@ -74,20 +78,19 @@ A multi-stage `Dockerfile` is provided. The runtime image is based on `debian:bo
 docker build -t tgfs .
 ```
 
-The container reads its config and persistent state from `/data`. Mount your `tgfs.yml`, `auth.json`, and `session.sqlite3` there:
+The container reads its config and persistent state from `/data`. Mount your `tgfs.yml` and `session.sqlite3` there:
 
 ### HTTP only
 
 ```bash
 docker run --rm -it \
   -v $PWD/tgfs.yml:/data/tgfs.yml \
-  -v $PWD/auth.json:/data/auth.json \
   -v $PWD/session.sqlite3:/data/session.sqlite3 \
   -p 8080:8080 \
   tgfs
 ```
 
-On first run, omit `-v` for `auth.json`/`session.sqlite3` and use `-it` so you can complete interactive sign-in; the files will be created in `/data` and you can persist them on subsequent runs.
+On first run, omit `-v` for `session.sqlite3` and use `-it` so you can complete interactive sign-in; the file will be created in `/data` and you can persist it on subsequent runs.
 
 ### With FUSE mount
 
@@ -99,7 +102,6 @@ docker run --rm -it \
   --device /dev/fuse \
   --security-opt apparmor:unconfined \
   -v $PWD/tgfs.yml:/data/tgfs.yml \
-  -v $PWD/auth.json:/data/auth.json \
   -v $PWD/session.sqlite3:/data/session.sqlite3 \
   -v $PWD/mnt:/mnt/tgfs:rshared \
   -p 8080:8080 \
