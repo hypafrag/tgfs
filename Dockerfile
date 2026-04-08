@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 
 # ---------- build stage ----------
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.94.1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
