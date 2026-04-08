@@ -45,6 +45,7 @@ pub struct IndexBuildResult {
     pub index: HashMap<String, Vec<FileEntry>>,
     pub mime_vec: Vec<String>,
     pub channel_view_map: HashMap<String, ArchiveView>,
+    pub dir_to_channel: HashMap<String, String>,
 }
 
 /// Fetch and parse the ZIP central directory for `docs` (one or more concatenated parts).
@@ -282,6 +283,10 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
     let mut mime_vec: Vec<String> = Vec::new();
     // build channel -> archive_view map
     let channel_view_map: HashMap<String, ArchiveView> = config.channels.iter().map(|c| (c.name.clone(), c.archive_view)).collect();
+    let dir_to_channel: HashMap<String, String> = config.channels.iter().map(|c| {
+        let dir = c.directory.clone().unwrap_or_else(|| c.name.clone());
+        (dir, c.name.clone())
+    }).collect();
 
     for entry in &config.channels {
         let name = &entry.name;
@@ -409,5 +414,5 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         index.insert(name.clone(), new_files);
     }
 
-    Ok(IndexBuildResult { index, mime_vec, channel_view_map })
+    Ok(IndexBuildResult { index, mime_vec, channel_view_map, dir_to_channel })
 }

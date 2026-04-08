@@ -316,13 +316,13 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str) ->
 }
 
 pub async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
-    let mut channels: Vec<&String> = state.index.keys().collect();
-    channels.sort();
-    let entries: Vec<Entry> = channels
+    let mut dirs: Vec<&String> = state.dir_to_channel.keys().collect();
+    dirs.sort();
+    let entries: Vec<Entry> = dirs
         .iter()
-        .map(|k| Entry {
-            href: format!("{}/", urlencoding::encode(k)),
-            label: format!("{}/", k),
+        .map(|d| Entry {
+            href: format!("{}/", urlencoding::encode(d)),
+            label: format!("{}/", d),
             size: None,
         })
         .collect();
@@ -331,10 +331,10 @@ pub async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
 
 pub async fn handle_channel_root(
     State(state): State<Arc<AppState>>,
-    AxumPath(channel): AxumPath<String>,
+    AxumPath(dir): AxumPath<String>,
 ) -> Result<Response, StatusCode> {
-    let channel = channel.trim_end_matches('/').to_string();
-    handle_channel_path(State(state), HeaderMap::new(), AxumPath((channel, String::new()))).await
+    let dir = dir.trim_end_matches('/').to_string();
+    handle_channel_path(State(state), HeaderMap::new(), AxumPath((dir, String::new()))).await
 }
 
 pub async fn handle_channel_path(
@@ -342,7 +342,8 @@ pub async fn handle_channel_path(
     headers: HeaderMap,
     AxumPath((channel, path)): AxumPath<(String, String)>,
 ) -> Result<Response, StatusCode> {
-    let channel = channel.trim_end_matches('/').to_string();
+    let dir = channel.trim_end_matches('/').to_string();
+    let channel = state.dir_to_channel.get(&dir).cloned().ok_or(StatusCode::NOT_FOUND)?;
     let files = state.index.get(&channel).ok_or(StatusCode::NOT_FOUND)?;
     let orig_path = path;
     let is_dir_request = orig_path.is_empty() || orig_path.ends_with('/');
@@ -351,7 +352,7 @@ pub async fn handle_channel_path(
     if is_dir_request {
         if trimmed.is_empty() {
             let archive_view = state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File);
-            let (entries, title) = entries_for_root(files, &channel, archive_view);
+            let (entries, title) = entries_for_root(files, &dir, archive_view);
             return html_response(dir_listing(&title, Some("/"), &entries));
         }
 
@@ -359,15 +360,15 @@ pub async fn handle_channel_path(
         // or a path inside the archive). If so, render the archive internal listing
         // for the matching inner prefix.
         if let Some((archive_entry, inner_prefix)) = match_archive(files, trimmed, true) {
-            let listing = entries_for_archive_listing(archive_entry, &channel, trimmed, &inner_prefix);
-            let title = format!("Index of /{channel}/{trimmed}/");
-            return html_response(dir_listing(&title, Some(&parent_href(&channel, trimmed)), &listing));
+            let listing = entries_for_archive_listing(archive_entry, &dir, trimmed, &inner_prefix);
+            let title = format!("Index of /{dir}/{trimmed}/");
+            return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
         }
 
         // Virtual directory listing: list immediate children (dirs and files) under trimmed/
-        let listing = entries_for_virtual_dir(files, &channel, trimmed);
-        let title = format!("Index of /{channel}/{trimmed}/");
-        return html_response(dir_listing(&title, Some(&parent_href(&channel, trimmed)), &listing));
+        let listing = entries_for_virtual_dir(files, &dir, trimmed);
+        let title = format!("Index of /{dir}/{trimmed}/");
+        return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
     }
 
     // File download path (orig_path does not end with '/')

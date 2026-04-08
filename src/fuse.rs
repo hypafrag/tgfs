@@ -136,9 +136,9 @@ impl TgfsFS {
         path_to_attr.insert("/".to_string(), dir_attr(path_hash("/"), now));
 
         // channels as top-level dirs
-        for channel in state.index.keys() {
-            let ch_path = format!("/{}", channel);
-            ensure_dir(&mut path_to_attr, &mut children, "/", channel, &ch_path, now);
+        for (dir, channel) in &state.dir_to_channel {
+            let ch_path = format!("/{}", dir);
+            ensure_dir(&mut path_to_attr, &mut children, "/", dir, &ch_path, now);
 
             let archive_view = state.channel_archive_view.get(channel).copied().unwrap_or(ArchiveView::File);
 

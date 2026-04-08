@@ -10,6 +10,8 @@ pub type DocParts = SmallVec<[Document; 1]>;
 #[derive(Deserialize)]
 pub struct ChannelEntry {
     pub name: String,
+    #[serde(default)]
+    pub directory: Option<String>,
     #[serde(default = "default_archive_view")]
     pub archive_view: ArchiveView,
 }
@@ -93,6 +95,9 @@ pub struct AppState {
     pub mime_pool: Vec<String>,
     // Channel-level archive view settings (from `tgfs.yml`).
     pub channel_archive_view: HashMap<String, ArchiveView>,
+    // Maps directory name (used in URLs / FUSE paths) → channel name (index key).
+    // When no `directory:` override is set, dir name == channel name.
+    pub dir_to_channel: HashMap<String, String>,
 }
 
 pub fn human_size(bytes: usize) -> String {
