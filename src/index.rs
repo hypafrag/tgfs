@@ -29,6 +29,24 @@ fn default_archive_view() -> ArchiveView {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyType {
+    Socks5,
+}
+
+#[derive(Deserialize)]
+pub struct ProxyConfig {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(rename = "type", default)]
+    pub _proxy_type: Option<ProxyType>,
+}
+
+#[derive(Deserialize)]
 pub struct Config {
     pub api_id: i32,
     pub api_hash: String,
@@ -37,6 +55,8 @@ pub struct Config {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub mount_at: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
     pub channels: Vec<ChannelEntry>,
 }
 

@@ -7,7 +7,7 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use grammers_client::{Client, SignInError};
-use grammers_mtsender::{InvocationError, SenderPool};
+use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
 use rpassword;
 
@@ -36,11 +36,20 @@ fn prompt(label: &str) -> String {
     io::stdin().lock().lines().next().unwrap().unwrap().trim().to_string()
 }
 
-async fn make_client(api_id: i32) -> anyhow::Result<Client> {
+async fn make_client(api_id: i32, proxy_url: Option<String>) -> anyhow::Result<Client> {
     let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
-    let pool = SenderPool::new(Arc::clone(&session), api_id);
+    let params = ConnectionParams { proxy_url, ..Default::default() };
+    let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, params);
     tokio::spawn(pool.runner.run());
     Ok(Client::new(pool.handle))
+}
+
+fn build_proxy_url(config: &index::Config) -> Option<String> {
+    let proxy = config.proxy.as_ref()?;
+    match (&proxy.user, &proxy.password) {
+        (Some(user), Some(pass)) => Some(format!("socks5://{}:{}@{}:{}", user, pass, proxy.host, proxy.port)),
+        _ => Some(format!("socks5://{}:{}", proxy.host, proxy.port)),
+    }
 }
 
 #[tokio::main]
@@ -51,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("config must set at least one of `http_port` or `mount_at`"));
     }
 
-    let mut client = make_client(config.api_id).await?;
+    let proxy_url = build_proxy_url(&config);
+    if let Some(ref url) = proxy_url {
+        println!("Using proxy: {}", url);
+    }
+    let mut client = make_client(config.api_id, proxy_url.clone()).await?;
 
     if !client.is_authorized().await? {
         println!("Sending sign-in code to {}...", config.phone);
@@ -60,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
             Err(InvocationError::Rpc(e)) if e.is("AUTH_RESTART") => {
                 eprintln!("Session invalidated by Telegram, resetting...");
                 std::fs::remove_file(SESSION_FILE).ok();
-                client = make_client(config.api_id).await?;
+                client = make_client(config.api_id, proxy_url).await?;
                 client.request_login_code(&config.phone, &config.api_hash).await?
             }
             Err(e) => return Err(e.into()),

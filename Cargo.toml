@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 grammers-client = "0.9"
-grammers-mtsender = "0.9"
+grammers-mtsender = { version = "0.9", features = ["proxy"] }
 grammers-session = "0.9"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
