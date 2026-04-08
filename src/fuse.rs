@@ -3,7 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen};
+use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
+use grammers_client::Client;
 use grammers_client::media::Document;
 use tokio::runtime::Handle;
 
@@ -122,6 +123,65 @@ fn add_file(
     path_to_attr.insert(path, attr);
 }
 
+const DEFLATE_FETCH_INITIAL: usize = 64 * 1024;
+const DEFLATE_FETCH_READAHEAD: usize = 512 * 1024;
+
+/// Streams compressed bytes from Telegram on demand, one chunk at a time.
+/// Wrapped by `DeflateDecoder` so only the decoder's 32 KB window is held
+/// in memory — not the full compressed payload.
+struct TelegramReader {
+    client: Client,
+    parts: Vec<Document>,
+    /// Absolute byte offset in the Telegram file where compressed data begins.
+    data_offset: usize,
+    compressed_size: usize,
+    /// Compressed bytes consumed so far (relative to data_offset).
+    consumed: usize,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    next_fetch: usize,
+    rt: Handle,
+}
+
+impl std::io::Read for TelegramReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.buf_pos >= self.buf.len() {
+            let remaining = self.compressed_size.saturating_sub(self.consumed);
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let fetch = remaining.min(self.next_fetch);
+            self.next_fetch = DEFLATE_FETCH_READAHEAD;
+            let abs = self.data_offset + self.consumed;
+            // Use a block so borrows of self.rt/client/parts end before we write self.buf.
+            let chunk = {
+                let rt = &self.rt;
+                let client = &self.client;
+                let parts = &self.parts;
+                rt.block_on(download_range(client, parts, abs, fetch))
+                    .map_err(|_| std::io::Error::other("download failed"))?
+            };
+            if chunk.is_empty() {
+                return Ok(0);
+            }
+            self.consumed += chunk.len();
+            self.buf = chunk;
+            self.buf_pos = 0;
+        }
+        let n = out.len().min(self.buf.len() - self.buf_pos);
+        out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        Ok(n)
+    }
+}
+
+/// Per-open-handle state for a deflate-compressed archive entry.
+struct DeflateStream {
+    decoder: DeflateDecoder<TelegramReader>,
+    /// Byte position in the decompressed output the decoder is currently at.
+    pos: usize,
+}
+
 pub struct TgfsFS {
     state: Arc<AppState>,
     // mappings built at init
@@ -130,6 +190,12 @@ pub struct TgfsFS {
     children: HashMap<String, Vec<String>>,
     // Captured at construction so blocking FUSE callbacks can drive async ops.
     rt: Handle,
+    // Streaming deflate decoders, one per open file handle, keyed by fh.
+    // Kept alive between FUSE read chunks so we decompress sequentially
+    // rather than re-downloading + re-decompressing from the start each call.
+    // Removed in release().
+    deflate_streams: HashMap<u64, DeflateStream>,
+    next_fh: u64,
 }
 
 impl TgfsFS {
@@ -203,7 +269,7 @@ impl TgfsFS {
 
         let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino, p.clone())).collect();
 
-        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current() }
+        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current(), deflate_streams: HashMap::new(), next_fh: 1 }
     }
 
     fn lookup_path(&self, path: &str) -> Option<&FileAttr> {
@@ -280,14 +346,24 @@ impl Filesystem for TgfsFS {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Only allow reading of regular files
         let exists = self.path_for_ino(ino)
             .and_then(|p| self.path_to_attr.get(p))
             .map_or(false, |a| a.kind == FuseFileType::RegularFile);
-        if exists { reply.opened(0, 0); } else { reply.error(libc::EISDIR); }
+        if exists {
+            let fh = self.next_fh;
+            self.next_fh += 1;
+            reply.opened(fh, 0);
+        } else {
+            reply.error(libc::EISDIR);
+        }
     }
 
-    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+        self.deflate_streams.remove(&fh);
+        reply.ok();
+    }
+
+    fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         let path = match self.path_for_ino(ino) {
             Some(p) => p.to_string(),
             None => { reply.error(libc::ENOENT); return; }
@@ -355,17 +431,68 @@ impl Filesystem for TgfsFS {
                     return;
                 }
                 8 => {
-                    // deflate: download compressed payload then inflate synchronously
-                    let comp_bytes = match self.block_download(&parts_docs, data_offset, ae.compressed_size) {
-                        Ok(b) => b,
-                        Err(_) => { reply.error(libc::EIO); return; }
-                    };
-                    let mut decoder = DeflateDecoder::new(&comp_bytes[..]);
-                    let mut out = Vec::with_capacity(ae.uncompressed_size);
-                    if std::io::copy(&mut decoder, &mut out).is_err() { reply.error(libc::EIO); return; }
+                    // Extract needed values from ae before touching deflate_streams
+                    // (ae borrows self.state; deflate_streams is a disjoint field).
+                    let compressed_size = ae.compressed_size;
+
                     let off = offset as usize;
-                    let end = std::cmp::min(out.len(), off + size as usize);
-                    if off >= out.len() { reply.data(&[]); } else { reply.data(&out[off..end]); }
+                    let sz = size as usize;
+
+                    // Initialize the streaming decoder on the first read for this fh.
+                    // TelegramReader fetches compressed data in small chunks on demand;
+                    // the DeflateDecoder only buffers its 32 KB sliding window.
+                    if !self.deflate_streams.contains_key(&fh) {
+                        let reader = TelegramReader {
+                            client: self.state.client.clone(),
+                            parts: parts_docs,
+                            data_offset,
+                            compressed_size,
+                            consumed: 0,
+                            buf: Vec::new(),
+                            buf_pos: 0,
+                            next_fetch: DEFLATE_FETCH_INITIAL,
+                            rt: self.rt.clone(),
+                        };
+                        self.deflate_streams.insert(fh, DeflateStream {
+                            decoder: DeflateDecoder::new(reader),
+                            pos: 0,
+                        });
+                    }
+
+                    let stream = self.deflate_streams.get_mut(&fh).unwrap();
+
+                    // Skip forward if the kernel jumped ahead (shouldn't happen in
+                    // normal sequential reads; caller should use STORE for random access).
+                    if off > stream.pos {
+                        use std::io::Read as _;
+                        let mut remaining = off - stream.pos;
+                        let mut discard = vec![0u8; remaining.min(65536)];
+                        while remaining > 0 {
+                            let n = remaining.min(discard.len());
+                            match stream.decoder.read(&mut discard[..n]) {
+                                Ok(0) => { reply.error(libc::EIO); return; }
+                                Ok(r) => { stream.pos += r; remaining -= r; }
+                                Err(_) => { reply.error(libc::EIO); return; }
+                            }
+                        }
+                    } else if off < stream.pos {
+                        // Backward seek: impossible to handle without rewinding.
+                        reply.error(libc::EIO);
+                        return;
+                    }
+
+                    use std::io::Read as _;
+                    let mut buf = vec![0u8; sz];
+                    let mut total = 0;
+                    while total < sz {
+                        match stream.decoder.read(&mut buf[total..]) {
+                            Ok(0) => break,
+                            Ok(n) => total += n,
+                            Err(_) => { reply.error(libc::EIO); return; }
+                        }
+                    }
+                    stream.pos += total;
+                    reply.data(&buf[..total]);
                     return;
                 }
                 _ => { reply.error(libc::ENOTSUP); return; }
