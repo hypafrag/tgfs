@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen};
 
-use crate::index::{AppState, FileEntry, FileType};
+use crate::index::{AppState, ArchiveView, FileEntry, FileType};
 use crate::indexer::download_range;
 use flate2::read::DeflateDecoder;
 
@@ -88,52 +88,85 @@ impl TgfsFS {
             path_to_attr.insert(ch_path.clone(), ch_attr);
             children.entry("/".to_string()).or_default().push(channel.clone());
 
+            let archive_view = state.channel_archive_view.get(channel).copied().unwrap_or(ArchiveView::File);
+
             if let Some(files) = state.index.get(channel) {
                 // add files and directories
                 for f in files.iter() {
                     let full = full_for(f);
+                    let is_browsable_zip = f.file_type == FileType::Zip
+                        && f.archive_entries.is_some()
+                        && archive_view != ArchiveView::File;
+                    let show_as_file = !is_browsable_zip || archive_view == ArchiveView::FileAndDirectory;
+
+                    // Build path components for this entry
                     let mut comps: Vec<String> = Vec::new();
                     let ch_prefix = format!("/{}", channel);
                     comps.push(ch_prefix.clone());
                     for seg in full.split('/') {
                         let parent = comps.last().unwrap().clone();
                         let child_path = if parent == "/" { format!("/{}", seg) } else { format!("{}/{}", parent, seg) };
-                        // add directory entry for intermediate components (if not leaf)
-                        // we'll assume leaf is a file
                         comps.push(child_path.clone());
                     }
-                    // iterate comps to create directories and final file
-                    for i in 1..comps.len() {
-                        let p = comps[i - 1].clone();
-                        let c = comps[i].clone();
-                        // register child name under parent
-                        let name = c.trim_start_matches(&format!("{}/", p)).trim_start_matches('/').to_string();
-                        if !children.get(&p).map_or(false, |v| v.contains(&name)) {
-                            children.entry(p.clone()).or_default().push(name.clone());
+
+                    if show_as_file {
+                        // iterate comps to create directories and final file
+                        for i in 1..comps.len() {
+                            let p = comps[i - 1].clone();
+                            let c = comps[i].clone();
+                            let name = c.trim_start_matches(&format!("{}/", p)).trim_start_matches('/').to_string();
+                            if !children.get(&p).map_or(false, |v| v.contains(&name)) {
+                                children.entry(p.clone()).or_default().push(name.clone());
+                            }
+                            if i == comps.len() - 1 {
+                                let size = f.size.unwrap_or(0) as u64;
+                                let fa = FileAttr {
+                                    ino: path_hash(&c),
+                                    size,
+                                    blocks: (size + 511) / 512,
+                                    atime: now,
+                                    mtime: now,
+                                    ctime: now,
+                                    crtime: now,
+                                    kind: FuseFileType::RegularFile,
+                                    perm: 0o444,
+                                    nlink: 1,
+                                    uid: unsafe { libc::geteuid() },
+                                    gid: unsafe { libc::getegid() },
+                                    rdev: 0,
+                                    flags: 0,
+                                    blksize: 512,
+                                };
+                                path_to_attr.insert(c.clone(), fa);
+                            } else if !path_to_attr.contains_key(&comps[i]) {
+                                let da = FileAttr {
+                                    ino: path_hash(&comps[i]),
+                                    size: 0,
+                                    blocks: 0,
+                                    atime: now,
+                                    mtime: now,
+                                    ctime: now,
+                                    crtime: now,
+                                    kind: FuseFileType::Directory,
+                                    perm: 0o755,
+                                    nlink: 2,
+                                    uid: unsafe { libc::geteuid() },
+                                    gid: unsafe { libc::getegid() },
+                                    rdev: 0,
+                                    flags: 0,
+                                    blksize: 512,
+                                };
+                                path_to_attr.insert(comps[i].clone(), da);
+                            }
                         }
-                        // if last component -> it's a file
-                        if i == comps.len() - 1 {
-                            let size = f.size.unwrap_or(0) as u64;
-                            let fa = FileAttr {
-                                ino: path_hash(&c),
-                                size,
-                                blocks: (size + 511) / 512,
-                                atime: now,
-                                mtime: now,
-                                ctime: now,
-                                crtime: now,
-                                kind: FuseFileType::RegularFile,
-                                perm: 0o444,
-                                nlink: 1,
-                                uid: unsafe { libc::geteuid() },
-                                gid: unsafe { libc::getegid() },
-                                rdev: 0,
-                                flags: 0,
-                                blksize: 512,
-                            };
-                            path_to_attr.insert(c.clone(), fa);
-                        } else {
-                            // intermediate directory
+                    } else {
+                        // Directory-only zip: create intermediate dirs but not the file itself
+                        for i in 1..comps.len() - 1 {
+                            let p = comps[i - 1].clone();
+                            let name = comps[i].trim_start_matches(&format!("{}/", p)).trim_start_matches('/').to_string();
+                            if !children.get(&p).map_or(false, |v| v.contains(&name)) {
+                                children.entry(p.clone()).or_default().push(name.clone());
+                            }
                             if !path_to_attr.contains_key(&comps[i]) {
                                 let da = FileAttr {
                                     ino: path_hash(&comps[i]),
@@ -157,47 +190,104 @@ impl TgfsFS {
                         }
                     }
 
-                    // if archive entries exist, expose inner files under a directory named after stem
-                    if f.file_type == FileType::Zip {
-                        if let Some(ae_list) = &f.archive_entries {
-                            let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name);
-                            let arc_dir = if full.ends_with('/') { format!("/{}/{}", channel, stem) } else { format!("/{}/{}", channel, stem) };
-                            // ensure arc_dir exists
-                            children.entry(format!("/{}", channel)).or_default().push(stem.to_string());
-                            for ae in ae_list.iter() {
-                                // create full inner path
-                                let inner_path = format!("{}/{}", arc_dir, ae.path);
-                                // register parent directories for inner entries
-                                let mut parent = arc_dir.clone();
-                                for seg in ae.path.split('/') {
-                                    let child = format!("{}/{}", parent, seg);
-                                    let name = seg.to_string();
-                                    if !children.get(&parent).map_or(false, |v| v.contains(&name)) {
-                                        children.entry(parent.clone()).or_default().push(name.clone());
-                                    }
-                                    parent = child;
-                                }
-                                // final file attr
-                                let size = ae.uncompressed_size as u64;
-                                let fa = FileAttr {
-                                    ino: path_hash(&inner_path),
-                                    size,
-                                    blocks: (size + 511) / 512,
+                    // Expose archive entries as a virtual directory named after the stem
+                    if is_browsable_zip {
+                        let ae_list = f.archive_entries.as_ref().unwrap();
+                        let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name);
+                        // Build stem path respecting virtual path prefix (same as server's stem_full_for)
+                        let stem_full = match &f.path {
+                            Some(p) => {
+                                let s = p.to_string_lossy().replace('\\', "/");
+                                if s.is_empty() { stem.to_string() } else { format!("{}/{}", s, stem) }
+                            }
+                            None => stem.to_string(),
+                        };
+                        let arc_dir = format!("/{}/{}", channel, stem_full);
+
+                        // Ensure parent directories of arc_dir exist
+                        let mut arc_comps: Vec<String> = vec![ch_prefix.clone()];
+                        for seg in stem_full.split('/') {
+                            let parent = arc_comps.last().unwrap().clone();
+                            let child_path = format!("{}/{}", parent, seg);
+                            let name = seg.to_string();
+                            if !children.get(&parent).map_or(false, |v| v.contains(&name)) {
+                                children.entry(parent.clone()).or_default().push(name);
+                            }
+                            if !path_to_attr.contains_key(&child_path) {
+                                let da = FileAttr {
+                                    ino: path_hash(&child_path),
+                                    size: 0,
+                                    blocks: 0,
                                     atime: now,
                                     mtime: now,
                                     ctime: now,
                                     crtime: now,
-                                    kind: FuseFileType::RegularFile,
-                                    perm: 0o444,
-                                    nlink: 1,
+                                    kind: FuseFileType::Directory,
+                                    perm: 0o755,
+                                    nlink: 2,
                                     uid: unsafe { libc::geteuid() },
                                     gid: unsafe { libc::getegid() },
                                     rdev: 0,
                                     flags: 0,
                                     blksize: 512,
                                 };
-                                path_to_attr.insert(inner_path, fa);
+                                path_to_attr.insert(child_path.clone(), da);
                             }
+                            arc_comps.push(child_path);
+                        }
+
+                        for ae in ae_list.iter() {
+                            let inner_path = format!("{}/{}", arc_dir, ae.path);
+                            let mut parent = arc_dir.clone();
+                            let segs: Vec<&str> = ae.path.split('/').collect();
+                            for (si, seg) in segs.iter().enumerate() {
+                                let child = format!("{}/{}", parent, seg);
+                                let name = seg.to_string();
+                                if !children.get(&parent).map_or(false, |v| v.contains(&name)) {
+                                    children.entry(parent.clone()).or_default().push(name);
+                                }
+                                // intermediate dirs inside archive
+                                if si < segs.len() - 1 && !path_to_attr.contains_key(&child) {
+                                    let da = FileAttr {
+                                        ino: path_hash(&child),
+                                        size: 0,
+                                        blocks: 0,
+                                        atime: now,
+                                        mtime: now,
+                                        ctime: now,
+                                        crtime: now,
+                                        kind: FuseFileType::Directory,
+                                        perm: 0o755,
+                                        nlink: 2,
+                                        uid: unsafe { libc::geteuid() },
+                                        gid: unsafe { libc::getegid() },
+                                        rdev: 0,
+                                        flags: 0,
+                                        blksize: 512,
+                                    };
+                                    path_to_attr.insert(child.clone(), da);
+                                }
+                                parent = child;
+                            }
+                            let size = ae.uncompressed_size as u64;
+                            let fa = FileAttr {
+                                ino: path_hash(&inner_path),
+                                size,
+                                blocks: (size + 511) / 512,
+                                atime: now,
+                                mtime: now,
+                                ctime: now,
+                                crtime: now,
+                                kind: FuseFileType::RegularFile,
+                                perm: 0o444,
+                                nlink: 1,
+                                uid: unsafe { libc::geteuid() },
+                                gid: unsafe { libc::getegid() },
+                                rdev: 0,
+                                flags: 0,
+                                blksize: 512,
+                            };
+                            path_to_attr.insert(inner_path, fa);
                         }
                     }
                 }
