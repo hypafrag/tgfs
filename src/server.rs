@@ -442,11 +442,9 @@ pub async fn handle_channel_path(
     let extra_len = u16le(&lh, 28) as usize;
     let data_offset = ae.local_header_offset as usize + 30 + name_len + extra_len;
 
-    // stream compressed data across all archive parts and inflate on-the-fly
-    let compressed = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
-    let buf = BufReader::new(StreamReader::new(compressed));
-    let decompressed = ReaderStream::new(AsyncDeflateDecoder::new(buf));
-
+    // Choose handling based on compression method: 0 = stored (no compression),
+    // 8 = deflate. For stored entries we stream the raw bytes directly; for
+    // deflate entries we inflate on-the-fly as before.
     let mime = guess_mime(inner).first_or_octet_stream().essence_str().to_string();
     // inner-archive filename should be just the basename for the download header
     let inner_base = std::path::Path::new(inner).file_name().and_then(|s| s.to_str()).unwrap_or(inner);
@@ -460,14 +458,39 @@ pub async fn handle_channel_path(
     let disposition = content_disposition(&inner_type, &encoded_name);
     let total = ae.uncompressed_size as usize;
 
-    if let Some((start, end)) = parse_range(&headers, total)? {
-        let wanted = end - start + 1;
-        let body = Body::from_stream(spawn_range_slicer(decompressed, start, wanted));
-        return Ok(partial_response(&mime, &disposition, body, start, end, total));
-    }
+    match ae.compression_method {
+        0 => {
+            // Stored (no compression): compressed_size == uncompressed_size normally.
+            if let Some((start, end)) = parse_range(&headers, total)? {
+                let wanted = end - start + 1;
+                let stream = stream_parts_range(client, archive_parts, data_offset + start, Some(wanted));
+                let body = Body::from_stream(stream);
+                return Ok(partial_response(&mime, &disposition, body, start, end, total));
+            }
+            let stream = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
+            let body = Body::from_stream(stream);
+            return Ok(full_download_response(&mime, &disposition, body, Some(total)));
+        }
+        8 => {
+            // Deflated: inflate on-the-fly (existing behavior).
+            let compressed = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
+            let buf = BufReader::new(StreamReader::new(compressed));
+            let decompressed = ReaderStream::new(AsyncDeflateDecoder::new(buf));
 
-    let body = Body::from_stream(decompressed);
-    Ok(full_download_response(&mime, &disposition, body, Some(total)))
+            if let Some((start, end)) = parse_range(&headers, total)? {
+                let wanted = end - start + 1;
+                let body = Body::from_stream(spawn_range_slicer(decompressed, start, wanted));
+                return Ok(partial_response(&mime, &disposition, body, start, end, total));
+            }
+
+            let body = Body::from_stream(decompressed);
+            return Ok(full_download_response(&mime, &disposition, body, Some(total)));
+        }
+        _ => {
+            // Unsupported compression method
+            return Err(StatusCode::NOT_IMPLEMENTED);
+        }
+    }
 }
 
 pub fn make_router(state: Arc<AppState>) -> Router {

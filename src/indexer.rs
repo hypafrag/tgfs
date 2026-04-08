@@ -146,6 +146,7 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
         if &cd[i..i+4] != [0x50,0x4b,0x01,0x02] { break; }
         let mut compressed_size = u32le(cd, i+20) as u64;
         let mut uncompressed_size = u32le(cd, i+24) as u64;
+        let compression_method = u16le(cd, i+10);
         let name_len = u16le(cd, i+28) as usize;
         let extra_len = u16le(cd, i+30) as usize;
         let comment_len = u16le(cd, i+32) as usize;
@@ -163,11 +164,13 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
 
         i = var_start + name_len + extra_len + comment_len;
         if name.ends_with('/') { continue; }
+        
         entries.push(ArchiveFileEntry {
             path: name,
             compressed_size: compressed_size as usize,
             uncompressed_size: uncompressed_size as usize,
             local_header_offset,
+            compression_method,
         });
     }
     Ok(entries)
