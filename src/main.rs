@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         let fs = fuse::TgfsFS::new(Arc::clone(&state));
         let mp = mountpoint.clone();
         tokio::task::spawn_blocking(move || {
-            fuser::mount2(fs, mp, &[]).expect("FUSE mount failed");
+            fuser::mount2(fs, mp, &[fuser::MountOption::AllowOther, fuser::MountOption::AutoUnmount]).expect("FUSE mount failed");
         })
     });
 
