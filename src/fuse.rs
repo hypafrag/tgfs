@@ -33,6 +33,13 @@ fn full_for(e: &FileEntry) -> String {
     }
 }
 
+// Static read-only FS: entries never change, so use a long TTL for kernel caching.
+const ATTR_TTL: Duration = Duration::from_secs(86400);
+
+// 128 KB preferred I/O size. Tells the kernel to batch reads, reducing
+// the number of round-trips through the single-threaded FUSE event loop.
+const BLKSIZE: u32 = 131_072;
+
 fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
     FileAttr {
         ino, size: 0, blocks: 0,
@@ -41,7 +48,7 @@ fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
         perm: 0o755, nlink: 2,
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
-        rdev: 0, flags: 0, blksize: 512,
+        rdev: 0, flags: 0, blksize: BLKSIZE,
     }
 }
 
@@ -53,7 +60,7 @@ fn file_attr(ino: u64, size: u64, now: SystemTime) -> FileAttr {
         perm: 0o444, nlink: 1,
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
-        rdev: 0, flags: 0, blksize: 512,
+        rdev: 0, flags: 0, blksize: BLKSIZE,
     }
 }
 
@@ -227,7 +234,7 @@ impl Filesystem for TgfsFS {
         let name_str = name.to_string_lossy();
         let target = if parent_path == "/" { format!("/{}", name_str) } else { format!("{}/{}", parent_path, name_str) };
         if let Some(attr) = self.lookup_path(&target) {
-            reply.entry(&Duration::from_secs(1), attr, 0);
+            reply.entry(&ATTR_TTL, attr, 0);
         } else {
             reply.error(libc::ENOENT);
         }
@@ -235,7 +242,7 @@ impl Filesystem for TgfsFS {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         match self.path_for_ino(ino).and_then(|p| self.path_to_attr.get(p)) {
-            Some(a) => reply.attr(&Duration::from_secs(1), a),
+            Some(a) => reply.attr(&ATTR_TTL, a),
             None => reply.error(libc::ENOENT),
         }
     }

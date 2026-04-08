@@ -109,7 +109,15 @@ async fn main() -> anyhow::Result<()> {
         let fs = fuse::TgfsFS::new(Arc::clone(&state));
         let mp = mountpoint.clone();
         tokio::task::spawn_blocking(move || {
-            fuser::mount2(fs, mp, &[fuser::MountOption::AllowOther, fuser::MountOption::AutoUnmount]).expect("FUSE mount failed");
+            fuser::mount2(fs, mp, &[
+                fuser::MountOption::AllowOther,
+                fuser::MountOption::AutoUnmount,
+                fuser::MountOption::RO,
+                // kernel_cache: serve repeated reads from the page cache without
+                // calling into FUSE, so concurrent readers don't serialize on the
+                // single FUSE event loop thread.
+                fuser::MountOption::CUSTOM("kernel_cache".to_string()),
+            ]).expect("FUSE mount failed");
         })
     });
 
