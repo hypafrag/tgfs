@@ -8,6 +8,7 @@ use smallvec::smallvec;
 
 fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
 fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o+4].try_into().unwrap()) }
+fn u64le(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o+8].try_into().unwrap()) }
 
 /// Detect a multipart-file suffix: `<base>.<digits>`. Returns `(base, part_num)`.
 /// Requires at least one digit after the final `.`.
@@ -98,16 +99,44 @@ pub async fn download_range(
     Ok(buf)
 }
 
-fn find_eocd(tail: &[u8]) -> Option<(u64, u64)> {
+fn find_eocd(tail: &[u8], tail_offset: u64) -> Option<(u64, u64)> {
     if tail.len() < 22 { return None; }
     for i in (0..=tail.len() - 22).rev() {
         if &tail[i..i+4] == [0x50,0x4b,0x05,0x06] {
             let cd_size = u32le(tail, i+12) as u64;
             let cd_offset = u32le(tail, i+16) as u64;
+            // If either value is 0xFFFFFFFF, look for ZIP64 EOCD
+            if cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
+                if let Some((z64_off, z64_sz)) = find_zip64_eocd(tail, i, tail_offset) {
+                    return Some((z64_off, z64_sz));
+                }
+                // ZIP64 lookup failed; the 0xFFFFFFFF values are unusable
+                return None;
+            }
             return Some((cd_offset, cd_size));
         }
     }
     None
+}
+
+/// Search for the ZIP64 End of Central Directory Locator (20 bytes, immediately
+/// before the standard EOCD) and then read the ZIP64 EOCD record from the tail.
+fn find_zip64_eocd(tail: &[u8], eocd_pos: usize, tail_offset: u64) -> Option<(u64, u64)> {
+    // The ZIP64 EOCD locator is 20 bytes and sits right before the standard EOCD.
+    if eocd_pos < 20 { return None; }
+    let loc = eocd_pos - 20;
+    if &tail[loc..loc+4] != [0x50, 0x4b, 0x06, 0x07] { return None; }
+    // Locator field at offset 8: absolute offset of the ZIP64 EOCD record.
+    let zip64_eocd_abs = u64le(tail, loc + 8);
+    // Check if the ZIP64 EOCD record is within our downloaded tail.
+    if zip64_eocd_abs < tail_offset { return None; }
+    let z64_pos = (zip64_eocd_abs - tail_offset) as usize;
+    // ZIP64 EOCD record is at least 56 bytes.
+    if z64_pos + 56 > tail.len() { return None; }
+    if &tail[z64_pos..z64_pos+4] != [0x50, 0x4b, 0x06, 0x06] { return None; }
+    let cd_size = u64le(tail, z64_pos + 40);
+    let cd_offset = u64le(tail, z64_pos + 48);
+    Some((cd_offset, cd_size))
 }
 
 fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
@@ -115,25 +144,60 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<Vec<ArchiveFileEntry>> {
     let mut entries = Vec::new();
     while i + 46 <= cd.len() {
         if &cd[i..i+4] != [0x50,0x4b,0x01,0x02] { break; }
-        let compressed_size = u32le(cd, i+20) as usize;
-        let uncompressed_size = u32le(cd, i+24) as usize;
+        let mut compressed_size = u32le(cd, i+20) as u64;
+        let mut uncompressed_size = u32le(cd, i+24) as u64;
         let name_len = u16le(cd, i+28) as usize;
         let extra_len = u16le(cd, i+30) as usize;
         let comment_len = u16le(cd, i+32) as usize;
-        let local_header_offset = u32le(cd, i+42) as u64;
+        let mut local_header_offset = u32le(cd, i+42) as u64;
         let var_start = i + 46;
         if var_start + name_len > cd.len() { break; }
         let name = String::from_utf8_lossy(&cd[var_start..var_start+name_len]).to_string();
+
+        // Parse ZIP64 extended information extra field if any value is 0xFFFFFFFF
+        if uncompressed_size == 0xFFFF_FFFF || compressed_size == 0xFFFF_FFFF || local_header_offset == 0xFFFF_FFFF {
+            let extra_start = var_start + name_len;
+            let extra_end = std::cmp::min(extra_start + extra_len, cd.len());
+            parse_zip64_extra(&cd[extra_start..extra_end], &mut uncompressed_size, &mut compressed_size, &mut local_header_offset);
+        }
+
         i = var_start + name_len + extra_len + comment_len;
         if name.ends_with('/') { continue; }
         entries.push(ArchiveFileEntry {
             path: name,
-            compressed_size,
-            uncompressed_size,
+            compressed_size: compressed_size as usize,
+            uncompressed_size: uncompressed_size as usize,
             local_header_offset,
         });
     }
     Ok(entries)
+}
+
+/// Parse ZIP64 extended information extra field (tag 0x0001). Values appear in
+/// order: uncompressed_size, compressed_size, local_header_offset, disk_number —
+/// but only for fields whose standard-header value is 0xFFFFFFFF.
+fn parse_zip64_extra(extra: &[u8], uncompressed: &mut u64, compressed: &mut u64, header_offset: &mut u64) {
+    let mut pos = 0;
+    while pos + 4 <= extra.len() {
+        let tag = u16le(extra, pos);
+        let sz = u16le(extra, pos + 2) as usize;
+        let data_start = pos + 4;
+        if data_start + sz > extra.len() { break; }
+        if tag == 0x0001 {
+            let mut o = data_start;
+            if *uncompressed == 0xFFFF_FFFF && o + 8 <= data_start + sz {
+                *uncompressed = u64le(extra, o); o += 8;
+            }
+            if *compressed == 0xFFFF_FFFF && o + 8 <= data_start + sz {
+                *compressed = u64le(extra, o); o += 8;
+            }
+            if *header_offset == 0xFFFF_FFFF && o + 8 <= data_start + sz {
+                *header_offset = u64le(extra, o);
+            }
+            return;
+        }
+        pos = data_start + sz;
+    }
 }
 
 fn resolve_filename(msg: &grammers_client::message::Message, doc: &Document) -> String {
@@ -213,7 +277,8 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 //    `Document` name, not a `name:` override).
                 let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
                 let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
-                if final_type == crate::index::FileType::Zip && entry.archive_view != ArchiveView::File {
+                let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
+                if final_type == crate::index::FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
                     println!("  fetching EOCD tail of '{}' for indexing", file_name);
                     io::stdout().flush().ok();
                     let size_usize = doc.size().unwrap_or(0) as usize;
@@ -221,7 +286,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     let tail_offset = size_usize.saturating_sub(tail_len);
                     let parts_one = [doc.clone()];
                     let tail = download_range(&client, &parts_one, tail_offset, tail_len).await?;
-                    if let Some((cd_off, cd_size)) = find_eocd(&tail) {
+                    if let Some((cd_off, cd_size)) = find_eocd(&tail, tail_offset as u64) {
                         println!("    central directory at {} ({} bytes)", cd_off, cd_size);
                         let cd_bytes = download_range(&client, &parts_one, cd_off as usize, cd_size as usize).await?;
                         let ae_list = parse_central_directory(&cd_bytes)?;
@@ -287,16 +352,23 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             // across the concatenated parts so we can expose inner entries.
             let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
             if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
+                println!("Processing multipart archive: {}", exposed_name);
+                println!("  fetching EOCD tail of '{}' for indexing", exposed_name);
+                io::stdout().flush().ok();
                 let total_bytes = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum::<usize>();
                 let tail_len = std::cmp::min(total_bytes, 70_000);
                 let tail_offset = total_bytes.saturating_sub(tail_len);
                 if let Ok(tail) = download_range(&client, &docs, tail_offset, tail_len).await {
-                    if let Some((cd_off, cd_size)) = find_eocd(&tail) {
+                    if let Some((cd_off, cd_size)) = find_eocd(&tail, tail_offset as u64) {
+                        println!("    central directory at {} ({} bytes)", cd_off, cd_size);
                         if let Ok(cd_bytes) = download_range(&client, &docs, cd_off as usize, cd_size as usize).await {
                             if let Ok(ae_list) = parse_central_directory(&cd_bytes) {
+                                println!("  zip entries read: {}", ae_list.len());
                                 archive_entries_combined = Some(ae_list);
                             }
                         }
+                    } else {
+                        println!("  EOCD not found for '{}', skipping archive index", exposed_name);
                     }
                 }
             }
