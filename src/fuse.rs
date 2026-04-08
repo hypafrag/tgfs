@@ -352,7 +352,7 @@ impl Filesystem for TgfsFS {
         if exists {
             let fh = self.next_fh;
             self.next_fh += 1;
-            reply.opened(fh, 0);
+            reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
         } else {
             reply.error(libc::EISDIR);
         }
