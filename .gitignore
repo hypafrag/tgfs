@@ -3,3 +3,4 @@
 /auth.json
 /session.sqlite3
 /tgfs.yml
+/zip_index_cache.json.gz

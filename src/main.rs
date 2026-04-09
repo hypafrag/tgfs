@@ -2,6 +2,7 @@ mod index;
 mod indexer;
 mod server;
 mod fuse;
+mod zip_cache;
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
