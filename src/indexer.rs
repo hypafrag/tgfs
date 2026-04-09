@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
+use grammers_client::tl;
 use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, TelegramChannel};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
@@ -442,10 +443,186 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         index.insert(name.clone(), tchan);
     }
 
+    // Index Saved Messages if configured. Files tagged via Telegram saved-message
+    // reaction tags are exposed as a directory per tag; untagged files live at the
+    // root of the saved_messages directory.
+    let mut dir_to_channel = dir_to_channel;
+    if let Some(dir) = &config.saved_messages {
+        if dir_to_channel.contains_key(dir) || index.contains_key(dir) {
+            return Err(anyhow::anyhow!(
+                "saved_messages directory '{}' collides with a configured channel name",
+                dir
+            ));
+        }
+        match index_saved_messages(&client, &mut mime_map, &mut mime_vec).await {
+            Ok(channel) => {
+                index.insert(dir.clone(), channel);
+                dir_to_channel.insert(dir.clone(), dir.clone());
+            }
+            Err(e) => eprintln!("failed to index saved messages: {}", e),
+        }
+    }
+
     // Persist the zip index cache once after the full index is built.
     if let Err(e) = zip_cache.save() {
         eprintln!("failed to save zip cache: {}", e);
     }
 
     Ok(IndexBuildResult { mime_vec, channels: index, dir_to_channel })
+}
+
+/// Hashable key derived from a Reaction so we can map reactions to their
+/// saved-tag titles. The Reaction enum itself is generated without `Hash`,
+/// so we project the discriminating fields ourselves.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+enum ReactionKey {
+    Emoji(String),
+    Custom(i64),
+    Other,
+}
+
+fn reaction_key(r: &tl::enums::Reaction) -> ReactionKey {
+    match r {
+        tl::enums::Reaction::Emoji(e) => ReactionKey::Emoji(e.emoticon.clone()),
+        tl::enums::Reaction::CustomEmoji(c) => ReactionKey::Custom(c.document_id),
+        _ => ReactionKey::Other,
+    }
+}
+
+/// Fallback display label for a reaction that has no title set on its
+/// `messages.SavedReactionTags` entry — use the emoji glyph itself, or
+/// `custom_<id>` for custom-emoji tags.
+fn reaction_label(r: &tl::enums::Reaction) -> String {
+    match r {
+        tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+        tl::enums::Reaction::CustomEmoji(c) => format!("custom_{}", c.document_id),
+        _ => String::new(),
+    }
+}
+
+/// Read the per-message reactions from the raw `tl::enums::Message`. In
+/// Saved Messages these are the user's own tag reactions on each message.
+fn extract_message_reactions(msg: &grammers_client::message::Message) -> Vec<tl::enums::Reaction> {
+    if let tl::enums::Message::Message(m) = &msg.raw {
+        if let Some(tl::enums::MessageReactions::Reactions(r)) = &m.reactions {
+            return r
+                .results
+                .iter()
+                .map(|rc| {
+                    let tl::enums::ReactionCount::Count(c) = rc;
+                    c.reaction.clone()
+                })
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Index the user's Saved Messages dialog. Each document message becomes one
+/// or more `FileEntry` rows: untagged files at the root, tagged files
+/// fanned out under one virtual directory per matching saved reaction tag
+/// (a single message tagged `music` + `ambient` produces two entries).
+///
+/// Skips zip indexing and multipart-grouping intentionally — saved messages
+/// are treated as a flat tag-grouped catalogue. The existing fan-out via
+/// `FileEntry.path` lets fuse.rs / server.rs render tag dirs without any
+/// additional logic.
+async fn index_saved_messages(
+    client: &Client,
+    mime_map: &mut HashMap<String, usize>,
+    mime_vec: &mut Vec<String>,
+) -> anyhow::Result<TelegramChannel> {
+    println!("Indexing Saved Messages...");
+
+    // Resolve self peer for `iter_messages`. `Saved Messages` is the cloud
+    // chat with yourself; its peer is just your own User.
+    let me = client.get_me().await?;
+    let me_ref = me
+        .to_ref()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("could not resolve self peer"))?;
+
+    // Pull the list of saved reaction tags (with titles) once. The result
+    // gives us reaction → title mapping; reactions on messages that don't
+    // appear here are not user-defined tags and are ignored.
+    let tags_resp = client
+        .invoke(&tl::functions::messages::GetSavedReactionTags { peer: None, hash: 0 })
+        .await?;
+    let mut tag_titles: HashMap<ReactionKey, String> = HashMap::new();
+    if let tl::enums::messages::SavedReactionTags::Tags(tags) = tags_resp {
+        for tag in tags.tags {
+            let tl::enums::SavedReactionTag::Tag(t) = tag;
+            let key = reaction_key(&t.reaction);
+            let title = t.title.unwrap_or_else(|| reaction_label(&t.reaction));
+            if !title.is_empty() {
+                tag_titles.insert(key, title);
+            }
+        }
+    }
+    println!("  saved reaction tags: {}", tag_titles.len());
+
+    let mut files: Vec<FileEntry> = Vec::new();
+    let mut messages = client.iter_messages(me_ref);
+    let mut processed: usize = 0;
+    while let Some(msg) = messages.next().await? {
+        processed += 1;
+        let Some(Media::Document(doc)) = msg.media() else { continue };
+        let name = doc.name().unwrap_or("<unnamed>").to_string();
+        let size = doc.size();
+        let mime_type = doc
+            .mime_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        // No `type:`/`name:` overrides in saved messages — classify purely from
+        // the document MIME and filename.
+        let file_type = classify_file_type(&None, &mime_type, &name);
+        let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
+            mime_vec.push(mime_type.clone());
+            mime_vec.len() - 1
+        });
+
+        // Resolve which of this message's reactions are user-defined tags.
+        let mut titles: Vec<String> = extract_message_reactions(&msg)
+            .iter()
+            .filter_map(|r| tag_titles.get(&reaction_key(r)).cloned())
+            .collect();
+        titles.sort();
+        titles.dedup();
+
+        if titles.is_empty() {
+            files.push(FileEntry {
+                name: name.clone(),
+                path: None,
+                parts: smallvec![doc],
+                size,
+                mime_idx,
+                archive_entries: None,
+                file_type: file_type.clone(),
+            });
+        } else {
+            for tag in titles {
+                files.push(FileEntry {
+                    name: name.clone(),
+                    path: Some(std::path::PathBuf::from(&tag)),
+                    parts: smallvec![doc.clone()],
+                    size,
+                    mime_idx,
+                    archive_entries: None,
+                    file_type: file_type.clone(),
+                });
+            }
+        }
+    }
+    println!(
+        "Saved Messages indexed: {} entries from {} messages",
+        files.len(),
+        processed
+    );
+
+    files.sort_by_key(|f| f.name.to_lowercase());
+    Ok(TelegramChannel {
+        archive_view: ArchiveView::File,
+        skip_deflated_id3v1: false,
+        files,
+    })
 }
