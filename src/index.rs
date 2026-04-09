@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use grammers_client::media::Media;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use grammers_client::Client;
 use smallvec::SmallVec;
 
@@ -126,6 +127,8 @@ pub struct FileEntry {
     // the document MIME/type and the original document filename (not the
     // message `name:` override).
     pub file_type: FileType,
+    // Modification time derived from the originating Telegram message.
+    pub mtime: Option<SystemTime>,
 }
 
 #[derive(Clone, PartialEq, Eq)]

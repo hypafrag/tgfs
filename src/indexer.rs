@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::time::{SystemTime, Duration};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
@@ -30,6 +31,13 @@ fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
     } else {
         (raw.to_string(), None)
     }
+}
+
+fn msg_mtime(msg: &grammers_client::message::Message) -> Option<SystemTime> {
+    if let tl::enums::Message::Message(m) = &msg.raw {
+        return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(m.date as u64));
+    }
+    None
 }
 
 // Document-only downloader adapter. Some internal code (ZIP central-directory
@@ -438,7 +446,8 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     }
                     // intern mime_type
                     let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], size, mime_idx, archive_entries, file_type: final_type.clone() });
+                    let mtime = msg_mtime(&msg);
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], size, mime_idx, archive_entries, file_type: final_type.clone(), mtime });
                 }
                 Some(Media::Photo(photo)) => {
                     // Photos: expose as files. Use `name:` override if present, otherwise synthesize a filename.
@@ -455,7 +464,8 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     let mime_type = "image/jpeg".to_string();
                     let final_type = classify_file_type(&type_override, &mime_type, &file_name);
                     let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], size, mime_idx, archive_entries: None, file_type: final_type });
+                    let mtime = msg_mtime(&msg);
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], size, mime_idx, archive_entries: None, file_type: final_type, mtime });
                 }
                 _ => {}
             }
@@ -533,6 +543,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 mime_idx: first.mime_idx,
                 archive_entries: archive_entries_combined,
                 file_type: combined_file_type,
+                mtime: first.mtime,
             };
 
             // mark removed indices
@@ -740,21 +751,24 @@ async fn index_saved_messages(
                 titles.dedup();
 
                 if titles.is_empty() {
-                        // Skip entries with empty or placeholder names
-                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
-                        files.push(FileEntry {
-                            name: name.clone(),
-                            path: None,
-                            parts: smallvec![Media::Document(doc.clone())],
-                            size,
-                            mime_idx,
-                            archive_entries: None,
-                            file_type: file_type.clone(),
-                        });
+                    // Skip entries with empty or placeholder names
+                    if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                    let mtime = msg_mtime(&msg);
+                    files.push(FileEntry {
+                        name: name.clone(),
+                        path: None,
+                        parts: smallvec![Media::Document(doc.clone())],
+                        size,
+                        mime_idx,
+                        archive_entries: None,
+                        file_type: file_type.clone(),
+                        mtime,
+                    });
                 } else {
                     for tag in titles {
                         // skip pushing tagged entries with empty names
                         if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        let mtime = msg_mtime(&msg);
                         files.push(FileEntry {
                             name: name.clone(),
                             path: Some(std::path::PathBuf::from(&tag)),
@@ -763,6 +777,7 @@ async fn index_saved_messages(
                             mime_idx,
                             archive_entries: None,
                             file_type: file_type.clone(),
+                            mtime,
                         });
                     }
                 }
@@ -790,20 +805,23 @@ async fn index_saved_messages(
                 titles.dedup();
 
                 if titles.is_empty() {
-                        // Skip entries with empty or placeholder names
-                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
-                        files.push(FileEntry {
-                            name: name.clone(),
-                            path: None,
-                            parts: smallvec![Media::Photo(photo.clone())],
-                            size,
-                            mime_idx,
-                            archive_entries: None,
-                            file_type: file_type.clone(),
-                        });
+                    // Skip entries with empty or placeholder names
+                    if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                    let mtime = msg_mtime(&msg);
+                    files.push(FileEntry {
+                        name: name.clone(),
+                        path: None,
+                        parts: smallvec![Media::Photo(photo.clone())],
+                        size,
+                        mime_idx,
+                        archive_entries: None,
+                        file_type: file_type.clone(),
+                        mtime,
+                    });
                 } else {
                     for tag in titles {
                         if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        let mtime = msg_mtime(&msg);
                         files.push(FileEntry {
                             name: name.clone(),
                             path: Some(std::path::PathBuf::from(&tag)),
@@ -812,6 +830,7 @@ async fn index_saved_messages(
                             mime_idx,
                             archive_entries: None,
                             file_type: file_type.clone(),
+                            mtime,
                         });
                     }
                 }
@@ -876,15 +895,20 @@ async fn index_saved_messages(
             mime_idx: first.mime_idx,
             archive_entries: None,
             file_type: first.file_type.clone(),
+            mtime: first.mtime,
         };
 
         for idx in parts_indices { removed.insert(idx); }
+        if combined.name.trim().is_empty() || combined.name == "<unnamed>" {
+            continue;
+        }
         new_files.push(combined);
     }
 
     // Append non-removed original entries
     for (i, f) in files.into_iter().enumerate() {
         if removed.contains(&i) { continue; }
+        if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
         new_files.push(f);
     }
 

@@ -240,7 +240,8 @@ impl TgfsFS {
                 if show_as_file {
                     let parent_path = ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
                     let size = f.size.unwrap_or(0) as u64;
-                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, 0, now);
+                    let file_mtime = f.mtime.unwrap_or(now);
+                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, 0, file_mtime);
                 } else {
                     // Directory-only zip: create intermediate dirs only (skip file leaf).
                     ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
@@ -265,7 +266,8 @@ impl TgfsFS {
                             None => ("", ae.path.as_str()),
                         };
                         let ae_parent = ensure_dirs_along(&mut path_to_attr, &mut children, &arc_dir, ae_parent_rel, now);
-                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), now);
+                        let file_mtime = f.mtime.unwrap_or(now);
+                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), file_mtime);
                     }
                 }
             }
