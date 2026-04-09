@@ -217,16 +217,28 @@ async fn download_part_range(
         let doc = doc.clone();
         let client = client.clone();
         handles.push(tokio::spawn(async move {
-            let mut dl = client
-                .iter_download(&doc)
-                .chunk_size(TG_CHUNK_SIZE as i32)
-                .skip_chunks(start_chunk as i32);
             let mut out: Vec<u8> = Vec::with_capacity(take_n * TG_CHUNK_SIZE);
-            for _ in 0..take_n {
-                match dl.next().await {
-                    Ok(Some(chunk)) => out.extend_from_slice(&chunk),
-                    Ok(None) => break,
-                    Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
+            for chunk_idx in 0..take_n {
+                let mut retries = 0u32;
+                loop {
+                    let mut dl = client
+                        .iter_download(&doc)
+                        .chunk_size(TG_CHUNK_SIZE as i32)
+                        .skip_chunks((start_chunk + chunk_idx) as i32);
+                    match dl.next().await {
+                        Ok(Some(chunk)) => { out.extend_from_slice(&chunk); break; }
+                        Ok(None) => break,
+                        Err(grammers_client::InvocationError::Rpc(ref rpc)) if rpc.name == "FLOOD_WAIT" => {
+                            let wait = rpc.value.unwrap_or(1);
+                            retries += 1;
+                            if retries > 5 {
+                                return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("FLOOD_WAIT retry limit exceeded"));
+                            }
+                            eprintln!("indexer: FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
+                            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+                        }
+                        Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
+                    }
                 }
             }
             Ok(out)
