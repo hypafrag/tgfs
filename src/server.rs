@@ -313,10 +313,12 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, ar
         if is_dir {
             listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&combined)), label: format!("{}/", name), size: None });
         } else {
-            // Check for browsable zip inside a virtual directory and expose as directory
-            if let Some(e) = files.iter().find(|x| full_for(x) == combined) {
+            // Single lookup of the matching file entry; reused for both the
+            // browsable-zip-as-directory branch and the plain-file branch.
+            let entry = files.iter().find(|x| full_for(x) == combined);
+            if let Some(e) = entry {
                 if e.file_type == FileType::Zip && e.archive_entries.is_some() && archive_view != crate::index::ArchiveView::File {
-                    // expose stem as a directory listing
+                    // Expose the archive stem as a directory listing.
                     let stem = std::path::Path::new(&e.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name).to_string();
                     let stem_full = format!("{}/{}", trimmed, stem);
                     listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
@@ -326,7 +328,7 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, ar
                     continue;
                 }
             }
-            let size = files.iter().find(|x| full_for(x) == combined).and_then(|x| x.size);
+            let size = entry.and_then(|x| x.size);
             listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size });
         }
     }
