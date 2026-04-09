@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
 use grammers_client::Client;
-use grammers_client::media::Document;
+use grammers_client::media::Media;
 use tokio::runtime::Handle;
 
 use crate::index::{AppState, ArchiveView, FileEntry, FileType};
@@ -150,10 +150,26 @@ impl std::io::Read for PrefetchingReader {
         while self.buf_pos >= self.buf.len() {
             if self.eof { return Ok(0); }
             match self.rx.blocking_recv() {
-                Some(Ok(chunk)) if chunk.is_empty() => { self.eof = true; return Ok(0); }
-                Some(Ok(chunk)) => { self.buf = chunk; self.buf_pos = 0; }
-                Some(Err(e)) => { self.eof = true; return Err(e); }
-                None => { self.eof = true; return Ok(0); }
+                Some(Ok(chunk)) if chunk.is_empty() => {
+                    eprintln!("fuse: PrefetchingReader EOF (empty sentinel)");
+                    self.eof = true;
+                    return Ok(0);
+                }
+                Some(Ok(chunk)) => {
+                    eprintln!("fuse: PrefetchingReader got chunk {} bytes", chunk.len());
+                    self.buf = chunk;
+                    self.buf_pos = 0;
+                }
+                Some(Err(e)) => {
+                    eprintln!("fuse: PrefetchingReader error: {:?}", e);
+                    self.eof = true;
+                    return Err(e);
+                }
+                None => {
+                    eprintln!("fuse: PrefetchingReader channel closed");
+                    self.eof = true;
+                    return Ok(0);
+                }
             }
         }
         let n = out.len().min(self.buf.len() - self.buf_pos);
@@ -170,29 +186,40 @@ impl std::io::Read for PrefetchingReader {
 fn spawn_prefetcher(
     rt: &Handle,
     client: Client,
-    parts: Vec<Document>,
+    parts: Vec<Media>,
     data_offset: usize,
     compressed_size: usize,
 ) -> PrefetchingReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(DEFLATE_PREFETCH_DEPTH);
+    eprintln!("fuse: spawn_prefetcher data_offset={} compressed_size={}", data_offset, compressed_size);
     rt.spawn(async move {
         let mut consumed: usize = 0;
         while consumed < compressed_size {
             let want = (compressed_size - consumed).min(DEFLATE_FETCH_CHUNK);
             let abs = data_offset + consumed;
+            eprintln!("fuse: prefetcher fetch abs={} want={} consumed={}/{}", abs, want, consumed, compressed_size);
             let res = download_range(&client, &parts, abs, want).await;
             match res {
                 Ok(chunk) => {
-                    if chunk.is_empty() { break; }
+                    if chunk.is_empty() {
+                        eprintln!("fuse: prefetcher got empty chunk at consumed={}", consumed);
+                        break;
+                    }
+                    eprintln!("fuse: prefetcher got {} bytes", chunk.len());
                     consumed += chunk.len();
-                    if tx.send(Ok(chunk)).await.is_err() { return; }
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        eprintln!("fuse: prefetcher receiver dropped, exiting");
+                        return;
+                    }
                 }
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("fuse: prefetcher download error: {:?}", e);
                     let _ = tx.send(Err(std::io::Error::other("download failed"))).await;
                     return;
                 }
             }
         }
+        eprintln!("fuse: prefetcher done, consumed={}/{}", consumed, compressed_size);
         // Send a final empty chunk to signal clean EOF (channel close also works).
         let _ = tx.send(Ok(Vec::new())).await;
     });
@@ -264,7 +291,8 @@ impl TgfsFS {
                 if show_as_file {
                     let parent_path = ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
                     let size = f.size.unwrap_or(0) as u64;
-                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, 0, now);
+                    let file_mtime = f.mtime.unwrap_or(now);
+                    add_file(&mut path_to_attr, &mut children, &parent_path, fname, size, 0, file_mtime);
                 } else {
                     // Directory-only zip: create intermediate dirs only (skip file leaf).
                     ensure_dirs_along(&mut path_to_attr, &mut children, &ch_path, parent_rel, now);
@@ -289,7 +317,8 @@ impl TgfsFS {
                             None => ("", ae.path.as_str()),
                         };
                         let ae_parent = ensure_dirs_along(&mut path_to_attr, &mut children, &arc_dir, ae_parent_rel, now);
-                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), now);
+                        let file_mtime = f.mtime.unwrap_or(now);
+                        add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), file_mtime);
                     }
                 }
             }
@@ -414,7 +443,7 @@ impl Filesystem for TgfsFS {
         // return from `read()` immediately so the FUSE event loop is free to
         // service other requests while the download is in flight.
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
-            let parts_docs: Vec<Document> = fentry.parts.iter().cloned().collect();
+            let parts_docs: Vec<Media> = fentry.parts.iter().cloned().collect();
             let client = state.client.clone();
             self.rt.spawn(async move {
                 match download_range(&client, &parts_docs, offset as usize, size as usize).await {
@@ -431,8 +460,15 @@ impl Filesystem for TgfsFS {
             if f.archive_entries.is_none() { continue; }
             let full = full_for(f);
             let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name).to_string();
+            let stem_full = match &f.path {
+                Some(p) => {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    if s.is_empty() { stem.clone() } else { format!("{}/{}", s, stem) }
+                }
+                None => stem.clone(),
+            };
             let prefix_full = format!("{}/", full);
-            let prefix_stem = format!("{}/", stem);
+            let prefix_stem = format!("{}/", stem_full);
             let inner = if rest.starts_with(&prefix_full) {
                 &rest[prefix_full.len()..]
             } else if rest.starts_with(&prefix_stem) {
@@ -444,17 +480,20 @@ impl Filesystem for TgfsFS {
                 Some(a) => a,
                 None => { reply.error(libc::ENOENT); return; }
             };
-            let parts_docs: Vec<Document> = f.parts.iter().cloned().collect();
+            eprintln!("fuse: read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
+                path, inner, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
+            let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
             let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {
                 0 => {
                     let off = data_offset + offset as usize;
+                    eprintln!("fuse: stored entry read off={} size={}", off, size);
                     let client = state.client.clone();
                     self.rt.spawn(async move {
                         match download_range(&client, &parts_docs, off, size as usize).await {
-                            Ok(buf) => reply.data(&buf),
-                            Err(_) => reply.error(libc::EIO),
+                            Ok(buf) => { eprintln!("fuse: stored entry got {} bytes", buf.len()); reply.data(&buf); }
+                            Err(e) => { eprintln!("fuse: stored entry download error: {:?}", e); reply.error(libc::EIO); }
                         }
                     });
                     return;
@@ -484,6 +523,8 @@ impl Filesystem for TgfsFS {
 
                     self.rt.spawn_blocking(move || {
                         let mut stream = stream.lock().unwrap();
+                        eprintln!("fuse: deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
+                            fh, off, sz, stream.pos, uncompressed_size, compressed_size);
 
                         // Workaround for players probing for ID3v1 at EOF on deflated inner files.
                         // When enabled per-channel, return zero bytes for small probe reads
@@ -506,6 +547,7 @@ impl Filesystem for TgfsFS {
                         // Skip forward if the kernel jumped ahead (shouldn't happen in
                         // normal sequential reads; caller should use STORE for random access).
                         if off > stream.pos {
+                            eprintln!("fuse: deflate skip forward from {} to {} (skip {})", stream.pos, off, off - stream.pos);
                             use std::io::Read as _;
                             let mut remaining = off - stream.pos;
                             let mut discard = vec![0u8; remaining.min(65536)];
@@ -519,6 +561,7 @@ impl Filesystem for TgfsFS {
                             }
                         } else if off < stream.pos {
                             // Backward seek: impossible to handle without rewinding.
+                            eprintln!("fuse: deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
                             reply.error(libc::EIO);
                             return;
                         }
@@ -528,12 +571,13 @@ impl Filesystem for TgfsFS {
                         let mut total = 0;
                         while total < sz {
                             match stream.decoder.read(&mut buf[total..]) {
-                                Ok(0) => break,
+                                Ok(0) => { eprintln!("fuse: deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
                                 Ok(n) => total += n,
-                                Err(_) => { reply.error(libc::EIO); return; }
+                                Err(e) => { eprintln!("fuse: deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(libc::EIO); return; }
                             }
                         }
                         stream.pos += total;
+                        eprintln!("fuse: deflate read done fh={} produced={} new_pos={}", fh, total, stream.pos);
                         reply.data(&buf[..total]);
                     });
                     return;

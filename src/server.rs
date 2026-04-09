@@ -14,6 +14,7 @@ use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
 use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
+use grammers_client::media::Media;
 use grammers_client::Client;
 use tokio_stream::Stream;
 
@@ -93,7 +94,14 @@ fn stream_parts_range(
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         // locate starting part index and in-part offset
-        let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
+        let sizes: Vec<usize> = parts
+            .iter()
+            .map(|m| match m {
+                Media::Document(d) => d.size().unwrap_or(0) as usize,
+                Media::Photo(p) => crate::indexer::photo_largest_size(p),
+                _ => 0,
+            })
+            .collect();
         let mut accum = 0usize;
         let mut part_idx = 0usize;
         let mut offset_in_part = 0usize;
@@ -286,7 +294,7 @@ fn entries_for_archive_listing(archive_entry: &FileEntry, channel: &str, trimmed
     listing
 }
 
-fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str) -> Vec<Entry> {
+fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, archive_view: crate::index::ArchiveView) -> Vec<Entry> {
     use std::collections::BTreeSet;
     let mut seen = BTreeSet::new();
     let mut listing: Vec<Entry> = Vec::new();
@@ -305,7 +313,22 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str) ->
         if is_dir {
             listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&combined)), label: format!("{}/", name), size: None });
         } else {
-            let size = files.iter().find(|x| full_for(x) == combined).and_then(|x| x.size);
+            // Single lookup of the matching file entry; reused for both the
+            // browsable-zip-as-directory branch and the plain-file branch.
+            let entry = files.iter().find(|x| full_for(x) == combined);
+            if let Some(e) = entry {
+                if e.file_type == FileType::Zip && e.archive_entries.is_some() && archive_view != crate::index::ArchiveView::File {
+                    // Expose the archive stem as a directory listing.
+                    let stem = std::path::Path::new(&e.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name).to_string();
+                    let stem_full = format!("{}/{}", trimmed, stem);
+                    listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
+                    if archive_view == crate::index::ArchiveView::FileAndDirectory {
+                        listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size: e.size });
+                    }
+                    continue;
+                }
+            }
+            let size = entry.and_then(|x| x.size);
             listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size });
         }
     }
@@ -364,7 +387,8 @@ pub async fn handle_channel_path(
         }
 
         // Virtual directory listing: list immediate children (dirs and files) under trimmed/
-        let listing = entries_for_virtual_dir(files, &dir, trimmed);
+        let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File);
+        let listing = entries_for_virtual_dir(files, &dir, trimmed, archive_view);
         let title = format!("Index of /{dir}/{trimmed}/");
         return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
     }
@@ -419,7 +443,7 @@ pub async fn handle_channel_path(
     let inner_base = std::path::Path::new(inner).file_name().and_then(|s| s.to_str()).unwrap_or(inner);
     let encoded_name = urlencoding::encode(inner_base).into_owned();
     // disposition based on the inner file's MIME, not the archive's file_type
-    let inner_type = if mime.starts_with("audio/") || mime.starts_with("video/") {
+    let inner_type = if mime.starts_with("audio/") || mime.starts_with("video/") || mime.starts_with("image/") {
         FileType::Media
     } else {
         FileType::File

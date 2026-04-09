@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use grammers_client::media::Document;
+use grammers_client::media::Media;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use grammers_client::Client;
 use smallvec::SmallVec;
 
-pub type DocParts = SmallVec<[Document; 1]>;
+pub type DocParts = SmallVec<[Media; 1]>;
 
 #[derive(Deserialize)]
 pub struct ChannelEntry {
@@ -57,9 +58,23 @@ pub struct Config {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub mount_at: Option<String>,
+    /// If set, expose Saved Messages as a top-level directory.
+    /// Use `directory` to set the top-level directory name; `archive_view`
+    /// controls how ZIP archives are exposed (`file|directory|file_and_directory`).
+    #[serde(default)]
+    pub saved_messages: Option<SavedMessagesConfig>,
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+    #[serde(default)]
     pub channels: Vec<ChannelEntry>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct SavedMessagesConfig {
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default = "default_archive_view")]
+    pub archive_view: ArchiveView,
 }
 
 #[derive(Clone)]
@@ -120,6 +135,8 @@ pub struct FileEntry {
     // the document MIME/type and the original document filename (not the
     // message `name:` override).
     pub file_type: FileType,
+    // Modification time derived from the originating Telegram message.
+    pub mtime: Option<SystemTime>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -130,12 +147,16 @@ pub enum FileType {
 }
 
 impl FileEntry {
-    pub fn first_doc(&self) -> &Document {
+    pub fn first_doc(&self) -> &Media {
         &self.parts[0]
     }
 
     pub fn doc_name(&self) -> &str {
-        self.first_doc().name().unwrap_or(&self.name)
+        match &self.first_doc() {
+            Media::Document(d) => d.name().unwrap_or(&self.name),
+            Media::Photo(_) => &self.name,
+            _ => &self.name,
+        }
     }
 }
 
