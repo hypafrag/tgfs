@@ -60,6 +60,7 @@ pub struct Config {
     pub channels: Vec<ChannelEntry>,
 }
 
+#[derive(Clone)]
 pub struct ArchiveFileEntry {
     pub path: String,
     pub compressed_size: usize,
@@ -69,6 +70,32 @@ pub struct ArchiveFileEntry {
     /// Unix permission bits (lower 12 bits of st_mode), present when the archive
     /// was created on a Unix system (Info-ZIP "version made by" OS byte == 3).
     pub unix_mode: Option<u16>,
+}
+
+// Make ArchiveFileEntry serializable so it can be persisted to disk
+impl serde::Serialize for ArchiveFileEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ArchiveFileEntry", 6)?;
+        s.serialize_field("path", &self.path)?;
+        s.serialize_field("compressed_size", &self.compressed_size)?;
+        s.serialize_field("uncompressed_size", &self.uncompressed_size)?;
+        s.serialize_field("data_offset", &self.data_offset)?;
+        s.serialize_field("compression_method", &self.compression_method)?;
+        s.serialize_field("unix_mode", &self.unix_mode)?;
+        s.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ArchiveFileEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        #[derive(serde::Deserialize)]
+        struct _AFE { path: String, compressed_size: usize, uncompressed_size: usize, data_offset: u64, compression_method: u16, unix_mode: Option<u16> }
+        let v = _AFE::deserialize(deserializer)?;
+        Ok(ArchiveFileEntry { path: v.path, compressed_size: v.compressed_size, uncompressed_size: v.uncompressed_size, data_offset: v.data_offset, compression_method: v.compression_method, unix_mode: v.unix_mode })
+    }
 }
 pub struct FileEntry {
     pub name: String,

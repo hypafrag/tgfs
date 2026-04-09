@@ -4,6 +4,7 @@ use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
 use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts};
+use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
 
 fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().unwrap()) }
@@ -50,10 +51,20 @@ pub struct IndexBuildResult {
 
 /// Fetch and parse the ZIP central directory for `docs` (one or more concatenated parts).
 /// Returns `None` if the archive can't be indexed (no EOCD, download failure, etc.).
-async fn try_index_zip(client: &Client, docs: &[Document], label: &str) -> Option<Vec<ArchiveFileEntry>> {
+async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &mut ZipCache) -> Option<Vec<ArchiveFileEntry>> {
+    let total: usize = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum();
+    // check cache first
+    // Use the document's original name but strip a trailing multipart
+    // suffix like `.00` so multipart parts map to the same cache key.
+    let raw_name = docs.get(0).and_then(|d| d.name()).map(|s| s.to_string()).unwrap_or_else(|| label.to_string());
+    let name_key = if let Some((base, _)) = split_part_suffix(&raw_name) { base.to_string() } else { raw_name.clone() };
+    let key = ZipCacheKey { name: name_key.clone(), size: total };
+    if let Some(cached) = cache.get(&key) {
+        println!("  zip index cache hit for {} ({} bytes)", key.name, key.size);
+        return Some(cached);
+    }
     println!("  fetching EOCD tail of '{}' for indexing", label);
     io::stdout().flush().ok();
-    let total: usize = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum();
     let tail_len = std::cmp::min(total, 70_000);
     let tail_offset = total.saturating_sub(tail_len);
     let tail = download_range(client, docs, tail_offset, tail_len).await.ok()?;
@@ -78,6 +89,7 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str) -> Optio
         ae.data_offset = lh_offset + 30 + name_len as u64 + extra_len as u64;
     }
     println!("  zip entries read: {}", ae_list.len());
+    cache.insert(ZipCacheKey { name: name_key, size: total }, ae_list.clone());
     Some(ae_list)
 }
 
@@ -301,6 +313,9 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         (dir, c.name.clone())
     }).collect();
 
+    // load persistent zip index cache (keyed by document original name + total size)
+    let mut zip_cache = ZipCache::load("zip_index_cache.json.gz");
+
     for entry in &config.channels {
         let name = &entry.name;
         let peer_ref = match channel_peers.get(name) {
@@ -332,7 +347,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
                 let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
                 if final_type == FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
-                    archive_entries = try_index_zip(&client, &[doc.clone()], &file_name).await;
+                    archive_entries = try_index_zip(&client, &[doc.clone()], &file_name, &mut zip_cache).await;
                 }
                 // intern mime_type
                 let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
@@ -391,7 +406,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
             if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
                 println!("Processing multipart archive: {}", exposed_name);
-                archive_entries_combined = try_index_zip(&client, &docs, &exposed_name).await;
+                archive_entries_combined = try_index_zip(&client, &docs, &exposed_name, &mut zip_cache).await;
             }
 
             // Determine combined file_type: prefer the first part's resolved file_type.
@@ -425,6 +440,11 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         new_files.sort_by_key(|f| f.name.to_lowercase());
         println!(" {} files (post-group)", new_files.len());
         index.insert(name.clone(), new_files);
+    }
+
+    // Persist the zip index cache once after the full index is built.
+    if let Err(e) = zip_cache.save() {
+        eprintln!("failed to save zip cache: {}", e);
     }
 
     Ok(IndexBuildResult { index, mime_vec, channel_view_map, dir_to_channel })
