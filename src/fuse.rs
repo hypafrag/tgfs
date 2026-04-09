@@ -148,22 +148,26 @@ impl std::io::Read for TelegramReader {
         if self.buf_pos >= self.buf.len() {
             let remaining = self.compressed_size.saturating_sub(self.consumed);
             if remaining == 0 {
+                eprintln!("fuse: TelegramReader EOF consumed={} compressed_size={}", self.consumed, self.compressed_size);
                 return Ok(0);
             }
             let fetch = remaining.min(self.next_fetch);
             self.next_fetch = DEFLATE_FETCH_READAHEAD;
             let abs = self.data_offset + self.consumed;
+            eprintln!("fuse: TelegramReader fetch abs_offset={} fetch_size={} consumed={}/{}", abs, fetch, self.consumed, self.compressed_size);
             // Use a block so borrows of self.rt/client/parts end before we write self.buf.
             let chunk = {
                 let rt = &self.rt;
                 let client = &self.client;
                 let parts = &self.parts;
                 rt.block_on(download_range(client, parts, abs, fetch))
-                    .map_err(|_| std::io::Error::other("download failed"))?
+                    .map_err(|e| { eprintln!("fuse: TelegramReader download_range failed: {:?}", e); std::io::Error::other("download failed") })?
             };
             if chunk.is_empty() {
+                eprintln!("fuse: TelegramReader got empty chunk at consumed={}", self.consumed);
                 return Ok(0);
             }
+            eprintln!("fuse: TelegramReader got {} bytes (requested {})", chunk.len(), fetch);
             self.consumed += chunk.len();
             self.buf = chunk;
             self.buf_pos = 0;
@@ -409,8 +413,15 @@ impl Filesystem for TgfsFS {
             if f.archive_entries.is_none() { continue; }
             let full = full_for(f);
             let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name).to_string();
+            let stem_full = match &f.path {
+                Some(p) => {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    if s.is_empty() { stem.clone() } else { format!("{}/{}", s, stem) }
+                }
+                None => stem.clone(),
+            };
             let prefix_full = format!("{}/", full);
-            let prefix_stem = format!("{}/", stem);
+            let prefix_stem = format!("{}/", stem_full);
             let inner = if rest.starts_with(&prefix_full) {
                 &rest[prefix_full.len()..]
             } else if rest.starts_with(&prefix_stem) {
@@ -422,17 +433,20 @@ impl Filesystem for TgfsFS {
                 Some(a) => a,
                 None => { reply.error(libc::ENOENT); return; }
             };
+            eprintln!("fuse: read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
+                path, inner, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
             let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
             let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {
                 0 => {
                     let off = data_offset + offset as usize;
+                    eprintln!("fuse: stored entry read off={} size={}", off, size);
                     let client = state.client.clone();
                     self.rt.spawn(async move {
                         match download_range(&client, &parts_docs, off, size as usize).await {
-                            Ok(buf) => reply.data(&buf),
-                            Err(_) => reply.error(libc::EIO),
+                            Ok(buf) => { eprintln!("fuse: stored entry got {} bytes", buf.len()); reply.data(&buf); }
+                            Err(e) => { eprintln!("fuse: stored entry download error: {:?}", e); reply.error(libc::EIO); }
                         }
                     });
                     return;
@@ -470,6 +484,8 @@ impl Filesystem for TgfsFS {
 
                     self.rt.spawn_blocking(move || {
                         let mut stream = stream.lock().unwrap();
+                        eprintln!("fuse: deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
+                            fh, off, sz, stream.pos, uncompressed_size, compressed_size);
 
                         // Workaround for players probing for ID3v1 at EOF on deflated inner files.
                         // When enabled per-channel, return zero bytes for small probe reads
@@ -492,6 +508,7 @@ impl Filesystem for TgfsFS {
                         // Skip forward if the kernel jumped ahead (shouldn't happen in
                         // normal sequential reads; caller should use STORE for random access).
                         if off > stream.pos {
+                            eprintln!("fuse: deflate skip forward from {} to {} (skip {})", stream.pos, off, off - stream.pos);
                             use std::io::Read as _;
                             let mut remaining = off - stream.pos;
                             let mut discard = vec![0u8; remaining.min(65536)];
@@ -505,6 +522,7 @@ impl Filesystem for TgfsFS {
                             }
                         } else if off < stream.pos {
                             // Backward seek: impossible to handle without rewinding.
+                            eprintln!("fuse: deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
                             reply.error(libc::EIO);
                             return;
                         }
@@ -514,12 +532,13 @@ impl Filesystem for TgfsFS {
                         let mut total = 0;
                         while total < sz {
                             match stream.decoder.read(&mut buf[total..]) {
-                                Ok(0) => break,
+                                Ok(0) => { eprintln!("fuse: deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
                                 Ok(n) => total += n,
-                                Err(_) => { reply.error(libc::EIO); return; }
+                                Err(e) => { eprintln!("fuse: deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(libc::EIO); return; }
                             }
                         }
                         stream.pos += total;
+                        eprintln!("fuse: deflate read done fh={} produced={} new_pos={}", fh, total, stream.pos);
                         reply.data(&buf[..total]);
                     });
                     return;
