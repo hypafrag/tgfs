@@ -620,9 +620,71 @@ async fn index_saved_messages(
     );
 
     files.sort_by_key(|f| f.name.to_lowercase());
+    // Detect multipart files among saved messages and merge contiguous parts.
+    // Only merge parts that share the same tag `path` (i.e. same saved reaction
+    // tag placement). This avoids grouping parts that were fanned out under
+    // different tags.
+    let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        if let Some((base, part)) = split_part_suffix(f.doc_name()) {
+            groups.entry(base.to_string()).or_default().push((i, part));
+        }
+    }
+
+    let mut removed = std::collections::BTreeSet::new();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+    for (base, mut entries) in groups.into_iter() {
+        if entries.len() < 2 { continue; }
+        entries.sort_by_key(|&(_, p)| p);
+        if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
+        // Ensure all parts share the same tag path (both None or equal Some)
+        let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
+        let first_path = files[parts_indices[0]].path.clone();
+        if !parts_indices.iter().all(|&idx| files[idx].path == first_path) { continue; }
+
+        // collect docs and sizes
+        let mut docs: DocParts = DocParts::new();
+        let mut total_size: Option<usize> = Some(0);
+        for idx in &parts_indices {
+            let f = &files[*idx];
+            docs.extend(f.parts.iter().cloned());
+            match (total_size, f.size) {
+                (Some(acc), Some(s)) => total_size = Some(acc + s),
+                _ => total_size = None,
+            }
+        }
+
+        // Exposed name: use the base (no message overrides in saved messages)
+        let exposed_name = base.clone();
+
+        // Representative from first part
+        let first = &files[parts_indices[0]];
+
+        let combined = FileEntry {
+            name: exposed_name,
+            path: first.path.clone(),
+            parts: docs,
+            size: total_size,
+            mime_idx: first.mime_idx,
+            archive_entries: None,
+            file_type: first.file_type.clone(),
+        };
+
+        for idx in parts_indices { removed.insert(idx); }
+        new_files.push(combined);
+    }
+
+    // Append non-removed original entries
+    for (i, f) in files.into_iter().enumerate() {
+        if removed.contains(&i) { continue; }
+        new_files.push(f);
+    }
+
+    new_files.sort_by_key(|f| f.name.to_lowercase());
+
     Ok(TelegramChannel {
         archive_view: ArchiveView::File,
         skip_deflated_id3v1: false,
-        files,
+        files: new_files,
     })
 }
