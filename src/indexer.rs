@@ -22,6 +22,89 @@ fn split_part_suffix(name: &str) -> Option<(&str, usize)> {
     Some((base, rest.parse().ok()?))
 }
 
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(ca, cb)| ca == cb).map(|(c, _)| c.len_utf8()).sum()
+}
+
+/// Trim a prefix candidate: remove trailing whitespace and underscores, then
+/// cut at the earliest unmatched `[` or `(` (e.g. `"Into the Breach [010057"`
+/// → `"Into the Breach"`). Returns a &str into the original slice.
+fn trim_prefix_name(s: &str) -> &str {
+    // Find the first position of an unmatched opening bracket/paren.
+    let mut bracket_opens: Vec<usize> = Vec::new();
+    let mut paren_opens: Vec<usize> = Vec::new();
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => bracket_opens.push(i),
+            ']' => { bracket_opens.pop(); }
+            '(' => paren_opens.push(i),
+            ')' => { paren_opens.pop(); }
+            _ => {}
+        }
+    }
+    let mut cut = s.len();
+    if let Some(&pos) = bracket_opens.first() { cut = cut.min(pos); }
+    if let Some(&pos) = paren_opens.first() { cut = cut.min(pos); }
+    s[..cut].trim_end_matches(|c: char| c.is_whitespace() || c == '_')
+}
+
+/// Collapse files at the same virtual-directory level into sub-directories
+/// when two or more files share a common name prefix of at least `min_len`
+/// characters (after trimming trailing whitespace from the prefix).
+/// Modifies `path` on affected entries in-place; the rest of the server /
+/// FUSE path logic requires no changes.
+fn apply_prefix_collapse(files: &mut Vec<FileEntry>, min_len: usize) {
+    if min_len == 0 || files.len() < 2 { return; }
+
+    // Bucket file indices by their current virtual path so we only collapse
+    // files that already live at the same directory level.
+    let mut buckets: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (i, f) in files.iter().enumerate() {
+        let key = f.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        buckets.entry(key).or_default().push(i);
+    }
+
+    let mut updates: Vec<(usize, std::path::PathBuf)> = Vec::new();
+
+    for (_bucket_key, mut indices) in buckets {
+        if indices.len() < 2 { continue; }
+        // Sort indices by lowercase name so adjacent entries share maximum prefix.
+        indices.sort_by_key(|&i| files[i].name.to_lowercase());
+        let names: Vec<&str> = indices.iter().map(|&i| files[i].name.as_str()).collect();
+
+        // Forward greedy scan: extend a group as long as the accumulated
+        // common prefix of the whole group stays >= min_len bytes.
+        let mut start = 0;
+        while start + 1 < names.len() {
+            let mut prefix_bytes = common_prefix_len(names[start], names[start + 1]);
+            if prefix_bytes < min_len { start += 1; continue; }
+
+            let mut end = start + 2;
+            while end < names.len() {
+                let new_len = common_prefix_len(&names[start][..prefix_bytes], names[end]);
+                if new_len >= min_len { prefix_bytes = new_len; end += 1; } else { break; }
+            }
+
+            // The directory name is the shared prefix, right-trimmed of whitespace.
+            let dir_name = trim_prefix_name(&names[start][..prefix_bytes]).to_string();
+            if dir_name.len() >= min_len {
+                for &idx in &indices[start..end] {
+                    let new_path = match &files[idx].path {
+                        Some(p) => p.join(&dir_name),
+                        None => std::path::PathBuf::from(&dir_name),
+                    };
+                    updates.push((idx, new_path));
+                }
+            }
+            start = end;
+        }
+    }
+
+    for (idx, new_path) in updates {
+        files[idx].path = Some(new_path);
+    }
+}
+
 fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
     if raw.contains('/') {
         let p = std::path::Path::new(raw);
@@ -586,6 +669,10 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         // sort files by exposed name
         new_files.sort_by_key(|f| f.name.to_lowercase());
         println!(" {} files (post-group)", new_files.len());
+        // collapse files sharing a common name prefix into virtual subdirectories
+        if let Some(min_len) = entry.collapse_by_prefix {
+            apply_prefix_collapse(&mut new_files, min_len);
+        }
         // create TelegramChannel and insert
         let tchan = TelegramChannel { archive_view: entry.archive_view, skip_deflated_id3v1: entry.skip_deflated_id3v1, files: new_files };
         index.insert(name.clone(), tchan);

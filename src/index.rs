@@ -17,6 +17,11 @@ pub struct ChannelEntry {
     pub archive_view: ArchiveView,
     #[serde(default)]
     pub skip_deflated_id3v1: bool,
+    /// Minimum length of a shared name prefix required to collapse files at
+    /// the same virtual directory level into a new sub-directory named after
+    /// that prefix (trailing whitespace stripped). 0 / absent = disabled.
+    #[serde(default)]
+    pub collapse_by_prefix: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
