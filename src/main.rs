@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let indexer::IndexBuildResult { mime_vec: mime_pool, channels, dir_to_channel } =
         indexer::build_index(client.clone(), &config).await?;
-    let state = Arc::new(AppState { client, mime_pool, channels, dir_to_channel });
+    let state = Arc::new(AppState { client, mime_pool, channels, dir_to_channel, max_fetches_per_pid: config.max_fetches_per_pid });
 
     // Optionally mount FUSE filesystem in a blocking task.
     let fuse_handle = config.mount_at.as_ref().map(|mountpoint| {

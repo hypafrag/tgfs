@@ -65,6 +65,10 @@ pub struct Config {
     pub saved_messages: Option<SavedMessagesConfig>,
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+    /// Maximum number of concurrent Telegram fetches a single PID may have
+    /// in-flight through the FUSE mount. Extra reads block until a slot opens.
+    #[serde(default)]
+    pub max_fetches_per_pid: Option<usize>,
     #[serde(default)]
     pub channels: Vec<ChannelEntry>,
 }
@@ -169,6 +173,8 @@ pub struct AppState {
     // Maps directory name (used in URLs / FUSE paths) → channel name (index key).
     // When no `directory:` override is set, dir name == channel name.
     pub dir_to_channel: HashMap<String, String>,
+    /// Per-PID concurrent fetch limit for FUSE (None = unlimited).
+    pub max_fetches_per_pid: Option<usize>,
 }
 
 #[derive(Clone)]

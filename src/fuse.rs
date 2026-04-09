@@ -251,6 +251,11 @@ pub struct TgfsFS {
     // and must consume bytes sequentially. Removed in release().
     deflate_streams: HashMap<u64, Arc<Mutex<DeflateStream>>>,
     next_fh: u64,
+    /// Per-PID semaphores limiting concurrent Telegram fetches.
+    /// Created lazily on first read from a given PID.
+    pid_semaphores: HashMap<u32, Arc<tokio::sync::Semaphore>>,
+    /// Maximum concurrent fetches per PID (None = unlimited).
+    max_fetches_per_pid: Option<usize>,
 }
 
 impl TgfsFS {
@@ -326,7 +331,14 @@ impl TgfsFS {
 
         let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino, p.clone())).collect();
 
-        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current(), deflate_streams: HashMap::new(), next_fh: 1 }
+        let max_fetches_per_pid = state.max_fetches_per_pid;
+        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current(), deflate_streams: HashMap::new(), next_fh: 1, pid_semaphores: HashMap::new(), max_fetches_per_pid }
+    }
+
+    /// Get or create the per-PID semaphore. Returns `None` when limiting is disabled.
+    fn pid_semaphore(&mut self, pid: u32) -> Option<Arc<tokio::sync::Semaphore>> {
+        let limit = self.max_fetches_per_pid?;
+        Some(self.pid_semaphores.entry(pid).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit))).clone())
     }
 
     fn lookup_path(&self, path: &str) -> Option<&FileAttr> {
@@ -419,6 +431,7 @@ impl Filesystem for TgfsFS {
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+        let pid_sem = self.pid_semaphore(_req.pid());
         // Clone Arc so borrows for `files`/`ae` come from a local — leaving
         // `self` free to mutate `deflate_streams` below without borrow conflict.
         let state = self.state.clone();
@@ -445,7 +458,12 @@ impl Filesystem for TgfsFS {
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
             let parts_docs: Vec<Media> = fentry.parts.iter().cloned().collect();
             let client = state.client.clone();
+            let sem = pid_sem.clone();
             self.rt.spawn(async move {
+                let _permit = match &sem {
+                    Some(s) => Some(s.acquire().await.expect("semaphore closed")),
+                    None => None,
+                };
                 match download_range(&client, &parts_docs, offset as usize, size as usize).await {
                     Ok(buf) => reply.data(&buf),
                     Err(_) => reply.error(libc::EIO),
@@ -490,7 +508,12 @@ impl Filesystem for TgfsFS {
                     let off = data_offset + offset as usize;
                     eprintln!("fuse: stored entry read off={} size={}", off, size);
                     let client = state.client.clone();
+                    let sem = pid_sem.clone();
                     self.rt.spawn(async move {
+                        let _permit = match &sem {
+                            Some(s) => Some(s.acquire().await.expect("semaphore closed")),
+                            None => None,
+                        };
                         match download_range(&client, &parts_docs, off, size as usize).await {
                             Ok(buf) => { eprintln!("fuse: stored entry got {} bytes", buf.len()); reply.data(&buf); }
                             Err(e) => { eprintln!("fuse: stored entry download error: {:?}", e); reply.error(libc::EIO); }
@@ -521,7 +544,11 @@ impl Filesystem for TgfsFS {
                         }))
                     }).clone();
 
+                    let sem = pid_sem.clone();
+                    let rt_for_sem = self.rt.clone();
                     self.rt.spawn_blocking(move || {
+                        // Acquire per-PID fetch permit (blocks until a slot is free).
+                        let _permit = sem.map(|s| rt_for_sem.block_on(s.acquire_owned()).expect("semaphore closed"));
                         let mut stream = stream.lock().unwrap();
                         eprintln!("fuse: deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
                             fh, off, sz, stream.pos, uncompressed_size, compressed_size);
