@@ -78,6 +78,16 @@ Single-message documents (not grouped albums) support caption directives:
 - `name: path/to/file.ext` — override the filename and/or place the file under a virtual directory.
 - `type: file|media|zip` — override auto-classification. `media` forces inline playback; `file` forces download; `zip` enables archive indexing.
 
+### `max_fetches_per_pid`
+
+Limits how many concurrent Telegram downloads a single process (PID) may have in-flight through the FUSE mount. When the limit is reached, new `read()` calls block until an in-flight fetch completes. File opens are never blocked.
+
+```yaml
+max_fetches_per_pid: 3
+```
+
+Omit or leave unset for unlimited concurrency (default).
+
 ## Docker
 
 A multi-stage `Dockerfile` is provided. The runtime image is based on `debian:bookworm-slim` and contains only the stripped binary plus `ca-certificates` and `libfuse2` — no Rust toolchain or build artifacts.
