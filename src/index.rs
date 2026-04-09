@@ -237,7 +237,7 @@ fn fmt_system_time(t: std::time::SystemTime) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, min)
 }
 
-pub fn dir_listing(title: &str, parent: Option<&str>, entries: &[Entry]) -> String {
+pub fn dir_listing(title: &str, _parent: Option<&str>, entries: &[Entry]) -> String {
     use std::fmt::Write;
     let mut body = String::new();
     let te = html_escape(title);
@@ -259,14 +259,11 @@ pub fn dir_listing(title: &str, parent: Option<&str>, entries: &[Entry]) -> Stri
         "  <th class=\"size\">Size</th>\n",
         "</tr>\n</thead>\n<tbody>\n"
     ), te = te).unwrap();
-    if let Some(p) = parent {
-        write!(body, "<tr><td><a href=\"{}\">../</a></td><td class=\"modified\"></td><td class=\"size\">-</td></tr>\n", p).unwrap();
-    }
     for e in entries {
         let size_str = e.size.map_or("-".to_string(), |s| human_size(s));
         let mod_str = e.modified.map(fmt_system_time).unwrap_or_default();
         write!(body,
-            "<tr><td><a href=\"{}\">{}</a></td><td class=\"modified\">{}</td><td class=\"size\">{}</td></tr>\n",
+            "<tr>\n  <td>\n    <a href=\"{}\">{}</a>\n  </td>\n  <td class=\"modified\">{}</td>\n  <td class=\"size\">{}</td>\n</tr>\n",
             e.href, html_escape(&e.label), mod_str, size_str
         ).unwrap();
     }
