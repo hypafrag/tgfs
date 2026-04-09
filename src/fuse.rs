@@ -37,9 +37,11 @@ fn full_for(e: &FileEntry) -> String {
 // Static read-only FS: entries never change, so use a long TTL for kernel caching.
 const ATTR_TTL: Duration = Duration::from_secs(86400);
 
-// 128 KB preferred I/O size. Tells the kernel to batch reads, reducing
-// the number of round-trips through the single-threaded FUSE event loop.
-const BLKSIZE: u32 = 131_072;
+// 1 MB preferred I/O size. Tells the kernel to batch reads, reducing
+// the number of round-trips through the FUSE event loop. Must be paired
+// with a matching `max_read=` mount option (see main.rs) — otherwise the
+// kernel caps individual reads at its default (128 KB on Linux).
+pub const BLKSIZE: u32 = 1024 * 1024;
 
 fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
     FileAttr {
@@ -123,50 +125,36 @@ fn add_file(
     path_to_attr.insert(path, attr);
 }
 
-const DEFLATE_FETCH_INITIAL: usize = 64 * 1024;
-const DEFLATE_FETCH_READAHEAD: usize = 512 * 1024;
+/// Compressed-bytes prefetch chunk size. Big enough to amortize Telegram
+/// per-request overhead; small enough to keep the channel responsive.
+const DEFLATE_FETCH_CHUNK: usize = 2 * 1024 * 1024;
+/// How many fetched chunks the prefetcher may keep buffered ahead of the
+/// decoder. The bounded channel applies natural backpressure: when full, the
+/// background task awaits on `send().await` until the decoder catches up.
+/// Worst-case buffered compressed data ≈ DEFLATE_PREFETCH_DEPTH * DEFLATE_FETCH_CHUNK.
+const DEFLATE_PREFETCH_DEPTH: usize = 4;
 
-/// Streams compressed bytes from Telegram on demand, one chunk at a time.
-/// Wrapped by `DeflateDecoder` so only the decoder's 32 KB window is held
-/// in memory — not the full compressed payload.
-struct TelegramReader {
-    client: Client,
-    parts: Vec<Document>,
-    /// Absolute byte offset in the Telegram file where compressed data begins.
-    data_offset: usize,
-    compressed_size: usize,
-    /// Compressed bytes consumed so far (relative to data_offset).
-    consumed: usize,
+/// `std::io::Read` adapter over a tokio mpsc receiver fed by a background
+/// fetcher task. The decoder calls `read()` from a `spawn_blocking` thread,
+/// which blocks on `blocking_recv()` while the fetcher pipelines the next
+/// compressed chunks in parallel with decode work.
+struct PrefetchingReader {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     buf: Vec<u8>,
     buf_pos: usize,
-    next_fetch: usize,
-    rt: Handle,
+    eof: bool,
 }
 
-impl std::io::Read for TelegramReader {
+impl std::io::Read for PrefetchingReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if self.buf_pos >= self.buf.len() {
-            let remaining = self.compressed_size.saturating_sub(self.consumed);
-            if remaining == 0 {
-                return Ok(0);
+        while self.buf_pos >= self.buf.len() {
+            if self.eof { return Ok(0); }
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) if chunk.is_empty() => { self.eof = true; return Ok(0); }
+                Some(Ok(chunk)) => { self.buf = chunk; self.buf_pos = 0; }
+                Some(Err(e)) => { self.eof = true; return Err(e); }
+                None => { self.eof = true; return Ok(0); }
             }
-            let fetch = remaining.min(self.next_fetch);
-            self.next_fetch = DEFLATE_FETCH_READAHEAD;
-            let abs = self.data_offset + self.consumed;
-            // Use a block so borrows of self.rt/client/parts end before we write self.buf.
-            let chunk = {
-                let rt = &self.rt;
-                let client = &self.client;
-                let parts = &self.parts;
-                rt.block_on(download_range(client, parts, abs, fetch))
-                    .map_err(|_| std::io::Error::other("download failed"))?
-            };
-            if chunk.is_empty() {
-                return Ok(0);
-            }
-            self.consumed += chunk.len();
-            self.buf = chunk;
-            self.buf_pos = 0;
         }
         let n = out.len().min(self.buf.len() - self.buf_pos);
         out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
@@ -175,9 +163,45 @@ impl std::io::Read for TelegramReader {
     }
 }
 
+/// Spawn a background task that pipelines compressed-byte fetches from
+/// Telegram into a bounded channel. The receiver is wrapped in
+/// `PrefetchingReader` for the deflate decoder. When the receiver is dropped
+/// (e.g. on `release()`), `tx.send().await` errors and the task exits.
+fn spawn_prefetcher(
+    rt: &Handle,
+    client: Client,
+    parts: Vec<Document>,
+    data_offset: usize,
+    compressed_size: usize,
+) -> PrefetchingReader {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(DEFLATE_PREFETCH_DEPTH);
+    rt.spawn(async move {
+        let mut consumed: usize = 0;
+        while consumed < compressed_size {
+            let want = (compressed_size - consumed).min(DEFLATE_FETCH_CHUNK);
+            let abs = data_offset + consumed;
+            let res = download_range(&client, &parts, abs, want).await;
+            match res {
+                Ok(chunk) => {
+                    if chunk.is_empty() { break; }
+                    consumed += chunk.len();
+                    if tx.send(Ok(chunk)).await.is_err() { return; }
+                }
+                Err(_) => {
+                    let _ = tx.send(Err(std::io::Error::other("download failed"))).await;
+                    return;
+                }
+            }
+        }
+        // Send a final empty chunk to signal clean EOF (channel close also works).
+        let _ = tx.send(Ok(Vec::new())).await;
+    });
+    PrefetchingReader { rx, buf: Vec::new(), buf_pos: 0, eof: false }
+}
+
 /// Per-open-handle state for a deflate-compressed archive entry.
 struct DeflateStream {
-    decoder: DeflateDecoder<TelegramReader>,
+    decoder: DeflateDecoder<PrefetchingReader>,
     /// Byte position in the decompressed output the decoder is currently at.
     pos: usize,
 }
@@ -445,21 +469,13 @@ impl Filesystem for TgfsFS {
 
                     // Get-or-create the per-fh streaming decoder. Wrapped in
                     // Arc<Mutex<>> so the actual decode work runs on a blocking
-                    // thread and the FUSE event loop returns immediately.
+                    // thread and the FUSE event loop returns immediately. The
+                    // PrefetchingReader pipelines compressed-byte fetches in a
+                    // background task so the decoder rarely blocks on network.
                     let client = state.client.clone();
                     let rt_clone = self.rt.clone();
                     let stream = self.deflate_streams.entry(fh).or_insert_with(|| {
-                        let reader = TelegramReader {
-                            client,
-                            parts: parts_docs,
-                            data_offset,
-                            compressed_size,
-                            consumed: 0,
-                            buf: Vec::new(),
-                            buf_pos: 0,
-                            next_fetch: DEFLATE_FETCH_INITIAL,
-                            rt: rt_clone,
-                        };
+                        let reader = spawn_prefetcher(&rt_clone, client, parts_docs, data_offset, compressed_size);
                         Arc::new(Mutex::new(DeflateStream {
                             decoder: DeflateDecoder::new(reader),
                             pos: 0,

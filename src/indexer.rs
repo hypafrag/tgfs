@@ -92,6 +92,14 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
     Some(ae_list)
 }
 
+/// Telegram chunk size for `iter_download`. Must be a power of 2; 64 KB is the
+/// standard MTProto chunk granularity.
+const TG_CHUNK_SIZE: usize = 64 * 1024;
+/// How many parallel `iter_download` streams to spawn per `download_part_range`
+/// call. Each stream walks a disjoint slice of contiguous 64 KB chunks. The
+/// `SenderPool` in `make_client` multiplexes these onto its connection pool.
+const PARALLEL_DOWNLOAD_STREAMS: usize = 4;
+
 // Download a byte range [offset, offset+length) from Telegram, spanning one or
 // more concatenated document parts. A single-document file is just a 1-element
 // slice. Used by both the indexer (central-directory parsing, local-header reads)
@@ -113,35 +121,81 @@ pub async fn download_range(
     while i < sizes.len() && pos + sizes[i] <= offset { pos += sizes[i]; i += 1; }
     let mut start_in_part = offset - pos;
 
-    let chunk_size: usize = 64 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(to_read);
     let mut need = to_read;
     while i < parts.len() && need > 0 {
         let avail = sizes[i].saturating_sub(start_in_part);
         if avail == 0 { i += 1; start_in_part = 0; continue; }
         let read_len = std::cmp::min(avail, need);
-        let first_chunk = (start_in_part / chunk_size) as i32;
-        let offset_in_first = start_in_part % chunk_size;
-        let mut dl = client
-            .iter_download(&parts[i])
-            .chunk_size(chunk_size as i32)
-            .skip_chunks(first_chunk);
-        let mut part_buf: Vec<u8> = Vec::with_capacity(offset_in_first + read_len);
-        while let Ok(Some(chunk)) = dl.next().await {
-            part_buf.extend_from_slice(&chunk);
-            if part_buf.len() >= offset_in_first + read_len { break; }
-        }
-        if part_buf.len() <= offset_in_first {
+        let part_buf = download_part_range(client, &parts[i], start_in_part, read_len).await?;
+        if part_buf.len() < read_len {
             return Err(anyhow::anyhow!("failed to download requested range"));
         }
-        let end = std::cmp::min(part_buf.len(), offset_in_first + read_len);
-        buf.extend_from_slice(&part_buf[offset_in_first..end]);
-        need = need.saturating_sub(end - offset_in_first);
+        buf.extend_from_slice(&part_buf);
+        need = need.saturating_sub(read_len);
         i += 1;
         start_in_part = 0;
     }
 
     Ok(buf)
+}
+
+/// Download `[offset, offset+length)` from a single document part by splitting
+/// the covering chunk range across `PARALLEL_DOWNLOAD_STREAMS` concurrent
+/// `iter_download` streams. Network latency hides behind itself, giving
+/// near-linear speedup up to the underlying connection-pool concurrency.
+async fn download_part_range(
+    client: &Client,
+    doc: &Document,
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if length == 0 { return Ok(Vec::new()); }
+    let first_chunk = offset / TG_CHUNK_SIZE;
+    let last_chunk = (offset + length - 1) / TG_CHUNK_SIZE;
+    let total_chunks = last_chunk - first_chunk + 1;
+    let in_first_chunk = offset % TG_CHUNK_SIZE;
+
+    let n_tasks = std::cmp::min(PARALLEL_DOWNLOAD_STREAMS, total_chunks);
+    let chunks_per_task = total_chunks.div_ceil(n_tasks);
+
+    let mut handles = Vec::with_capacity(n_tasks);
+    for t in 0..n_tasks {
+        let start_chunk = first_chunk + t * chunks_per_task;
+        if start_chunk > last_chunk { break; }
+        let end_chunk = std::cmp::min(first_chunk + (t + 1) * chunks_per_task - 1, last_chunk);
+        let take_n = end_chunk - start_chunk + 1;
+        let doc = doc.clone();
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let mut dl = client
+                .iter_download(&doc)
+                .chunk_size(TG_CHUNK_SIZE as i32)
+                .skip_chunks(start_chunk as i32);
+            let mut out: Vec<u8> = Vec::with_capacity(take_n * TG_CHUNK_SIZE);
+            for _ in 0..take_n {
+                match dl.next().await {
+                    Ok(Some(chunk)) => out.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
+                }
+            }
+            Ok(out)
+        }));
+    }
+
+    // Concatenate in order so the returned bytes are contiguous.
+    let mut combined: Vec<u8> = Vec::with_capacity(total_chunks * TG_CHUNK_SIZE);
+    for h in handles {
+        let part = h.await??;
+        combined.extend_from_slice(&part);
+    }
+
+    if combined.len() <= in_first_chunk {
+        return Err(anyhow::anyhow!("failed to download requested range"));
+    }
+    let end = std::cmp::min(combined.len(), in_first_chunk + length);
+    Ok(combined[in_first_chunk..end].to_vec())
 }
 
 fn find_eocd(tail: &[u8], tail_offset: u64) -> Option<(u64, u64)> {

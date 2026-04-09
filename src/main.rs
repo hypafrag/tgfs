@@ -114,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
                 fuser::MountOption::AllowOther,
                 fuser::MountOption::AutoUnmount,
                 fuser::MountOption::RO,
+                // Match the BLKSIZE advertised in fuse.rs so the kernel issues
+                // bigger reads, reducing per-call FUSE event-loop overhead.
+                fuser::MountOption::CUSTOM(format!("max_read={}", fuse::BLKSIZE)),
             ]).expect("FUSE mount failed");
         })
     });

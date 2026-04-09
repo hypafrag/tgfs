@@ -22,5 +22,5 @@ bytes = "1"
 mime_guess = "2"
 smallvec = "1"
 fuser = "0.14"
-flate2 = "1.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
