@@ -342,14 +342,14 @@ pub async fn handle_channel_path(
 ) -> Result<Response, StatusCode> {
     let dir = channel.trim_end_matches('/').to_string();
     let channel = state.dir_to_channel.get(&dir).cloned().ok_or(StatusCode::NOT_FOUND)?;
-    let files = state.index.get(&channel).ok_or(StatusCode::NOT_FOUND)?;
+    let files = state.channels.get(&channel).map(|c| &c.files).ok_or(StatusCode::NOT_FOUND)?;
     let orig_path = path;
     let is_dir_request = orig_path.is_empty() || orig_path.ends_with('/');
     let trimmed = orig_path.trim_end_matches('/');
 
     if is_dir_request {
         if trimmed.is_empty() {
-            let archive_view = state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File);
+            let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File);
             let (entries, title) = entries_for_root(files, &dir, archive_view);
             return html_response(dir_listing(&title, Some("/"), &entries));
         }
@@ -373,7 +373,7 @@ pub async fn handle_channel_path(
     // either a direct file (top-level or at a virtual path) or a file inside an archive
     if let Some(fentry) = files.iter().find(|e| full_for(e) == trimmed) {
         // if zip and archive_view is Directory-only, then we do not offer raw download; return 404
-        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channel_archive_view.get(&channel).copied().unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::Directory {
+        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::Directory {
             return Err(StatusCode::NOT_FOUND);
         }
 

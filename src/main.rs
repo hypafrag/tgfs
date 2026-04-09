@@ -100,9 +100,9 @@ async fn main() -> anyhow::Result<()> {
         println!("Signed in successfully.");
     }
 
-    let indexer::IndexBuildResult { index, mime_vec: mime_pool, channel_view_map: channel_archive_view, dir_to_channel } =
+    let indexer::IndexBuildResult { mime_vec: mime_pool, channels, dir_to_channel } =
         indexer::build_index(client.clone(), &config).await?;
-    let state = Arc::new(AppState { client, index, mime_pool, channel_archive_view, dir_to_channel });
+    let state = Arc::new(AppState { client, mime_pool, channels, dir_to_channel });
 
     // Optionally mount FUSE filesystem in a blocking task.
     let fuse_handle = config.mount_at.as_ref().map(|mountpoint| {

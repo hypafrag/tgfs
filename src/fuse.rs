@@ -213,9 +213,9 @@ impl TgfsFS {
             let ch_path = format!("/{}", dir);
             ensure_dir(&mut path_to_attr, &mut children, "/", dir, &ch_path, now);
 
-            let archive_view = state.channel_archive_view.get(channel).copied().unwrap_or(ArchiveView::File);
+            let archive_view = state.channels.get(channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File);
 
-            let files = match state.index.get(channel) {
+            let files = match state.channels.get(channel).map(|c| &c.files) {
                 Some(f) => f,
                 None => continue,
             };
@@ -352,6 +352,8 @@ impl Filesystem for TgfsFS {
         if exists {
             let fh = self.next_fh;
             self.next_fh += 1;
+            let path = self.path_for_ino(ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
+            println!("fuse: open ino={} path='{}' fh={}", ino, path, fh);
             reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
         } else {
             reply.error(libc::EISDIR);
@@ -359,7 +361,10 @@ impl Filesystem for TgfsFS {
     }
 
     fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        self.deflate_streams.remove(&fh);
+        let had = self.deflate_streams.remove(&fh).is_some();
+        // Try to resolve path for logging; not strictly required.
+        let path = self.path_for_ino(_ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
+        println!("fuse: release fh={} ino={} path='{}' had_deflate_stream={}", fh, _ino, path, had);
         reply.ok();
     }
 
@@ -376,7 +381,7 @@ impl Filesystem for TgfsFS {
             Some(c) => c,
             None => { reply.error(libc::ENOENT); return; }
         };
-        let files = match self.state.index.get(channel) {
+        let files = match self.state.channels.get(channel).map(|c| &c.files) {
             Some(f) => f,
             None => { reply.error(libc::ENOENT); return; }
         };
@@ -429,6 +434,27 @@ impl Filesystem for TgfsFS {
 
                     let off = offset as usize;
                     let sz = size as usize;
+
+                    // Workaround for players probing for ID3v1 at EOF on deflated inner files.
+                    // When enabled per-channel, return 4096 zero bytes for small probe reads
+                    // near the end of short reads to avoid players attempting to parse
+                    // ID3v1 tags which require seeking/completing the entire inflated stream.
+                    const MAX_TOTAL_READ: usize = 128 * 1024;
+                    const DISTANCE_TO_FILE_END: usize = 16 * 1024;
+                    const ID3V1_READ_SIZE: usize = 4096;
+
+                    let channel_skip = self.state.channels.get(channel).map(|a| a.skip_deflated_id3v1).unwrap_or(false);
+                    if channel_skip {
+                        let path_lower = ae.path.to_lowercase();
+                        let looks_like_audio = path_lower.ends_with(".mp3") || path_lower.ends_with(".flac");
+                        let stream_pos_so_far = self.deflate_streams.get(&fh).map(|s| s.pos).unwrap_or(0usize);
+                        if looks_like_audio && sz == ID3V1_READ_SIZE && stream_pos_so_far < MAX_TOTAL_READ && ae.uncompressed_size.saturating_sub(off) < DISTANCE_TO_FILE_END {
+                            println!("fuse: suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae.path, fh, off, stream_pos_so_far);
+                            let zeros = vec![0u8; sz];
+                            reply.data(&zeros);
+                            return;
+                        }
+                    }
 
                     // Initialize the streaming decoder on the first read for this fh.
                     // TelegramReader fetches compressed data in small chunks on demand;

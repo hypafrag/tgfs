@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
-use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts};
+use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, TelegramChannel};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
 
@@ -43,9 +43,8 @@ fn classify_file_type(type_override: &Option<FileType>, mime_type: &str, doc_nam
 }
 
 pub struct IndexBuildResult {
-    pub index: HashMap<String, Vec<FileEntry>>,
     pub mime_vec: Vec<String>,
-    pub channel_view_map: HashMap<String, ArchiveView>,
+    pub channels: HashMap<String, TelegramChannel>,
     pub dir_to_channel: HashMap<String, String>,
 }
 
@@ -302,12 +301,11 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         }
     }
 
-    let mut index: HashMap<String, Vec<FileEntry>> = HashMap::new();
     // MIME interning structures
     let mut mime_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut mime_vec: Vec<String> = Vec::new();
-    // build channel -> archive_view map
-    let channel_view_map: HashMap<String, ArchiveView> = config.channels.iter().map(|c| (c.name.clone(), c.archive_view)).collect();
+    // build channel -> TelegramChannel map (files populated later)
+    let mut index: HashMap<String, TelegramChannel> = HashMap::new();
     let dir_to_channel: HashMap<String, String> = config.channels.iter().map(|c| {
         let dir = c.directory.clone().unwrap_or_else(|| c.name.clone());
         (dir, c.name.clone())
@@ -439,7 +437,9 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         // sort files by exposed name
         new_files.sort_by_key(|f| f.name.to_lowercase());
         println!(" {} files (post-group)", new_files.len());
-        index.insert(name.clone(), new_files);
+        // create TelegramChannel and insert
+        let tchan = TelegramChannel { archive_view: entry.archive_view, skip_deflated_id3v1: entry.skip_deflated_id3v1, files: new_files };
+        index.insert(name.clone(), tchan);
     }
 
     // Persist the zip index cache once after the full index is built.
@@ -447,5 +447,5 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         eprintln!("failed to save zip cache: {}", e);
     }
 
-    Ok(IndexBuildResult { index, mime_vec, channel_view_map, dir_to_channel })
+    Ok(IndexBuildResult { mime_vec, channels: index, dir_to_channel })
 }

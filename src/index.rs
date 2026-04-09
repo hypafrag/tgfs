@@ -14,6 +14,8 @@ pub struct ChannelEntry {
     pub directory: Option<String>,
     #[serde(default = "default_archive_view")]
     pub archive_view: ArchiveView,
+    #[serde(default)]
+    pub skip_deflated_id3v1: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
@@ -97,6 +99,8 @@ impl<'de> serde::Deserialize<'de> for ArchiveFileEntry {
         Ok(ArchiveFileEntry { path: v.path, compressed_size: v.compressed_size, uncompressed_size: v.uncompressed_size, data_offset: v.data_offset, compression_method: v.compression_method, unix_mode: v.unix_mode })
     }
 }
+
+#[derive(Clone)]
 pub struct FileEntry {
     pub name: String,
     // Optional directory path (relative virtual path) where the file is served.
@@ -137,14 +141,20 @@ impl FileEntry {
 
 pub struct AppState {
     pub client: Client,
-    pub index: HashMap<String, Vec<FileEntry>>,
     // Deduplicated pool of MIME type strings shared across entries.
     pub mime_pool: Vec<String>,
-    // Channel-level archive view settings (from `tgfs.yml`).
-    pub channel_archive_view: HashMap<String, ArchiveView>,
+    // Channel-level runtime attributes populated from config channels.
+    pub channels: HashMap<String, TelegramChannel>,
     // Maps directory name (used in URLs / FUSE paths) → channel name (index key).
     // When no `directory:` override is set, dir name == channel name.
     pub dir_to_channel: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct TelegramChannel {
+    pub archive_view: ArchiveView,
+    pub skip_deflated_id3v1: bool,
+    pub files: Vec<FileEntry>,
 }
 
 pub fn human_size(bytes: usize) -> String {
