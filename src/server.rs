@@ -249,19 +249,19 @@ fn entries_for_root(files: &[FileEntry], channel: &str, archive_view: crate::ind
     let ch = urlencoding::encode(channel);
     let mut entries: Vec<Entry> = Vec::new();
     for d in dirs.iter() {
-        entries.push(Entry { href: format!("/{}/{}/", ch, encode_segments(d)), label: format!("{}/", d), size: None });
+        entries.push(Entry { href: format!("/{}/{}/", ch, encode_segments(d)), label: format!("{}/", d), size: None, modified: None });
     }
     for f in top_files.iter() {
         let full = full_for(f);
         if f.file_type == FileType::Zip && f.archive_entries.is_some() {
             let stem_full = stem_full_for(f);
             let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name).to_string();
-            entries.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
+            entries.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None, modified: None });
             if archive_view == crate::index::ArchiveView::FileAndDirectory {
-                entries.push(Entry { href: format!("/{}/{}", ch, encode_segments(&full)), label: f.name.clone(), size: f.size });
+                entries.push(Entry { href: format!("/{}/{}", ch, encode_segments(&full)), label: f.name.clone(), size: f.size, modified: f.mtime });
             }
         } else {
-            entries.push(Entry { href: format!("/{}/{}", ch, encode_segments(&full)), label: f.name.clone(), size: f.size });
+            entries.push(Entry { href: format!("/{}/{}", ch, encode_segments(&full)), label: f.name.clone(), size: f.size, modified: f.mtime });
         }
     }
     entries.sort_by_key(|e| e.label.to_lowercase());
@@ -284,10 +284,10 @@ fn entries_for_archive_listing(archive_entry: &FileEntry, channel: &str, trimmed
         let is_dir = seg_iter.next().is_some();
         if !seen.insert((name.to_string(), is_dir)) { continue; }
         if is_dir {
-            listing.push(Entry { href: format!("{}/{}/", base_path, encode_segments(name)), label: format!("{}/", name), size: None });
+            listing.push(Entry { href: format!("{}/{}/", base_path, encode_segments(name)), label: format!("{}/", name), size: None, modified: None });
         } else {
             let ae_size = archive_entries.iter().find(|x| x.path == format!("{}{}", prefix, name)).map(|x| x.uncompressed_size);
-            listing.push(Entry { href: format!("{}/{}", base_path, encode_segments(name)), label: name.to_string(), size: ae_size });
+            listing.push(Entry { href: format!("{}/{}", base_path, encode_segments(name)), label: name.to_string(), size: ae_size, modified: None });
         }
     }
     listing.sort_by_key(|e| e.label.to_lowercase());
@@ -311,7 +311,7 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, ar
         if !seen.insert((name.to_string(), is_dir)) { continue; }
         let combined = format!("{}/{}", trimmed, name);
         if is_dir {
-            listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&combined)), label: format!("{}/", name), size: None });
+            listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&combined)), label: format!("{}/", name), size: None, modified: None });
         } else {
             // Single lookup of the matching file entry; reused for both the
             // browsable-zip-as-directory branch and the plain-file branch.
@@ -321,15 +321,16 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, ar
                     // Expose the archive stem as a directory listing.
                     let stem = std::path::Path::new(&e.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name).to_string();
                     let stem_full = format!("{}/{}", trimmed, stem);
-                    listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
+                    listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None, modified: None });
                     if archive_view == crate::index::ArchiveView::FileAndDirectory {
-                        listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size: e.size });
+                        listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size: e.size, modified: e.mtime });
                     }
                     continue;
                 }
             }
             let size = entry.and_then(|x| x.size);
-            listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size });
+            let modified = entry.and_then(|x| x.mtime);
+            listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size, modified });
         }
     }
     listing.sort_by_key(|e| e.label.to_lowercase());
@@ -345,6 +346,7 @@ pub async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
             href: format!("{}/", urlencoding::encode(d)),
             label: format!("{}/", d),
             size: None,
+            modified: None,
         })
         .collect();
     Html(dir_listing("Index of /", None, &entries))
