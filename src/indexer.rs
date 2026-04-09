@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
 use grammers_client::media::{Document, Media};
@@ -8,6 +7,7 @@ use grammers_client::Client;
 use grammers_client::InvocationError;
 use grammers_client::tl;
 use grammers_session::types::PeerRef;
+use log::{debug, error, info, warn};
 use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, MsgIds, TelegramChannel};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
@@ -180,25 +180,24 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
     let name_key = if let Some((base, _)) = split_part_suffix(&raw_name) { base.to_string() } else { raw_name.clone() };
     let key = ZipCacheKey { name: name_key.clone(), size: total };
     if let Some(cached) = cache.get(&key) {
-        println!("  zip index cache hit for {} ({} bytes)", key.name, key.size);
+        debug!("zip index cache hit for {} ({} bytes)", key.name, key.size);
         return Some(cached);
     }
     // Wrap once so we can reuse the unified `download_range` instead of
     // maintaining a near-duplicate `Document`-only variant.
     let media_parts: Vec<Media> = docs.iter().cloned().map(Media::Document).collect();
-    println!("  fetching EOCD tail of '{}' for indexing", label);
-    io::stdout().flush().ok();
+    debug!("fetching EOCD tail of '{}' for indexing", label);
     let tail_len = std::cmp::min(total, 70_000);
     let tail_offset = total.saturating_sub(tail_len);
     let tail = download_range(client, &media_parts, tail_offset, tail_len).await.ok()?;
     let (cd_off, cd_size) = match find_eocd(&tail, tail_offset as u64) {
         Some(v) => v,
         None => {
-            println!("  EOCD not found for '{}', skipping archive index", label);
+            warn!("EOCD not found for '{}', skipping archive index", label);
             return None;
         }
     };
-    println!("    central directory at {} ({} bytes)", cd_off, cd_size);
+    debug!("central directory at {} ({} bytes)", cd_off, cd_size);
     let cd_bytes = download_range(client, &media_parts, cd_off as usize, cd_size as usize).await.ok()?;
     let (mut ae_list, lh_offsets) = parse_central_directory(&cd_bytes).ok()?;
     // Fetch each local file header to resolve the true data offset.
@@ -211,7 +210,7 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
         let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
         ae.data_offset = lh_offset + 30 + name_len as u64 + extra_len as u64;
     }
-    println!("  zip entries read: {}", ae_list.len());
+    debug!("zip entries read: {}", ae_list.len());
     cache.insert(ZipCacheKey { name: name_key, size: total }, ae_list.clone());
     Some(ae_list)
 }
@@ -351,7 +350,7 @@ pub async fn download_range_refresh(
             if msg_ids.len() != parts.len() || msg_ids.is_empty() {
                 return Err(e);
             }
-            eprintln!(
+            warn!(
                 "download_range: FILE_REFERENCE_EXPIRED, refreshing {} part(s)",
                 msg_ids.len()
             );
@@ -413,7 +412,7 @@ async fn download_part_range(
                             if retries > 5 {
                                 return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("FLOOD_WAIT retry limit exceeded"));
                             }
-                            eprintln!("indexer: FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
+                            warn!("FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
                             tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
                         }
                         Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
@@ -608,10 +607,10 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         let name = &entry.name;
         let peer_ref = match channel_peers.get(name) {
             Some(r) => r.clone(),
-            None => { eprintln!("Channel '{name}' not found, skipping."); continue; }
+            None => { warn!("Channel '{name}' not found, skipping."); continue; }
         };
 
-        println!("Indexing {name}...");
+        info!("Indexing {name}...");
         let mut files = Vec::new();
         let mut messages = client.iter_messages(peer_ref);
         let mut processed_msgs: usize = 0;
@@ -627,8 +626,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     if file_name.trim().is_empty() || file_name == "<unnamed>" {
                         continue;
                     }
-                    println!("Processing file: {}", file_name);
-                    io::stdout().flush().ok();
+                    debug!("Processing file: {}", file_name);
                     let size = doc.size();
                     let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
                     // Determine the final `file_type` for this entry. Preference order:
@@ -658,8 +656,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     if file_name.trim().is_empty() || file_name == "<unnamed>" {
                         continue;
                     }
-                    println!("Processing photo: {}", file_name);
-                    io::stdout().flush().ok();
+                    debug!("Processing photo: {}", file_name);
                     let size = Some(photo_largest_size(&photo));
                     let mime_type = "image/jpeg".to_string();
                     let final_type = classify_file_type(&type_override, &mime_type, &file_name);
@@ -670,8 +667,8 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 _ => {}
             }
         }
-        println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
-        println!(" {} files (pre-group)", files.len());
+        info!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
+        debug!("{} files (pre-group)", files.len());
 
         // Detect multipart files by inspecting the document filename (not message overrides).
         // Pattern: <base>.<N digits> e.g. foo.00, foo.01, ... Numbering must start at 0
@@ -726,7 +723,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 // try_index_zip expects Documents; only attempt if all parts are Documents
                 let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
                 if doc_vec.len() == docs.len() {
-                    println!("Processing multipart archive: {}", exposed_name);
+                    debug!("Processing multipart archive: {}", exposed_name);
                     archive_entries_combined = try_index_zip(&client, &doc_vec, &exposed_name, &mut zip_cache).await;
                 }
             }
@@ -767,7 +764,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
 
         // sort files by exposed name
         new_files.sort_by_key(|f| f.name.to_lowercase());
-        println!(" {} files (post-group)", new_files.len());
+        info!("{} files (post-group)", new_files.len());
         // collapse files sharing a common name prefix into virtual subdirectories
         if let Some(min_len) = entry.collapse_by_prefix {
             apply_prefix_collapse(&mut new_files, min_len);
@@ -793,13 +790,13 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 index.insert(saved_dir.clone(), channel);
                 dir_to_channel.insert(saved_dir.clone(), saved_dir.clone());
             }
-            Err(e) => eprintln!("failed to index saved messages: {}", e),
+            Err(e) => error!("failed to index saved messages: {}", e),
         }
     }
 
     // Persist the zip index cache once after the full index is built.
     if let Err(e) = zip_cache.save() {
-        eprintln!("failed to save zip cache: {}", e);
+        error!("failed to save zip cache: {}", e);
     }
 
     Ok(IndexBuildResult { mime_vec, channels: index, dir_to_channel })
@@ -892,7 +889,7 @@ async fn index_saved_messages(
     zip_cache: &mut ZipCache,
     archive_view: crate::index::ArchiveView,
 ) -> anyhow::Result<TelegramChannel> {
-    println!("Indexing Saved Messages...");
+    info!("Indexing Saved Messages...");
 
     // Resolve self peer for `iter_messages`. `Saved Messages` is the cloud
     // chat with yourself; its peer is just your own User.
@@ -919,7 +916,7 @@ async fn index_saved_messages(
             }
         }
     }
-    println!("  saved reaction tags: {}", tag_titles.len());
+    debug!("saved reaction tags: {}", tag_titles.len());
 
     // Stream messages once, building compact per-message records and
     // accumulating per-album tag unions on the fly. We never need to keep
@@ -1036,7 +1033,7 @@ async fn index_saved_messages(
             }
         }
     }
-    println!(
+    info!(
         "Saved Messages indexed: {} entries from {} messages",
         files.len(),
         processed
@@ -1094,7 +1091,7 @@ async fn index_saved_messages(
                 .filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None })
                 .collect();
             if doc_vec.len() == docs.len() {
-                println!("Processing saved-message multipart archive: {}", exposed_name);
+                debug!("Processing saved-message multipart archive: {}", exposed_name);
                 archive_entries_combined = try_index_zip(client, &doc_vec, &exposed_name, zip_cache).await;
             }
         }

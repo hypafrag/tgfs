@@ -10,9 +10,32 @@ use std::sync::Arc;
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
+use log::{error, info, warn};
 use rpassword;
 
 use index::AppState;
+
+/// Initialize the global logger.
+///
+/// Levels are color-coded (env_logger default palette: ERROR red, WARN yellow,
+/// INFO green, DEBUG blue, TRACE cyan). Default filter is `info`; override
+/// with the `RUST_LOG` env var (e.g. `RUST_LOG=tgfs=debug`).
+fn init_logger() {
+    use std::io::Write as _;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let ts = buf.timestamp_millis();
+            let level_style = buf.default_level_style(record.level());
+            writeln!(
+                buf,
+                "{ts} {level_style}{:5}{level_style:#} {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
+}
 
 const SESSION_FILE: &str = "session.sqlite3";
 const DEFAULT_CONFIG_FILE: &str = "tgfs.yml";
@@ -23,7 +46,7 @@ fn parse_config_path() -> String {
     while let Some(arg) = args.next() {
         if arg == "--config" {
             return args.next().unwrap_or_else(|| {
-                eprintln!("--config requires a path argument");
+                error!("--config requires a path argument");
                 std::process::exit(2);
             });
         }
@@ -55,6 +78,7 @@ fn build_proxy_url(config: &index::Config) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logger();
     let config_path = parse_config_path();
     let config = index::load_config(&config_path)?;
     if config.http_port.is_none() && config.mount_at.is_none() {
@@ -63,16 +87,16 @@ async fn main() -> anyhow::Result<()> {
 
     let proxy_url = build_proxy_url(&config);
     if let Some(ref url) = proxy_url {
-        println!("Using proxy: {}", url);
+        info!("Using proxy: {}", url);
     }
     let mut client = make_client(config.api_id, proxy_url.clone()).await?;
 
     if !client.is_authorized().await? {
-        println!("Sending sign-in code to {}...", config.phone);
+        info!("Sending sign-in code to {}...", config.phone);
         let token = match client.request_login_code(&config.phone, &config.api_hash).await {
             Ok(t) => t,
             Err(InvocationError::Rpc(e)) if e.is("AUTH_RESTART") => {
-                eprintln!("Session invalidated by Telegram, resetting...");
+                warn!("Session invalidated by Telegram, resetting...");
                 std::fs::remove_file(SESSION_FILE).ok();
                 client = make_client(config.api_id, proxy_url).await?;
                 client.request_login_code(&config.phone, &config.api_hash).await?
@@ -89,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
                 match client.check_password(password_token, password.trim()).await {
                     Ok(_) => break,
                     Err(SignInError::InvalidPassword(new_token)) => {
-                        eprintln!("Wrong password, try again.");
+                        warn!("Wrong password, try again.");
                         password_token = new_token;
                     }
                     Err(e) => return Err(e.into()),
@@ -97,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
             },
             Err(e) => return Err(e.into()),
         }
-        println!("Signed in successfully.");
+        info!("Signed in successfully.");
     }
 
     let indexer::IndexBuildResult { mime_vec: mime_pool, channels, dir_to_channel } =
@@ -113,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Optionally mount FUSE filesystem in a blocking task.
     let fuse_handle = config.mount_at.as_ref().map(|mountpoint| {
-        println!("Mounting FUSE filesystem at {mountpoint}");
+        info!("Mounting FUSE filesystem at {mountpoint}");
         let fs = fuse::TgfsFS::new(Arc::clone(&state));
         let mp = mountpoint.clone();
         tokio::task::spawn_blocking(move || {
@@ -132,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
     let http_handle = if let Some(port) = config.http_port {
         let app = server::make_router(state);
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        println!("Serving on http://{addr}");
+        info!("Serving on http://{addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
         Some(tokio::spawn(async move {
             axum::serve(listener, app).await.expect("HTTP server failed");
@@ -152,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = sigterm.recv() => {}
                 _ = sigint.recv()  => {}
             }
-            println!("Shutting down, unmounting {mp}...");
+            info!("Shutting down, unmounting {mp}...");
             std::process::Command::new("fusermount").args(["-u", &mp]).status().ok();
             std::process::exit(0);
         });

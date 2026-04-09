@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
 use grammers_client::media::Media;
 use grammers_session::types::PeerRef;
+use log::{debug, error, trace, warn};
 use tokio::runtime::Handle;
 
 use crate::index::{AppState, ArchiveView, FileEntry, FileType};
@@ -151,22 +152,22 @@ impl std::io::Read for PrefetchingReader {
             if self.eof { return Ok(0); }
             match self.rx.blocking_recv() {
                 Some(Ok(chunk)) if chunk.is_empty() => {
-                    eprintln!("fuse: PrefetchingReader EOF (empty sentinel)");
+                    trace!("PrefetchingReader EOF (empty sentinel)");
                     self.eof = true;
                     return Ok(0);
                 }
                 Some(Ok(chunk)) => {
-                    eprintln!("fuse: PrefetchingReader got chunk {} bytes", chunk.len());
+                    trace!("PrefetchingReader got chunk {} bytes", chunk.len());
                     self.buf = chunk;
                     self.buf_pos = 0;
                 }
                 Some(Err(e)) => {
-                    eprintln!("fuse: PrefetchingReader error: {:?}", e);
+                    error!("PrefetchingReader error: {:?}", e);
                     self.eof = true;
                     return Err(e);
                 }
                 None => {
-                    eprintln!("fuse: PrefetchingReader channel closed");
+                    trace!("PrefetchingReader channel closed");
                     self.eof = true;
                     return Ok(0);
                 }
@@ -193,36 +194,36 @@ fn spawn_prefetcher(
     compressed_size: usize,
 ) -> PrefetchingReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(DEFLATE_PREFETCH_DEPTH);
-    eprintln!("fuse: spawn_prefetcher data_offset={} compressed_size={}", data_offset, compressed_size);
+    debug!("spawn_prefetcher data_offset={} compressed_size={}", data_offset, compressed_size);
     rt.spawn(async move {
         let client = state.client.clone();
         let mut consumed: usize = 0;
         while consumed < compressed_size {
             let want = (compressed_size - consumed).min(DEFLATE_FETCH_CHUNK);
             let abs = data_offset + consumed;
-            eprintln!("fuse: prefetcher fetch abs={} want={} consumed={}/{}", abs, want, consumed, compressed_size);
+            trace!("prefetcher fetch abs={} want={} consumed={}/{}", abs, want, consumed, compressed_size);
             let res = download_range_refresh(&client, &parts, &msg_ids, peer, &state.fresh_docs, abs, want).await;
             match res {
                 Ok(chunk) => {
                     if chunk.is_empty() {
-                        eprintln!("fuse: prefetcher got empty chunk at consumed={}", consumed);
+                        warn!("prefetcher got empty chunk at consumed={}", consumed);
                         break;
                     }
-                    eprintln!("fuse: prefetcher got {} bytes", chunk.len());
+                    trace!("prefetcher got {} bytes", chunk.len());
                     consumed += chunk.len();
                     if tx.send(Ok(chunk)).await.is_err() {
-                        eprintln!("fuse: prefetcher receiver dropped, exiting");
+                        debug!("prefetcher receiver dropped, exiting");
                         return;
                     }
                 }
                 Err(e) => {
-                    eprintln!("fuse: prefetcher download error: {:?}", e);
+                    error!("prefetcher download error: {:?}", e);
                     let _ = tx.send(Err(std::io::Error::other("download failed"))).await;
                     return;
                 }
             }
         }
-        eprintln!("fuse: prefetcher done, consumed={}/{}", consumed, compressed_size);
+        debug!("prefetcher done, consumed={}/{}", consumed, compressed_size);
         // Send a final empty chunk to signal clean EOF (channel close also works).
         let _ = tx.send(Ok(Vec::new())).await;
     });
@@ -234,6 +235,26 @@ struct DeflateStream {
     decoder: DeflateDecoder<PrefetchingReader>,
     /// Byte position in the decompressed output the decoder is currently at.
     pos: usize,
+}
+
+/// Try to acquire a permit immediately; if none is available, log that the
+/// caller is being throttled by the per-PID fetch limit and await one.
+async fn acquire_owned_with_throttle_log(
+    sem: Arc<tokio::sync::Semaphore>,
+    pid: u32,
+    fh: u64,
+    site: &str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    match sem.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            debug!(
+                "throttled by max_fetches_per_pid pid={} fh={} site={} available={} waiting...",
+                pid, fh, site, sem.available_permits()
+            );
+            sem.acquire_owned().await.expect("semaphore closed")
+        }
+    }
 }
 
 pub struct TgfsFS {
@@ -418,7 +439,7 @@ impl Filesystem for TgfsFS {
             let fh = self.next_fh;
             self.next_fh += 1;
             let path = self.path_for_ino(ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
-            println!("fuse: open ino={} path='{}' fh={}", ino, path, fh);
+            debug!("open ino={} path='{}' fh={}", ino, path, fh);
             reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
         } else {
             reply.error(libc::EISDIR);
@@ -429,11 +450,12 @@ impl Filesystem for TgfsFS {
         let had = self.deflate_streams.remove(&fh).is_some();
         // Try to resolve path for logging; not strictly required.
         let path = self.path_for_ino(_ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
-        println!("fuse: release fh={} ino={} path='{}' had_deflate_stream={}", fh, _ino, path, had);
+        debug!("release fh={} ino={} path='{}' had_deflate_stream={}", fh, _ino, path, had);
         reply.ok();
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+        debug!("read enter ino={} fh={} offset={} size={} pid={}", ino, fh, offset, size, _req.pid());
         let pid_sem = self.pid_semaphore(_req.pid());
         // Clone Arc so borrows for `files`/`ae` come from a local — leaving
         // `self` free to mutate `deflate_streams` below without borrow conflict.
@@ -466,14 +488,23 @@ impl Filesystem for TgfsFS {
             let client = state.client.clone();
             let state_for_fetch = state.clone();
             let sem = pid_sem.clone();
+            let pid = _req.pid();
+            debug!("read direct ino={} fh={} parts={} offset={} size={}", ino, fh, parts_docs.len(), offset, size);
             self.rt.spawn(async move {
-                let _permit = match &sem {
-                    Some(s) => Some(s.acquire().await.expect("semaphore closed")),
+                let _permit = match sem {
+                    Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh, "direct").await),
                     None => None,
                 };
+                trace!("read direct fh={} download_range_refresh start", fh);
                 match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, offset as usize, size as usize).await {
-                    Ok(buf) => reply.data(&buf),
-                    Err(_) => reply.error(libc::EIO),
+                    Ok(buf) => {
+                        debug!("read direct fh={} got {} bytes", fh, buf.len());
+                        reply.data(&buf);
+                    }
+                    Err(e) => {
+                        error!("read direct fh={} download error: {:?}", fh, e);
+                        reply.error(libc::EIO);
+                    }
                 }
             });
             return;
@@ -505,7 +536,7 @@ impl Filesystem for TgfsFS {
                 Some(a) => a,
                 None => { reply.error(libc::ENOENT); return; }
             };
-            eprintln!("fuse: read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
+            debug!("read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
                 path, inner, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
             let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
             let msg_ids: Vec<i32> = f.msg_ids.iter().copied().collect();
@@ -514,18 +545,19 @@ impl Filesystem for TgfsFS {
             match ae.compression_method {
                 0 => {
                     let off = data_offset + offset as usize;
-                    eprintln!("fuse: stored entry read off={} size={}", off, size);
+                    trace!("stored entry read off={} size={}", off, size);
                     let client = state.client.clone();
                     let state_for_fetch = state.clone();
                     let sem = pid_sem.clone();
+                    let pid = _req.pid();
                     self.rt.spawn(async move {
-                        let _permit = match &sem {
-                            Some(s) => Some(s.acquire().await.expect("semaphore closed")),
+                        let _permit = match sem {
+                            Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh, "stored").await),
                             None => None,
                         };
                         match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, off, size as usize).await {
-                            Ok(buf) => { eprintln!("fuse: stored entry got {} bytes", buf.len()); reply.data(&buf); }
-                            Err(e) => { eprintln!("fuse: stored entry download error: {:?}", e); reply.error(libc::EIO); }
+                            Ok(buf) => { trace!("stored entry got {} bytes", buf.len()); reply.data(&buf); }
+                            Err(e) => { error!("stored entry download error: {:?}", e); reply.error(libc::EIO); }
                         }
                     });
                     return;
@@ -555,11 +587,12 @@ impl Filesystem for TgfsFS {
 
                     let sem = pid_sem.clone();
                     let rt_for_sem = self.rt.clone();
+                    let pid = _req.pid();
                     self.rt.spawn_blocking(move || {
                         // Acquire per-PID fetch permit (blocks until a slot is free).
-                        let _permit = sem.map(|s| rt_for_sem.block_on(s.acquire_owned()).expect("semaphore closed"));
+                        let _permit = sem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh, "deflate")));
                         let mut stream = stream.lock().unwrap();
-                        eprintln!("fuse: deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
+                        trace!("deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
                             fh, off, sz, stream.pos, uncompressed_size, compressed_size);
 
                         // Workaround for players probing for ID3v1 at EOF on deflated inner files.
@@ -573,7 +606,7 @@ impl Filesystem for TgfsFS {
                             let path_lower = ae_path.to_lowercase();
                             let looks_like_audio = path_lower.ends_with(".mp3") || path_lower.ends_with(".flac");
                             if looks_like_audio && sz == ID3V1_READ_SIZE && stream.pos < MAX_TOTAL_READ && uncompressed_size.saturating_sub(off) < DISTANCE_TO_FILE_END {
-                                println!("fuse: suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae_path, fh, off, stream.pos);
+                                debug!("suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae_path, fh, off, stream.pos);
                                 let zeros = vec![0u8; sz];
                                 reply.data(&zeros);
                                 return;
@@ -583,7 +616,7 @@ impl Filesystem for TgfsFS {
                         // Skip forward if the kernel jumped ahead (shouldn't happen in
                         // normal sequential reads; caller should use STORE for random access).
                         if off > stream.pos {
-                            eprintln!("fuse: deflate skip forward from {} to {} (skip {})", stream.pos, off, off - stream.pos);
+                            debug!("deflate skip forward from {} to {} (skip {})", stream.pos, off, off - stream.pos);
                             use std::io::Read as _;
                             let mut remaining = off - stream.pos;
                             let mut discard = vec![0u8; remaining.min(65536)];
@@ -597,7 +630,7 @@ impl Filesystem for TgfsFS {
                             }
                         } else if off < stream.pos {
                             // Backward seek: impossible to handle without rewinding.
-                            eprintln!("fuse: deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
+                            error!("deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
                             reply.error(libc::EIO);
                             return;
                         }
@@ -607,13 +640,13 @@ impl Filesystem for TgfsFS {
                         let mut total = 0;
                         while total < sz {
                             match stream.decoder.read(&mut buf[total..]) {
-                                Ok(0) => { eprintln!("fuse: deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
+                                Ok(0) => { trace!("deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
                                 Ok(n) => total += n,
-                                Err(e) => { eprintln!("fuse: deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(libc::EIO); return; }
+                                Err(e) => { error!("deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(libc::EIO); return; }
                             }
                         }
                         stream.pos += total;
-                        eprintln!("fuse: deflate read done fh={} produced={} new_pos={}", fh, total, stream.pos);
+                        trace!("deflate read done fh={} produced={} new_pos={}", fh, total, stream.pos);
                         reply.data(&buf[..total]);
                     });
                     return;

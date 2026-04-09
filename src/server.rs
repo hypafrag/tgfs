@@ -17,6 +17,7 @@ use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
 use crate::indexer::refresh_part_documents;
 use grammers_client::media::{Document, Media};
 use grammers_session::types::PeerRef;
+use log::warn;
 use tokio_stream::Stream;
 
 fn normalize_path(p: &std::path::Path) -> String {
@@ -110,7 +111,7 @@ async fn refresh_for_stream(ctx: &StreamCtx, idx: usize) -> anyhow::Result<Docum
     if ctx.msg_ids.len() != ctx.parts.len() || ctx.msg_ids.is_empty() {
         anyhow::bail!("msg_ids/parts misalignment, cannot refresh");
     }
-    eprintln!("server: FILE_REFERENCE_EXPIRED, refreshing {} part(s)", ctx.msg_ids.len());
+    warn!("FILE_REFERENCE_EXPIRED, refreshing {} part(s)", ctx.msg_ids.len());
     let docs = refresh_part_documents(&ctx.state.client, peer, &ctx.msg_ids).await?;
     {
         let mut cache = ctx.state.fresh_docs.lock().unwrap();
