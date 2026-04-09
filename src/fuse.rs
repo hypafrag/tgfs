@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
 use grammers_client::Client;
-use grammers_client::media::Document;
+use grammers_client::media::Media;
 use tokio::runtime::Handle;
 
 use crate::index::{AppState, ArchiveView, FileEntry, FileType};
@@ -131,7 +131,7 @@ const DEFLATE_FETCH_READAHEAD: usize = 512 * 1024;
 /// in memory — not the full compressed payload.
 struct TelegramReader {
     client: Client,
-    parts: Vec<Document>,
+    parts: Vec<Media>,
     /// Absolute byte offset in the Telegram file where compressed data begins.
     data_offset: usize,
     compressed_size: usize,
@@ -390,7 +390,7 @@ impl Filesystem for TgfsFS {
         // return from `read()` immediately so the FUSE event loop is free to
         // service other requests while the download is in flight.
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
-            let parts_docs: Vec<Document> = fentry.parts.iter().cloned().collect();
+            let parts_docs: Vec<Media> = fentry.parts.iter().cloned().collect();
             let client = state.client.clone();
             self.rt.spawn(async move {
                 match download_range(&client, &parts_docs, offset as usize, size as usize).await {
@@ -420,7 +420,7 @@ impl Filesystem for TgfsFS {
                 Some(a) => a,
                 None => { reply.error(libc::ENOENT); return; }
             };
-            let parts_docs: Vec<Document> = f.parts.iter().cloned().collect();
+            let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
             let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {

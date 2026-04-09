@@ -32,6 +32,81 @@ fn split_name(raw: &str) -> (String, Option<std::path::PathBuf>) {
     }
 }
 
+// Document-only downloader adapter. Some internal code (ZIP central-directory
+// parsing and local-header reads) works with `Document` slices and expects
+// a downloader that accepts `&[Document]`. Provide a thin copy of the
+// media-aware `download_range` that operates on `Document` specifically so
+// callers don't need to convert types.
+pub async fn download_range_docs(
+    client: &Client,
+    parts: &[Document],
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
+    let total: usize = sizes.iter().sum();
+    if offset >= total { return Ok(Vec::new()); }
+    let to_read = std::cmp::min(length, total - offset);
+
+    // locate starting part and in-part offset
+    let mut pos = 0usize;
+    let mut i = 0usize;
+    while i < sizes.len() && pos + sizes[i] <= offset { pos += sizes[i]; i += 1; }
+    let mut start_in_part = offset - pos;
+
+    let chunk_size: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(to_read);
+    let mut need = to_read;
+    while i < parts.len() && need > 0 {
+        let avail = sizes[i].saturating_sub(start_in_part);
+        if avail == 0 { i += 1; start_in_part = 0; continue; }
+        let read_len = std::cmp::min(avail, need);
+        let first_chunk = (start_in_part / chunk_size) as i32;
+        let offset_in_first = start_in_part % chunk_size;
+        let mut dl = client
+            .iter_download(&parts[i])
+            .chunk_size(chunk_size as i32)
+            .skip_chunks(first_chunk);
+        let mut part_buf: Vec<u8> = Vec::with_capacity(offset_in_first + read_len);
+        while let Ok(Some(chunk)) = dl.next().await {
+            part_buf.extend_from_slice(&chunk);
+            if part_buf.len() >= offset_in_first + read_len { break; }
+        }
+        if part_buf.len() <= offset_in_first {
+            return Err(anyhow::anyhow!("failed to download requested range"));
+        }
+        let end = std::cmp::min(part_buf.len(), offset_in_first + read_len);
+        buf.extend_from_slice(&part_buf[offset_in_first..end]);
+        need = need.saturating_sub(end - offset_in_first);
+        i += 1;
+        start_in_part = 0;
+    }
+
+    Ok(buf)
+}
+
+pub fn photo_largest_size(p: &grammers_client::media::Photo) -> usize {
+    // `p.raw.photo` is an Option<tl::enums::Photo>. Drill down to the actual
+    // TL Photo (`tl::enums::Photo::Photo`) and inspect its `sizes` Vector.
+    if let Some(inner_photo_enum) = &p.raw.photo {
+        if let tl::enums::Photo::Photo(inner_photo) = inner_photo_enum {
+            let mut best: usize = 0;
+            for sz in inner_photo.sizes.iter() {
+                match sz {
+                    tl::enums::PhotoSize::Size(s) => best = best.max(s.size as usize),
+                    tl::enums::PhotoSize::PhotoCachedSize(s) => best = best.max(s.bytes.len()),
+                    tl::enums::PhotoSize::PhotoPathSize(s) => best = best.max(s.bytes.len()),
+                    tl::enums::PhotoSize::PhotoStrippedSize(s) => best = best.max(s.bytes.len()),
+                    tl::enums::PhotoSize::Empty(_) => {}
+                    tl::enums::PhotoSize::Progressive(p) => best = best.max(p.sizes.iter().max().cloned().unwrap_or(0) as usize),
+                }
+            }
+            return best;
+        }
+    }
+    0
+}
+
 fn classify_file_type(type_override: &Option<FileType>, mime_type: &str, doc_name: &str) -> FileType {
     if let Some(t) = type_override { return t.clone(); }
     if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
@@ -67,7 +142,7 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
     io::stdout().flush().ok();
     let tail_len = std::cmp::min(total, 70_000);
     let tail_offset = total.saturating_sub(tail_len);
-    let tail = download_range(client, docs, tail_offset, tail_len).await.ok()?;
+    let tail = download_range_docs(client, docs, tail_offset, tail_len).await.ok()?;
     let (cd_off, cd_size) = match find_eocd(&tail, tail_offset as u64) {
         Some(v) => v,
         None => {
@@ -76,13 +151,13 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
         }
     };
     println!("    central directory at {} ({} bytes)", cd_off, cd_size);
-    let cd_bytes = download_range(client, docs, cd_off as usize, cd_size as usize).await.ok()?;
+    let cd_bytes = download_range_docs(client, docs, cd_off as usize, cd_size as usize).await.ok()?;
     let (mut ae_list, lh_offsets) = parse_central_directory(&cd_bytes).ok()?;
     // Fetch each local file header to resolve the true data offset.
     // The local extra field length can differ from the central directory,
     // so we must read it — but only once per entry, here at index time.
     for (ae, lh_offset) in ae_list.iter_mut().zip(lh_offsets.iter()) {
-        let lh = download_range(client, docs, *lh_offset as usize, 30).await.ok()?;
+        let lh = download_range_docs(client, docs, *lh_offset as usize, 30).await.ok()?;
         if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { return None; }
         let name_len = u16::from_le_bytes([lh[26], lh[27]]) as usize;
         let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as usize;
@@ -99,11 +174,18 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
 // and the server (archive inner-file header reads).
 pub async fn download_range(
     client: &Client,
-    parts: &[Document],
+    parts: &[Media],
     offset: usize,
     length: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
+    let sizes: Vec<usize> = parts
+        .iter()
+        .map(|m| match m {
+            Media::Document(d) => d.size().unwrap_or(0) as usize,
+            Media::Photo(p) => photo_largest_size(p),
+            _ => 0,
+        })
+        .collect();
     let total: usize = sizes.iter().sum();
     if offset >= total { return Ok(Vec::new()); }
     let to_read = std::cmp::min(length, total - offset);
@@ -275,6 +357,7 @@ fn message_field(msg: &grammers_client::message::Message, key: &str) -> Option<S
     None
 }
 
+#[allow(dead_code)]
 fn resolve_filename(msg: &grammers_client::message::Message, doc: &Document) -> String {
     message_field(msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string())
 }
@@ -328,29 +411,53 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         let mut processed_msgs: usize = 0;
         while let Some(msg) = messages.next().await? {
             processed_msgs += 1;
-            if let Some(Media::Document(doc)) = msg.media() {
-                let raw_name = resolve_filename(&msg, &doc);
-                // parse out optional path prefix from message `name:` override
-                let (file_name, path_opt) = split_name(&raw_name);
-                let type_override = resolve_type_override(&msg);
-                println!("Processing file: {}", file_name);
-                io::stdout().flush().ok();
-                let size = doc.size();
-                let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
-                // Determine the final `file_type` for this entry. Preference order:
-                // 1) explicit `type:` override in the message,
-                // 2) MIME/type (audio/video => media, application/zip => zip),
-                // 3) document filename extension (using the underlying
-                //    `Document` name, not a `name:` override).
-                let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
-                let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
-                let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
-                if final_type == FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
-                    archive_entries = try_index_zip(&client, &[doc.clone()], &file_name, &mut zip_cache).await;
+            match msg.media() {
+                Some(Media::Document(doc)) => {
+                    let raw_name = message_field(&msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string());
+                    // parse out optional path prefix from message `name:` override
+                    let (file_name, path_opt) = split_name(&raw_name);
+                    let type_override = resolve_type_override(&msg);
+                    // Skip entries with empty or placeholder names
+                    if file_name.trim().is_empty() || file_name == "<unnamed>" {
+                        continue;
+                    }
+                    println!("Processing file: {}", file_name);
+                    io::stdout().flush().ok();
+                    let size = doc.size();
+                    let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
+                    // Determine the final `file_type` for this entry. Preference order:
+                    // 1) explicit `type:` override in the message,
+                    // 2) MIME/type (audio/video => media, application/zip => zip),
+                    // 3) document filename extension (using the underlying
+                    //    `Document` name, not a `name:` override).
+                    let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
+                    let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
+                    let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
+                    if final_type == FileType::Zip && entry.archive_view != ArchiveView::File && !is_multipart_part {
+                        archive_entries = try_index_zip(&client, &[doc.clone()], &file_name, &mut zip_cache).await;
+                    }
+                    // intern mime_type
+                    let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], size, mime_idx, archive_entries, file_type: final_type.clone() });
                 }
-                // intern mime_type
-                let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![doc], size, mime_idx, archive_entries, file_type: final_type.clone() });
+                Some(Media::Photo(photo)) => {
+                    // Photos: expose as files. Use `name:` override if present, otherwise synthesize a filename.
+                    let raw_name = message_field(&msg, "name:").unwrap_or_else(|| format!("photo_{}.jpg", photo.id()));
+                    let (file_name, path_opt) = split_name(&raw_name);
+                    let type_override = resolve_type_override(&msg);
+                    // Skip entries with empty or placeholder names
+                    if file_name.trim().is_empty() || file_name == "<unnamed>" {
+                        continue;
+                    }
+                    println!("Processing photo: {}", file_name);
+                    io::stdout().flush().ok();
+                    let size = Some(photo_largest_size(&photo));
+                    let mime_type = "image/jpeg".to_string();
+                    let final_type = classify_file_type(&type_override, &mime_type, &file_name);
+                    let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], size, mime_idx, archive_entries: None, file_type: final_type });
+                }
+                _ => {}
             }
         }
         println!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
@@ -404,8 +511,12 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             // across the concatenated parts so we can expose inner entries.
             let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
             if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
-                println!("Processing multipart archive: {}", exposed_name);
-                archive_entries_combined = try_index_zip(&client, &docs, &exposed_name, &mut zip_cache).await;
+                // try_index_zip expects Documents; only attempt if all parts are Documents
+                let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
+                if doc_vec.len() == docs.len() {
+                    println!("Processing multipart archive: {}", exposed_name);
+                    archive_entries_combined = try_index_zip(&client, &doc_vec, &exposed_name, &mut zip_cache).await;
+                }
             }
 
             // Determine combined file_type: prefer the first part's resolved file_type.
@@ -426,12 +537,17 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
 
             // mark removed indices
             for idx in parts_indices { removed.insert(idx); }
+            // Skip combined entries with empty or placeholder names
+            if combined.name.trim().is_empty() || combined.name == "<unnamed>" {
+                continue;
+            }
             new_files.push(combined);
         }
 
         // Append non-removed original entries
         for (i, f) in files.into_iter().enumerate() {
             if removed.contains(&i) { continue; }
+            if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
             new_files.push(f);
         }
 
@@ -562,56 +678,148 @@ async fn index_saved_messages(
     println!("  saved reaction tags: {}", tag_titles.len());
 
     let mut files: Vec<FileEntry> = Vec::new();
+    // Collect saved messages first so we can aggregate reaction tags across
+    // grouped (album) messages. This ensures tags applied to one album part
+    // are propagated to all parts in the same group.
+    let mut saved_msgs: Vec<grammers_client::message::Message> = Vec::new();
     let mut messages = client.iter_messages(me_ref);
     let mut processed: usize = 0;
     while let Some(msg) = messages.next().await? {
         processed += 1;
-        let Some(Media::Document(doc)) = msg.media() else { continue };
-        let name = doc.name().unwrap_or("<unnamed>").to_string();
-        let size = doc.size();
-        let mime_type = doc
-            .mime_type()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        // No `type:`/`name:` overrides in saved messages — classify purely from
-        // the document MIME and filename.
-        let file_type = classify_file_type(&None, &mime_type, &name);
-        let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
-            mime_vec.push(mime_type.clone());
-            mime_vec.len() - 1
-        });
+        saved_msgs.push(msg);
+    }
 
-        // Resolve which of this message's reactions are user-defined tags.
-        let mut titles: Vec<String> = extract_message_reactions(&msg)
-            .iter()
-            .filter_map(|r| tag_titles.get(&reaction_key(r)).cloned())
-            .collect();
-        titles.sort();
-        titles.dedup();
-
-        if titles.is_empty() {
-            files.push(FileEntry {
-                name: name.clone(),
-                path: None,
-                parts: smallvec![doc],
-                size,
-                mime_idx,
-                archive_entries: None,
-                file_type: file_type.clone(),
-            });
-        } else {
-            for tag in titles {
-                files.push(FileEntry {
-                    name: name.clone(),
-                    path: Some(std::path::PathBuf::from(&tag)),
-                    parts: smallvec![doc.clone()],
-                    size,
-                    mime_idx,
-                    archive_entries: None,
-                    file_type: file_type.clone(),
-                });
+    // Build a mapping of grouped_id -> aggregated tag titles for that group.
+    let mut group_tag_titles: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for msg in &saved_msgs {
+        if let Some(gid) = msg.grouped_id() {
+            let entry = group_tag_titles.entry(gid).or_default();
+            for r in extract_message_reactions(msg) {
+                if let Some(title) = tag_titles.get(&reaction_key(&r)).cloned() {
+                    entry.push(title);
+                }
             }
         }
+    }
+    for v in group_tag_titles.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+
+    // Now iterate collected messages and build `FileEntry` items, merging
+    // per-message tags with any group-level tags we discovered above.
+    for msg in saved_msgs.into_iter() {
+        match msg.media() {
+            Some(Media::Document(doc)) => {
+                let name = doc.name().unwrap_or("<unnamed>").to_string();
+                let size = doc.size();
+                let mime_type = doc
+                    .mime_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                // No `type:`/`name:` overrides in saved messages — classify purely from
+                // the document MIME and filename.
+                // Photos should be treated as media so browsers display them inline.
+                let file_type = FileType::Media;
+                let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
+                    mime_vec.push(mime_type.clone());
+                    mime_vec.len() - 1
+                });
+
+                // Resolve which of this message's reactions are user-defined tags.
+                let mut titles: Vec<String> = extract_message_reactions(&msg)
+                    .iter()
+                    .filter_map(|r| tag_titles.get(&reaction_key(r)).cloned())
+                    .collect();
+                if let Some(gid) = msg.grouped_id() {
+                    if let Some(group_titles) = group_tag_titles.get(&gid) {
+                        titles.extend(group_titles.clone());
+                    }
+                }
+                titles.sort();
+                titles.dedup();
+
+                if titles.is_empty() {
+                        // Skip entries with empty or placeholder names
+                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        files.push(FileEntry {
+                            name: name.clone(),
+                            path: None,
+                            parts: smallvec![Media::Document(doc.clone())],
+                            size,
+                            mime_idx,
+                            archive_entries: None,
+                            file_type: file_type.clone(),
+                        });
+                } else {
+                    for tag in titles {
+                        // skip pushing tagged entries with empty names
+                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        files.push(FileEntry {
+                            name: name.clone(),
+                            path: Some(std::path::PathBuf::from(&tag)),
+                            parts: smallvec![Media::Document(doc.clone())],
+                            size,
+                            mime_idx,
+                            archive_entries: None,
+                            file_type: file_type.clone(),
+                        });
+                    }
+                }
+            }
+            Some(Media::Photo(photo)) => {
+                let name = format!("photo_{}.jpg", photo.id());
+                let size = Some(photo_largest_size(&photo));
+                let mime_type = "image/jpeg".to_string();
+                let file_type = classify_file_type(&None, &mime_type, &name);
+                let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
+                    mime_vec.push(mime_type.clone());
+                    mime_vec.len() - 1
+                });
+                // Resolve which of this message's reactions are user-defined tags.
+                let mut titles: Vec<String> = extract_message_reactions(&msg)
+                    .iter()
+                    .filter_map(|r| tag_titles.get(&reaction_key(r)).cloned())
+                    .collect();
+                if let Some(gid) = msg.grouped_id() {
+                    if let Some(group_titles) = group_tag_titles.get(&gid) {
+                        titles.extend(group_titles.clone());
+                    }
+                }
+                titles.sort();
+                titles.dedup();
+
+                if titles.is_empty() {
+                        // Skip entries with empty or placeholder names
+                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        files.push(FileEntry {
+                            name: name.clone(),
+                            path: None,
+                            parts: smallvec![Media::Photo(photo.clone())],
+                            size,
+                            mime_idx,
+                            archive_entries: None,
+                            file_type: file_type.clone(),
+                        });
+                } else {
+                    for tag in titles {
+                        if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        files.push(FileEntry {
+                            name: name.clone(),
+                            path: Some(std::path::PathBuf::from(&tag)),
+                            parts: smallvec![Media::Photo(photo.clone())],
+                            size,
+                            mime_idx,
+                            archive_entries: None,
+                            file_type: file_type.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        
     }
     println!(
         "Saved Messages indexed: {} entries from {} messages",

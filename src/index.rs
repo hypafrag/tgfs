@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use grammers_client::media::Document;
+use grammers_client::media::Media;
 use std::path::PathBuf;
 use grammers_client::Client;
 use smallvec::SmallVec;
 
-pub type DocParts = SmallVec<[Document; 1]>;
+pub type DocParts = SmallVec<[Media; 1]>;
 
 #[derive(Deserialize)]
 pub struct ChannelEntry {
@@ -136,12 +136,16 @@ pub enum FileType {
 }
 
 impl FileEntry {
-    pub fn first_doc(&self) -> &Document {
+    pub fn first_doc(&self) -> &Media {
         &self.parts[0]
     }
 
     pub fn doc_name(&self) -> &str {
-        self.first_doc().name().unwrap_or(&self.name)
+        match &self.first_doc() {
+            Media::Document(d) => d.name().unwrap_or(&self.name),
+            Media::Photo(_) => &self.name,
+            _ => &self.name,
+        }
     }
 }
 

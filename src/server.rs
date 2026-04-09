@@ -14,6 +14,7 @@ use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
 use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
+use grammers_client::media::Media;
 use grammers_client::Client;
 use tokio_stream::Stream;
 
@@ -93,7 +94,14 @@ fn stream_parts_range(
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         // locate starting part index and in-part offset
-        let sizes: Vec<usize> = parts.iter().map(|d| d.size().unwrap_or(0) as usize).collect();
+        let sizes: Vec<usize> = parts
+            .iter()
+            .map(|m| match m {
+                Media::Document(d) => d.size().unwrap_or(0) as usize,
+                Media::Photo(p) => crate::indexer::photo_largest_size(p),
+                _ => 0,
+            })
+            .collect();
         let mut accum = 0usize;
         let mut part_idx = 0usize;
         let mut offset_in_part = 0usize;
@@ -419,7 +427,7 @@ pub async fn handle_channel_path(
     let inner_base = std::path::Path::new(inner).file_name().and_then(|s| s.to_str()).unwrap_or(inner);
     let encoded_name = urlencoding::encode(inner_base).into_owned();
     // disposition based on the inner file's MIME, not the archive's file_type
-    let inner_type = if mime.starts_with("audio/") || mime.starts_with("video/") {
+    let inner_type = if mime.starts_with("audio/") || mime.starts_with("video/") || mime.starts_with("image/") {
         FileType::Media
     } else {
         FileType::File
