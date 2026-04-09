@@ -14,8 +14,9 @@ use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
 use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
-use grammers_client::media::Media;
-use grammers_client::Client;
+use crate::indexer::refresh_part_documents;
+use grammers_client::media::{Document, Media};
+use grammers_session::types::PeerRef;
 use tokio_stream::Stream;
 
 fn normalize_path(p: &std::path::Path) -> String {
@@ -81,18 +82,55 @@ fn encode_segments(p: &str) -> String {
 
 const DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Streaming context: identifies parts and how to refresh their file
+/// references when Telegram returns `FILE_REFERENCE_EXPIRED` mid-stream.
+struct StreamCtx {
+    state: Arc<AppState>,
+    parts: DocParts,
+    msg_ids: Vec<i32>,
+    peer: Option<PeerRef>,
+}
+
+/// Resolve `parts[idx]` to a `Document`, preferring a fresh copy from the
+/// process-wide cache.
+fn effective_part_doc(state: &AppState, parts: &[Media], idx: usize) -> Option<Document> {
+    match &parts[idx] {
+        Media::Document(d) => {
+            let cache = state.fresh_docs.lock().unwrap();
+            Some(cache.get(&d.id()).cloned().unwrap_or_else(|| d.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Refresh all parts via `get_messages_by_id`, update the process-wide cache,
+/// and return the document for `idx`.
+async fn refresh_for_stream(ctx: &StreamCtx, idx: usize) -> anyhow::Result<Document> {
+    let peer = ctx.peer.ok_or_else(|| anyhow::anyhow!("no peer for refresh"))?;
+    if ctx.msg_ids.len() != ctx.parts.len() || ctx.msg_ids.is_empty() {
+        anyhow::bail!("msg_ids/parts misalignment, cannot refresh");
+    }
+    eprintln!("server: FILE_REFERENCE_EXPIRED, refreshing {} part(s)", ctx.msg_ids.len());
+    let docs = refresh_part_documents(&ctx.state.client, peer, &ctx.msg_ids).await?;
+    {
+        let mut cache = ctx.state.fresh_docs.lock().unwrap();
+        for d in &docs { cache.insert(d.id(), d.clone()); }
+    }
+    docs.into_iter().nth(idx).ok_or_else(|| anyhow::anyhow!("refreshed docs missing index"))
+}
+
 /// Single streaming primitive: stream `length` bytes starting at `start` across
 /// a list of concatenated document parts. `length = None` means stream to EOF.
 /// Handles single-doc files, multipart files, and ranged reads over archive parts
 /// (used for inner-file extraction, where `parts` is the archive's own part list).
 fn stream_parts_range(
-    client: Client,
-    parts: DocParts,
+    ctx: StreamCtx,
     start: usize,
     length: Option<usize>,
 ) -> ReceiverStream<Result<Bytes, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
+        let parts = ctx.parts.clone();
         // locate starting part index and in-part offset
         let sizes: Vec<usize> = parts
             .iter()
@@ -115,27 +153,65 @@ fn stream_parts_range(
         let mut remaining: Option<usize> = length;
         for idx in part_idx..parts.len() {
             if remaining == Some(0) { break; }
-            let doc = &parts[idx];
+            let mut doc = match effective_part_doc(&ctx.state, &parts, idx) {
+                Some(d) => d,
+                None => continue, // skip non-document parts (photos handled elsewhere)
+            };
             let start_off = if idx == part_idx { offset_in_part } else { 0 };
             let first_chunk = (start_off / DOWNLOAD_CHUNK_SIZE) as i32;
             let offset_in_first = start_off % DOWNLOAD_CHUNK_SIZE;
-            let mut dl = client.iter_download(doc).chunk_size(DOWNLOAD_CHUNK_SIZE as i32).skip_chunks(first_chunk);
+            // Outer loop allows rebuilding iter_download from `chunks_consumed`
+            // after a `FILE_REFERENCE_EXPIRED` recovery.
+            let mut chunks_consumed: i32 = 0;
             let mut bytes_sent: usize = 0;
-            while let Ok(Some(chunk)) = dl.next().await {
-                let mut slice = &chunk[..];
-                if bytes_sent == 0 && offset_in_first > 0 {
-                    if slice.len() <= offset_in_first { continue; }
-                    slice = &slice[offset_in_first..];
-                }
-                let take = match remaining {
-                    Some(r) => std::cmp::min(r, slice.len()),
-                    None => slice.len(),
-                };
-                if tx.send(Ok(Bytes::from(slice[..take].to_vec()))).await.is_err() { return; }
-                bytes_sent += take;
-                if let Some(r) = remaining.as_mut() {
-                    *r -= take;
-                    if *r == 0 { break; }
+            let mut refreshed_once = false;
+            'part_stream: loop {
+                let mut dl = ctx.state.client
+                    .iter_download(&doc)
+                    .chunk_size(DOWNLOAD_CHUNK_SIZE as i32)
+                    .skip_chunks(first_chunk + chunks_consumed);
+                loop {
+                    match dl.next().await {
+                        Ok(Some(chunk)) => {
+                            let mut slice = &chunk[..];
+                            if bytes_sent == 0 && offset_in_first > 0 {
+                                if slice.len() <= offset_in_first {
+                                    chunks_consumed += 1;
+                                    continue;
+                                }
+                                slice = &slice[offset_in_first..];
+                            }
+                            let take = match remaining {
+                                Some(r) => std::cmp::min(r, slice.len()),
+                                None => slice.len(),
+                            };
+                            if tx.send(Ok(Bytes::from(slice[..take].to_vec()))).await.is_err() { return; }
+                            bytes_sent += take;
+                            chunks_consumed += 1;
+                            if let Some(r) = remaining.as_mut() {
+                                *r -= take;
+                                if *r == 0 { break 'part_stream; }
+                            }
+                        }
+                        Ok(None) => break 'part_stream,
+                        Err(grammers_client::InvocationError::Rpc(rpc)) if rpc.name == "FILE_REFERENCE_EXPIRED" && !refreshed_once => {
+                            refreshed_once = true;
+                            match refresh_for_stream(&ctx, idx).await {
+                                Ok(fresh) => {
+                                    doc = fresh;
+                                    continue 'part_stream;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(std::io::Error::other(format!("refresh failed: {e}")))).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::other(format!("download error: {e}")))).await;
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -362,7 +438,9 @@ pub async fn handle_channel_path(
 ) -> Result<Response, StatusCode> {
     let dir = channel.trim_end_matches('/').to_string();
     let channel = state.dir_to_channel.get(&dir).cloned().ok_or(StatusCode::NOT_FOUND)?;
-    let files = state.channels.get(&channel).map(|c| &c.files).ok_or(StatusCode::NOT_FOUND)?;
+    let tchan = state.channels.get(&channel).ok_or(StatusCode::NOT_FOUND)?;
+    let channel_peer = tchan.peer;
+    let files = &tchan.files;
     let orig_path = path;
     let is_dir_request = orig_path.is_empty() || orig_path.ends_with('/');
     let trimmed = orig_path.trim_end_matches('/');
@@ -398,21 +476,27 @@ pub async fn handle_channel_path(
             return Err(StatusCode::NOT_FOUND);
         }
 
-        let client = state.client.clone();
         let mime = state.mime_pool.get(fentry.mime_idx).cloned().unwrap_or_else(|| "application/octet-stream".to_string());
         let encoded_name = urlencoding::encode(&fentry.name).into_owned();
         let disposition = content_disposition(&fentry.file_type, &encoded_name);
 
+        let make_ctx = || StreamCtx {
+            state: state.clone(),
+            parts: fentry.parts.clone(),
+            msg_ids: fentry.msg_ids.iter().copied().collect(),
+            peer: channel_peer,
+        };
+
         if let Some(total_size) = fentry.size {
             if let Some((start, end)) = parse_range(&headers, total_size)? {
                 let wanted = end - start + 1;
-                let stream = stream_parts_range(client, fentry.parts.clone(), start, Some(wanted));
+                let stream = stream_parts_range(make_ctx(), start, Some(wanted));
                 let body = Body::from_stream(stream);
                 return Ok(partial_response(&mime, &disposition, body, start, end, total_size));
             }
         }
 
-        let body = Body::from_stream(stream_parts_range(client, fentry.parts.clone(), 0, None));
+        let body = Body::from_stream(stream_parts_range(make_ctx(), 0, None));
         return Ok(full_download_response(&mime, &disposition, body, fentry.size));
     }
 
@@ -424,8 +508,14 @@ pub async fn handle_channel_path(
 
     // ranged-extract the requested file from the archive without downloading the whole archive.
     // The archive itself may be multipart, so we thread its full `parts` list through every read.
-    let client = state.client.clone();
     let archive_parts = archive_entry.parts.clone();
+    let archive_msg_ids: Vec<i32> = archive_entry.msg_ids.iter().copied().collect();
+    let make_archive_ctx = || StreamCtx {
+        state: state.clone(),
+        parts: archive_parts.clone(),
+        msg_ids: archive_msg_ids.clone(),
+        peer: channel_peer,
+    };
 
     let archive_entries = archive_entry.archive_entries.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let ae = archive_entries.iter().find(|x| x.path == inner).ok_or(StatusCode::NOT_FOUND)?;
@@ -453,17 +543,17 @@ pub async fn handle_channel_path(
             // Stored (no compression): compressed_size == uncompressed_size normally.
             if let Some((start, end)) = parse_range(&headers, total)? {
                 let wanted = end - start + 1;
-                let stream = stream_parts_range(client, archive_parts, data_offset + start, Some(wanted));
+                let stream = stream_parts_range(make_archive_ctx(), data_offset + start, Some(wanted));
                 let body = Body::from_stream(stream);
                 return Ok(partial_response(&mime, &disposition, body, start, end, total));
             }
-            let stream = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
+            let stream = stream_parts_range(make_archive_ctx(), data_offset, Some(ae.compressed_size));
             let body = Body::from_stream(stream);
             return Ok(full_download_response(&mime, &disposition, body, Some(total)));
         }
         8 => {
             // Deflated: inflate on-the-fly (existing behavior).
-            let compressed = stream_parts_range(client, archive_parts, data_offset, Some(ae.compressed_size));
+            let compressed = stream_parts_range(make_archive_ctx(), data_offset, Some(ae.compressed_size));
             let buf = BufReader::new(StreamReader::new(compressed));
             let decompressed = ReaderStream::new(AsyncDeflateDecoder::new(buf));
 

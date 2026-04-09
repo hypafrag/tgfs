@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
 use grammers_client::media::{Document, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
+use grammers_client::InvocationError;
 use grammers_client::tl;
-use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, TelegramChannel};
+use grammers_session::types::PeerRef;
+use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, MsgIds, TelegramChannel};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
 
@@ -270,6 +273,99 @@ pub async fn download_range(
     }
 
     Ok(buf)
+}
+
+/// True if `e` (or any cause in its chain) is a Telegram
+/// `FILE_REFERENCE_EXPIRED` RPC error. References embedded in cached
+/// `Document`s expire after a few hours; the indexer keeps Documents around
+/// for the lifetime of the process, so download paths must be prepared to
+/// refresh on demand.
+pub fn is_file_ref_expired(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(InvocationError::Rpc(rpc)) = cause.downcast_ref::<InvocationError>() {
+            if rpc.name == "FILE_REFERENCE_EXPIRED" { return true; }
+        }
+    }
+    false
+}
+
+/// Re-fetch the source messages for `msg_ids` from `peer` and extract their
+/// document media. The returned `Document`s carry fresh `file_reference`s.
+pub async fn refresh_part_documents(
+    client: &Client,
+    peer: PeerRef,
+    msg_ids: &[i32],
+) -> anyhow::Result<Vec<Document>> {
+    let messages = client.get_messages_by_id(peer, msg_ids).await?;
+    let mut out = Vec::with_capacity(messages.len());
+    for (i, mopt) in messages.into_iter().enumerate() {
+        let m = mopt.ok_or_else(|| anyhow::anyhow!("message {} missing on file-reference refresh", msg_ids[i]))?;
+        match m.media() {
+            Some(Media::Document(d)) => out.push(d),
+            _ => anyhow::bail!("expected document media on refreshed message {}", msg_ids[i]),
+        }
+    }
+    Ok(out)
+}
+
+/// Substitute any `Document` parts with fresh copies from `fresh_docs` (keyed
+/// by document id). Photos and uncached docs are passed through unchanged.
+pub fn apply_fresh_docs(parts: &[Media], fresh_docs: &Mutex<HashMap<i64, Document>>) -> Vec<Media> {
+    let cache = fresh_docs.lock().unwrap();
+    parts
+        .iter()
+        .map(|m| match m {
+            Media::Document(d) => match cache.get(&d.id()) {
+                Some(fresh) => Media::Document(fresh.clone()),
+                None => Media::Document(d.clone()),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// `download_range` with `FILE_REFERENCE_EXPIRED` recovery. Looks up fresh
+/// document copies in `fresh_docs` first; on expiry refreshes via
+/// `get_messages_by_id`, populates the cache, and retries once.
+///
+/// Falls back to plain `download_range` (no retry) when no peer is known or
+/// `msg_ids` is misaligned with `parts`.
+pub async fn download_range_refresh(
+    client: &Client,
+    parts: &[Media],
+    msg_ids: &[i32],
+    peer: Option<PeerRef>,
+    fresh_docs: &Mutex<HashMap<i64, Document>>,
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let effective = apply_fresh_docs(parts, fresh_docs);
+    match download_range(client, &effective, offset, length).await {
+        Ok(buf) => Ok(buf),
+        Err(e) => {
+            if !is_file_ref_expired(&e) { return Err(e); }
+            let peer = match peer {
+                Some(p) => p,
+                None => return Err(e),
+            };
+            if msg_ids.len() != parts.len() || msg_ids.is_empty() {
+                return Err(e);
+            }
+            eprintln!(
+                "download_range: FILE_REFERENCE_EXPIRED, refreshing {} part(s)",
+                msg_ids.len()
+            );
+            let docs = refresh_part_documents(client, peer, msg_ids).await?;
+            {
+                let mut cache = fresh_docs.lock().unwrap();
+                for d in &docs {
+                    cache.insert(d.id(), d.clone());
+                }
+            }
+            let refreshed: Vec<Media> = docs.into_iter().map(Media::Document).collect();
+            download_range(client, &refreshed, offset, length).await
+        }
+    }
 }
 
 /// Download `[offset, offset+length)` from a single document part by splitting
@@ -551,7 +647,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     // intern mime_type
                     let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
                     let mtime = msg_mtime(&msg);
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], size, mime_idx, archive_entries, file_type: final_type.clone(), mtime });
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], msg_ids: smallvec![msg.id()], size, mime_idx, archive_entries, file_type: final_type.clone(), mtime });
                 }
                 Some(Media::Photo(photo)) => {
                     // Photos: expose as files. Use `name:` override if present, otherwise synthesize a filename.
@@ -569,7 +665,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                     let final_type = classify_file_type(&type_override, &mime_type, &file_name);
                     let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
                     let mtime = msg_mtime(&msg);
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], size, mime_idx, archive_entries: None, file_type: final_type, mtime });
+                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], msg_ids: smallvec![msg.id()], size, mime_idx, archive_entries: None, file_type: final_type, mtime });
                 }
                 _ => {}
             }
@@ -596,11 +692,13 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
             // collect docs and sizes
             let mut docs: DocParts = DocParts::new();
+            let mut combined_msg_ids: MsgIds = MsgIds::new();
             let mut total_size: Option<usize> = Some(0);
             let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
             for idx in &parts_indices {
                 let f = &files[*idx];
                 docs.extend(f.parts.iter().cloned());
+                combined_msg_ids.extend(f.msg_ids.iter().copied());
                 match (total_size, f.size) {
                     (Some(acc), Some(s)) => total_size = Some(acc + s),
                     _ => total_size = None,
@@ -643,6 +741,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 name: exposed_base,
                 path: exposed_path,
                 parts: docs,
+                msg_ids: combined_msg_ids,
                 size: total_size,
                 mime_idx: first.mime_idx,
                 archive_entries: archive_entries_combined,
@@ -674,7 +773,7 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
             apply_prefix_collapse(&mut new_files, min_len);
         }
         // create TelegramChannel and insert
-        let tchan = TelegramChannel { archive_view: entry.archive_view, skip_deflated_id3v1: entry.skip_deflated_id3v1, files: new_files };
+        let tchan = TelegramChannel { archive_view: entry.archive_view, skip_deflated_id3v1: entry.skip_deflated_id3v1, files: new_files, peer: Some(peer_ref) };
         index.insert(name.clone(), tchan);
     }
 
@@ -766,6 +865,7 @@ fn extract_tag_titles(
 /// holding raw `Message` objects around (which carry text, peer info, etc.).
 struct SavedRecord {
     media: Media,
+    msg_id: i32,
     name: String,
     size: Option<usize>,
     mime_idx: usize,
@@ -892,6 +992,7 @@ async fn index_saved_messages(
 
         records.push(SavedRecord {
             media,
+            msg_id: msg.id(),
             name,
             size,
             mime_idx,
@@ -919,6 +1020,7 @@ async fn index_saved_messages(
             name: rec.name.clone(),
             path,
             parts: smallvec![rec.media.clone()],
+            msg_ids: smallvec![rec.msg_id],
             size: rec.size,
             mime_idx: rec.mime_idx,
             archive_entries: rec.archive_entries.clone(),
@@ -965,10 +1067,12 @@ async fn index_saved_messages(
 
         // collect docs and sizes
         let mut docs: DocParts = DocParts::new();
+        let mut combined_msg_ids: MsgIds = MsgIds::new();
         let mut total_size: Option<usize> = Some(0);
         for idx in &parts_indices {
             let f = &files[*idx];
             docs.extend(f.parts.iter().cloned());
+            combined_msg_ids.extend(f.msg_ids.iter().copied());
             match (total_size, f.size) {
                 (Some(acc), Some(s)) => total_size = Some(acc + s),
                 _ => total_size = None,
@@ -999,6 +1103,7 @@ async fn index_saved_messages(
             name: exposed_name,
             path: first.path.clone(),
             parts: docs,
+            msg_ids: combined_msg_ids,
             size: total_size,
             mime_idx: first.mime_idx,
             archive_entries: archive_entries_combined,
@@ -1026,5 +1131,6 @@ async fn index_saved_messages(
         archive_view,
         skip_deflated_id3v1: false,
         files: new_files,
+        peer: Some(me_ref),
     })
 }

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
-use grammers_client::media::Media;
+use grammers_client::media::{Document, Media};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use grammers_client::Client;
+use grammers_session::types::PeerRef;
 use smallvec::SmallVec;
 
 pub type DocParts = SmallVec<[Media; 1]>;
+pub type MsgIds = SmallVec<[i32; 1]>;
 
 #[derive(Deserialize)]
 pub struct ChannelEntry {
@@ -135,6 +138,10 @@ pub struct FileEntry {
     // stored inline (no heap allocation); multipart files (`<base>.NN` detection)
     // spill to the heap.
     pub parts: DocParts,
+    /// Source Telegram message id for each part, parallel to `parts`. Used to
+    /// re-fetch fresh `Document` objects when Telegram returns
+    /// `FILE_REFERENCE_EXPIRED` (file references are short-lived).
+    pub msg_ids: MsgIds,
     pub size: Option<usize>,
     // Index into the global MIME pool in `AppState`.
     pub mime_idx: usize,
@@ -180,6 +187,11 @@ pub struct AppState {
     pub dir_to_channel: HashMap<String, String>,
     /// Per-PID concurrent fetch limit for FUSE (None = unlimited).
     pub max_fetches_per_pid: Option<usize>,
+    /// Process-wide cache of refreshed `Document`s, keyed by document id.
+    /// Populated on `FILE_REFERENCE_EXPIRED` recovery so subsequent reads of
+    /// the same file reuse the fresh reference instead of re-fetching the
+    /// source message every time.
+    pub fresh_docs: Mutex<HashMap<i64, Document>>,
 }
 
 #[derive(Clone)]
@@ -187,6 +199,9 @@ pub struct TelegramChannel {
     pub archive_view: ArchiveView,
     pub skip_deflated_id3v1: bool,
     pub files: Vec<FileEntry>,
+    /// Resolved peer reference for the channel (or self peer for Saved Messages).
+    /// Used to re-fetch messages when refreshing expired file references.
+    pub peer: Option<PeerRef>,
 }
 
 pub fn human_size(bytes: usize) -> String {

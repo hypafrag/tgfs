@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
-use grammers_client::Client;
 use grammers_client::media::Media;
+use grammers_session::types::PeerRef;
 use tokio::runtime::Handle;
 
 use crate::index::{AppState, ArchiveView, FileEntry, FileType};
-use crate::indexer::download_range;
+use crate::indexer::download_range_refresh;
 use flate2::read::DeflateDecoder;
 
 fn path_hash(p: &str) -> u64 {
@@ -185,20 +185,23 @@ impl std::io::Read for PrefetchingReader {
 /// (e.g. on `release()`), `tx.send().await` errors and the task exits.
 fn spawn_prefetcher(
     rt: &Handle,
-    client: Client,
+    state: Arc<AppState>,
     parts: Vec<Media>,
+    msg_ids: Vec<i32>,
+    peer: Option<PeerRef>,
     data_offset: usize,
     compressed_size: usize,
 ) -> PrefetchingReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(DEFLATE_PREFETCH_DEPTH);
     eprintln!("fuse: spawn_prefetcher data_offset={} compressed_size={}", data_offset, compressed_size);
     rt.spawn(async move {
+        let client = state.client.clone();
         let mut consumed: usize = 0;
         while consumed < compressed_size {
             let want = (compressed_size - consumed).min(DEFLATE_FETCH_CHUNK);
             let abs = data_offset + consumed;
             eprintln!("fuse: prefetcher fetch abs={} want={} consumed={}/{}", abs, want, consumed, compressed_size);
-            let res = download_range(&client, &parts, abs, want).await;
+            let res = download_range_refresh(&client, &parts, &msg_ids, peer, &state.fresh_docs, abs, want).await;
             match res {
                 Ok(chunk) => {
                     if chunk.is_empty() {
@@ -447,24 +450,28 @@ impl Filesystem for TgfsFS {
             Some(c) => c.clone(),
             None => { reply.error(libc::ENOENT); return; }
         };
-        let files = match state.channels.get(&channel).map(|c| &c.files) {
-            Some(f) => f,
+        let tchan = match state.channels.get(&channel) {
+            Some(c) => c,
             None => { reply.error(libc::ENOENT); return; }
         };
+        let channel_peer = tchan.peer;
+        let files = &tchan.files;
 
         // Try direct file match. Dispatch the download as an async task and
         // return from `read()` immediately so the FUSE event loop is free to
         // service other requests while the download is in flight.
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
             let parts_docs: Vec<Media> = fentry.parts.iter().cloned().collect();
+            let msg_ids: Vec<i32> = fentry.msg_ids.iter().copied().collect();
             let client = state.client.clone();
+            let state_for_fetch = state.clone();
             let sem = pid_sem.clone();
             self.rt.spawn(async move {
                 let _permit = match &sem {
                     Some(s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
-                match download_range(&client, &parts_docs, offset as usize, size as usize).await {
+                match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, offset as usize, size as usize).await {
                     Ok(buf) => reply.data(&buf),
                     Err(_) => reply.error(libc::EIO),
                 }
@@ -501,6 +508,7 @@ impl Filesystem for TgfsFS {
             eprintln!("fuse: read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
                 path, inner, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
             let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
+            let msg_ids: Vec<i32> = f.msg_ids.iter().copied().collect();
             let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {
@@ -508,13 +516,14 @@ impl Filesystem for TgfsFS {
                     let off = data_offset + offset as usize;
                     eprintln!("fuse: stored entry read off={} size={}", off, size);
                     let client = state.client.clone();
+                    let state_for_fetch = state.clone();
                     let sem = pid_sem.clone();
                     self.rt.spawn(async move {
                         let _permit = match &sem {
                             Some(s) => Some(s.acquire().await.expect("semaphore closed")),
                             None => None,
                         };
-                        match download_range(&client, &parts_docs, off, size as usize).await {
+                        match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, off, size as usize).await {
                             Ok(buf) => { eprintln!("fuse: stored entry got {} bytes", buf.len()); reply.data(&buf); }
                             Err(e) => { eprintln!("fuse: stored entry download error: {:?}", e); reply.error(libc::EIO); }
                         }
@@ -534,10 +543,10 @@ impl Filesystem for TgfsFS {
                     // thread and the FUSE event loop returns immediately. The
                     // PrefetchingReader pipelines compressed-byte fetches in a
                     // background task so the decoder rarely blocks on network.
-                    let client = state.client.clone();
+                    let state_for_prefetch = state.clone();
                     let rt_clone = self.rt.clone();
                     let stream = self.deflate_streams.entry(fh).or_insert_with(|| {
-                        let reader = spawn_prefetcher(&rt_clone, client, parts_docs, data_offset, compressed_size);
+                        let reader = spawn_prefetcher(&rt_clone, state_for_prefetch, parts_docs, msg_ids, channel_peer, data_offset, compressed_size);
                         Arc::new(Mutex::new(DeflateStream {
                             decoder: DeflateDecoder::new(reader),
                             pos: 0,
