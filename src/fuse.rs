@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
@@ -193,8 +193,12 @@ pub struct TgfsFS {
     // Streaming deflate decoders, one per open file handle, keyed by fh.
     // Kept alive between FUSE read chunks so we decompress sequentially
     // rather than re-downloading + re-decompressing from the start each call.
-    // Removed in release().
-    deflate_streams: HashMap<u64, DeflateStream>,
+    // Wrapped in Arc<Mutex<>> so per-fh state can be moved into a
+    // `spawn_blocking` task and locked there — different fh's (different
+    // clients) decode in parallel; concurrent reads on the same fh serialize
+    // on the mutex, which is required since the deflate decoder is stateful
+    // and must consume bytes sequentially. Removed in release().
+    deflate_streams: HashMap<u64, Arc<Mutex<DeflateStream>>>,
     next_fh: u64,
 }
 
@@ -282,13 +286,6 @@ impl TgfsFS {
         self.ino_to_path.get(&ino).map(|s| s.as_str())
     }
 
-    /// Synchronously download a byte range using the captured tokio runtime handle.
-    fn block_download(&self, parts: &[Document], offset: usize, length: usize) -> std::io::Result<Vec<u8>> {
-        let client = self.state.client.clone();
-        self.rt
-            .block_on(async move { download_range(&client, parts, offset, length).await })
-            .map_err(|_| std::io::Error::other("download failed"))
-    }
 }
 
 impl Filesystem for TgfsFS {
@@ -369,30 +366,38 @@ impl Filesystem for TgfsFS {
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        let path = match self.path_for_ino(ino) {
-            Some(p) => p.to_string(),
+        // Clone Arc so borrows for `files`/`ae` come from a local — leaving
+        // `self` free to mutate `deflate_streams` below without borrow conflict.
+        let state = self.state.clone();
+        let path = match self.ino_to_path.get(&ino) {
+            Some(p) => p.clone(),
             None => { reply.error(libc::ENOENT); return; }
         };
         let ptrim = path.trim_start_matches('/');
-        let mut parts = ptrim.splitn(2, '/');
-        let dir = parts.next().unwrap_or("");
-        let rest = parts.next().unwrap_or("");
-        let channel = match self.state.dir_to_channel.get(dir) {
-            Some(c) => c,
+        let mut p_iter = ptrim.splitn(2, '/');
+        let dir = p_iter.next().unwrap_or("");
+        let rest = p_iter.next().unwrap_or("");
+        let channel = match state.dir_to_channel.get(dir) {
+            Some(c) => c.clone(),
             None => { reply.error(libc::ENOENT); return; }
         };
-        let files = match self.state.channels.get(channel).map(|c| &c.files) {
+        let files = match state.channels.get(&channel).map(|c| &c.files) {
             Some(f) => f,
             None => { reply.error(libc::ENOENT); return; }
         };
 
-        // Try direct file match
+        // Try direct file match. Dispatch the download as an async task and
+        // return from `read()` immediately so the FUSE event loop is free to
+        // service other requests while the download is in flight.
         if let Some(fentry) = files.iter().find(|e| full_for(e) == rest) {
-            let parts_docs: Vec<_> = fentry.parts.iter().cloned().collect();
-            match self.block_download(&parts_docs, offset as usize, size as usize) {
-                Ok(buf) => reply.data(&buf),
-                Err(_) => reply.error(libc::EIO),
-            }
+            let parts_docs: Vec<Document> = fentry.parts.iter().cloned().collect();
+            let client = state.client.clone();
+            self.rt.spawn(async move {
+                match download_range(&client, &parts_docs, offset as usize, size as usize).await {
+                    Ok(buf) => reply.data(&buf),
+                    Err(_) => reply.error(libc::EIO),
+                }
+            });
             return;
         }
 
@@ -415,53 +420,37 @@ impl Filesystem for TgfsFS {
                 Some(a) => a,
                 None => { reply.error(libc::ENOENT); return; }
             };
-            let parts_docs: Vec<_> = f.parts.iter().cloned().collect();
+            let parts_docs: Vec<Document> = f.parts.iter().cloned().collect();
             let data_offset = ae.data_offset as usize;
 
             match ae.compression_method {
                 0 => {
                     let off = data_offset + offset as usize;
-                    match self.block_download(&parts_docs, off, size as usize) {
-                        Ok(buf) => reply.data(&buf),
-                        Err(_) => reply.error(libc::EIO),
-                    }
+                    let client = state.client.clone();
+                    self.rt.spawn(async move {
+                        match download_range(&client, &parts_docs, off, size as usize).await {
+                            Ok(buf) => reply.data(&buf),
+                            Err(_) => reply.error(libc::EIO),
+                        }
+                    });
                     return;
                 }
                 8 => {
-                    // Extract needed values from ae before touching deflate_streams
-                    // (ae borrows self.state; deflate_streams is a disjoint field).
                     let compressed_size = ae.compressed_size;
-
+                    let uncompressed_size = ae.uncompressed_size;
+                    let ae_path = ae.path.clone();
                     let off = offset as usize;
                     let sz = size as usize;
+                    let channel_skip = state.channels.get(&channel).map(|a| a.skip_deflated_id3v1).unwrap_or(false);
 
-                    // Workaround for players probing for ID3v1 at EOF on deflated inner files.
-                    // When enabled per-channel, return 4096 zero bytes for small probe reads
-                    // near the end of short reads to avoid players attempting to parse
-                    // ID3v1 tags which require seeking/completing the entire inflated stream.
-                    const MAX_TOTAL_READ: usize = 128 * 1024;
-                    const DISTANCE_TO_FILE_END: usize = 16 * 1024;
-                    const ID3V1_READ_SIZE: usize = 4096;
-
-                    let channel_skip = self.state.channels.get(channel).map(|a| a.skip_deflated_id3v1).unwrap_or(false);
-                    if channel_skip {
-                        let path_lower = ae.path.to_lowercase();
-                        let looks_like_audio = path_lower.ends_with(".mp3") || path_lower.ends_with(".flac");
-                        let stream_pos_so_far = self.deflate_streams.get(&fh).map(|s| s.pos).unwrap_or(0usize);
-                        if looks_like_audio && sz == ID3V1_READ_SIZE && stream_pos_so_far < MAX_TOTAL_READ && ae.uncompressed_size.saturating_sub(off) < DISTANCE_TO_FILE_END {
-                            println!("fuse: suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae.path, fh, off, stream_pos_so_far);
-                            let zeros = vec![0u8; sz];
-                            reply.data(&zeros);
-                            return;
-                        }
-                    }
-
-                    // Initialize the streaming decoder on the first read for this fh.
-                    // TelegramReader fetches compressed data in small chunks on demand;
-                    // the DeflateDecoder only buffers its 32 KB sliding window.
-                    if !self.deflate_streams.contains_key(&fh) {
+                    // Get-or-create the per-fh streaming decoder. Wrapped in
+                    // Arc<Mutex<>> so the actual decode work runs on a blocking
+                    // thread and the FUSE event loop returns immediately.
+                    let client = state.client.clone();
+                    let rt_clone = self.rt.clone();
+                    let stream = self.deflate_streams.entry(fh).or_insert_with(|| {
                         let reader = TelegramReader {
-                            client: self.state.client.clone(),
+                            client,
                             parts: parts_docs,
                             data_offset,
                             compressed_size,
@@ -469,48 +458,68 @@ impl Filesystem for TgfsFS {
                             buf: Vec::new(),
                             buf_pos: 0,
                             next_fetch: DEFLATE_FETCH_INITIAL,
-                            rt: self.rt.clone(),
+                            rt: rt_clone,
                         };
-                        self.deflate_streams.insert(fh, DeflateStream {
+                        Arc::new(Mutex::new(DeflateStream {
                             decoder: DeflateDecoder::new(reader),
                             pos: 0,
-                        });
-                    }
+                        }))
+                    }).clone();
 
-                    let stream = self.deflate_streams.get_mut(&fh).unwrap();
+                    self.rt.spawn_blocking(move || {
+                        let mut stream = stream.lock().unwrap();
 
-                    // Skip forward if the kernel jumped ahead (shouldn't happen in
-                    // normal sequential reads; caller should use STORE for random access).
-                    if off > stream.pos {
+                        // Workaround for players probing for ID3v1 at EOF on deflated inner files.
+                        // When enabled per-channel, return zero bytes for small probe reads
+                        // near the end to avoid players attempting to parse ID3v1 tags which
+                        // would require completing the entire inflated stream.
+                        const MAX_TOTAL_READ: usize = 128 * 1024;
+                        const DISTANCE_TO_FILE_END: usize = 16 * 1024;
+                        const ID3V1_READ_SIZE: usize = 4096;
+                        if channel_skip {
+                            let path_lower = ae_path.to_lowercase();
+                            let looks_like_audio = path_lower.ends_with(".mp3") || path_lower.ends_with(".flac");
+                            if looks_like_audio && sz == ID3V1_READ_SIZE && stream.pos < MAX_TOTAL_READ && uncompressed_size.saturating_sub(off) < DISTANCE_TO_FILE_END {
+                                println!("fuse: suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae_path, fh, off, stream.pos);
+                                let zeros = vec![0u8; sz];
+                                reply.data(&zeros);
+                                return;
+                            }
+                        }
+
+                        // Skip forward if the kernel jumped ahead (shouldn't happen in
+                        // normal sequential reads; caller should use STORE for random access).
+                        if off > stream.pos {
+                            use std::io::Read as _;
+                            let mut remaining = off - stream.pos;
+                            let mut discard = vec![0u8; remaining.min(65536)];
+                            while remaining > 0 {
+                                let n = remaining.min(discard.len());
+                                match stream.decoder.read(&mut discard[..n]) {
+                                    Ok(0) => { reply.error(libc::EIO); return; }
+                                    Ok(r) => { stream.pos += r; remaining -= r; }
+                                    Err(_) => { reply.error(libc::EIO); return; }
+                                }
+                            }
+                        } else if off < stream.pos {
+                            // Backward seek: impossible to handle without rewinding.
+                            reply.error(libc::EIO);
+                            return;
+                        }
+
                         use std::io::Read as _;
-                        let mut remaining = off - stream.pos;
-                        let mut discard = vec![0u8; remaining.min(65536)];
-                        while remaining > 0 {
-                            let n = remaining.min(discard.len());
-                            match stream.decoder.read(&mut discard[..n]) {
-                                Ok(0) => { reply.error(libc::EIO); return; }
-                                Ok(r) => { stream.pos += r; remaining -= r; }
+                        let mut buf = vec![0u8; sz];
+                        let mut total = 0;
+                        while total < sz {
+                            match stream.decoder.read(&mut buf[total..]) {
+                                Ok(0) => break,
+                                Ok(n) => total += n,
                                 Err(_) => { reply.error(libc::EIO); return; }
                             }
                         }
-                    } else if off < stream.pos {
-                        // Backward seek: impossible to handle without rewinding.
-                        reply.error(libc::EIO);
-                        return;
-                    }
-
-                    use std::io::Read as _;
-                    let mut buf = vec![0u8; sz];
-                    let mut total = 0;
-                    while total < sz {
-                        match stream.decoder.read(&mut buf[total..]) {
-                            Ok(0) => break,
-                            Ok(n) => total += n,
-                            Err(_) => { reply.error(libc::EIO); return; }
-                        }
-                    }
-                    stream.pos += total;
-                    reply.data(&buf[..total]);
+                        stream.pos += total;
+                        reply.data(&buf[..total]);
+                    });
                     return;
                 }
                 _ => { reply.error(libc::ENOTSUP); return; }
