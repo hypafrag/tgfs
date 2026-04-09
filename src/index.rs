@@ -58,15 +58,23 @@ pub struct Config {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub mount_at: Option<String>,
-    /// If set, expose Saved Messages as a top-level directory of this name.
-    /// Files tagged via Telegram saved-message reaction tags are grouped under
-    /// `<saved_messages>/<tag-name>/`. Untagged files live at the root.
+    /// If set, expose Saved Messages as a top-level directory.
+    /// Use `directory` to set the top-level directory name; `archive_view`
+    /// controls how ZIP archives are exposed (`file|directory|file_and_directory`).
     #[serde(default)]
-    pub saved_messages: Option<String>,
+    pub saved_messages: Option<SavedMessagesConfig>,
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
     #[serde(default)]
     pub channels: Vec<ChannelEntry>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct SavedMessagesConfig {
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default = "default_archive_view")]
+    pub archive_view: ArchiveView,
 }
 
 #[derive(Clone)]

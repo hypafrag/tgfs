@@ -294,7 +294,7 @@ fn entries_for_archive_listing(archive_entry: &FileEntry, channel: &str, trimmed
     listing
 }
 
-fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str) -> Vec<Entry> {
+fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str, archive_view: crate::index::ArchiveView) -> Vec<Entry> {
     use std::collections::BTreeSet;
     let mut seen = BTreeSet::new();
     let mut listing: Vec<Entry> = Vec::new();
@@ -313,6 +313,19 @@ fn entries_for_virtual_dir(files: &[FileEntry], channel: &str, trimmed: &str) ->
         if is_dir {
             listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&combined)), label: format!("{}/", name), size: None });
         } else {
+            // Check for browsable zip inside a virtual directory and expose as directory
+            if let Some(e) = files.iter().find(|x| full_for(x) == combined) {
+                if e.file_type == FileType::Zip && e.archive_entries.is_some() && archive_view != crate::index::ArchiveView::File {
+                    // expose stem as a directory listing
+                    let stem = std::path::Path::new(&e.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name).to_string();
+                    let stem_full = format!("{}/{}", trimmed, stem);
+                    listing.push(Entry { href: format!("/{}/{}/", ch, encode_segments(&stem_full)), label: format!("{}/", stem), size: None });
+                    if archive_view == crate::index::ArchiveView::FileAndDirectory {
+                        listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size: e.size });
+                    }
+                    continue;
+                }
+            }
             let size = files.iter().find(|x| full_for(x) == combined).and_then(|x| x.size);
             listing.push(Entry { href: format!("/{}/{}", ch, encode_segments(&combined)), label: name.to_string(), size });
         }
@@ -372,7 +385,8 @@ pub async fn handle_channel_path(
         }
 
         // Virtual directory listing: list immediate children (dirs and files) under trimmed/
-        let listing = entries_for_virtual_dir(files, &dir, trimmed);
+        let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File);
+        let listing = entries_for_virtual_dir(files, &dir, trimmed, archive_view);
         let title = format!("Index of /{dir}/{trimmed}/");
         return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
     }

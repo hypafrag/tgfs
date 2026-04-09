@@ -117,7 +117,7 @@ pub fn photo_largest_size(p: &grammers_client::media::Photo) -> usize {
 
 fn classify_file_type(type_override: &Option<FileType>, mime_type: &str, doc_name: &str) -> FileType {
     if let Some(t) = type_override { return t.clone(); }
-    if mime_type.starts_with("audio/") || mime_type.starts_with("video/") {
+    if mime_type.starts_with("audio/") || mime_type.starts_with("video/") || mime_type.starts_with("image/") {
         FileType::Media
     } else if mime_type == "application/zip" || doc_name.to_lowercase().ends_with(".zip") {
         FileType::Zip
@@ -574,17 +574,18 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
     // reaction tags are exposed as a directory per tag; untagged files live at the
     // root of the saved_messages directory.
     let mut dir_to_channel = dir_to_channel;
-    if let Some(dir) = &config.saved_messages {
-        if dir_to_channel.contains_key(dir) || index.contains_key(dir) {
+    if let Some(saved_cfg) = &config.saved_messages {
+        let saved_dir = saved_cfg.directory.clone().unwrap_or_else(|| "saved_messages".to_string());
+        if dir_to_channel.contains_key(&saved_dir) || index.contains_key(&saved_dir) {
             return Err(anyhow::anyhow!(
                 "saved_messages directory '{}' collides with a configured channel name",
-                dir
+                saved_dir
             ));
         }
-        match index_saved_messages(&client, &mut mime_map, &mut mime_vec).await {
+        match index_saved_messages(&client, &mut mime_map, &mut mime_vec, &mut zip_cache, saved_cfg.archive_view).await {
             Ok(channel) => {
-                index.insert(dir.clone(), channel);
-                dir_to_channel.insert(dir.clone(), dir.clone());
+                index.insert(saved_dir.clone(), channel);
+                dir_to_channel.insert(saved_dir.clone(), saved_dir.clone());
             }
             Err(e) => eprintln!("failed to index saved messages: {}", e),
         }
@@ -658,6 +659,8 @@ async fn index_saved_messages(
     client: &Client,
     mime_map: &mut HashMap<String, usize>,
     mime_vec: &mut Vec<String>,
+    zip_cache: &mut ZipCache,
+    archive_view: crate::index::ArchiveView,
 ) -> anyhow::Result<TelegramChannel> {
     println!("Indexing Saved Messages...");
 
@@ -730,8 +733,7 @@ async fn index_saved_messages(
                     .to_string();
                 // No `type:`/`name:` overrides in saved messages — classify purely from
                 // the document MIME and filename.
-                // Photos should be treated as media so browsers display them inline.
-                let file_type = FileType::Media;
+                let file_type = classify_file_type(&None, &mime_type, &name);
                 let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
                     mime_vec.push(mime_type.clone());
                     mime_vec.len() - 1
@@ -753,6 +755,11 @@ async fn index_saved_messages(
                 if titles.is_empty() {
                     // Skip entries with empty or placeholder names
                     if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                    let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
+                    let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
+                    if file_type == FileType::Zip && !is_multipart_part {
+                        archive_entries = try_index_zip(&client, &[doc.clone()], &name, zip_cache).await;
+                    }
                     let mtime = msg_mtime(&msg);
                     files.push(FileEntry {
                         name: name.clone(),
@@ -760,7 +767,7 @@ async fn index_saved_messages(
                         parts: smallvec![Media::Document(doc.clone())],
                         size,
                         mime_idx,
-                        archive_entries: None,
+                        archive_entries,
                         file_type: file_type.clone(),
                         mtime,
                     });
@@ -768,6 +775,11 @@ async fn index_saved_messages(
                     for tag in titles {
                         // skip pushing tagged entries with empty names
                         if name.trim().is_empty() || name == "<unnamed>" { continue; }
+                        let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
+                        let is_multipart_part = split_part_suffix(doc.name().unwrap_or("")).is_some();
+                        if file_type == FileType::Zip && !is_multipart_part {
+                            archive_entries = try_index_zip(&client, &[doc.clone()], &name, zip_cache).await;
+                        }
                         let mtime = msg_mtime(&msg);
                         files.push(FileEntry {
                             name: name.clone(),
@@ -775,7 +787,7 @@ async fn index_saved_messages(
                             parts: smallvec![Media::Document(doc.clone())],
                             size,
                             mime_idx,
-                            archive_entries: None,
+                            archive_entries,
                             file_type: file_type.clone(),
                             mtime,
                         });
@@ -887,16 +899,26 @@ async fn index_saved_messages(
         // Representative from first part
         let first = &files[parts_indices[0]];
 
-        let combined = FileEntry {
-            name: exposed_name,
-            path: first.path.clone(),
-            parts: docs,
-            size: total_size,
-            mime_idx: first.mime_idx,
-            archive_entries: None,
-            file_type: first.file_type.clone(),
-            mtime: first.mtime,
-        };
+            let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
+            if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
+                // try_index_zip expects Documents; only attempt if all parts are Documents
+                let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
+                if doc_vec.len() == docs.len() {
+                    println!("Processing saved-message multipart archive: {}", exposed_name);
+                    archive_entries_combined = try_index_zip(&client, &doc_vec, &exposed_name, zip_cache).await;
+                }
+            }
+
+            let combined = FileEntry {
+                name: exposed_name,
+                path: first.path.clone(),
+                parts: docs,
+                size: total_size,
+                mime_idx: first.mime_idx,
+                archive_entries: archive_entries_combined,
+                file_type: first.file_type.clone(),
+                mtime: first.mtime,
+            };
 
         for idx in parts_indices { removed.insert(idx); }
         if combined.name.trim().is_empty() || combined.name == "<unnamed>" {
@@ -915,7 +937,7 @@ async fn index_saved_messages(
     new_files.sort_by_key(|f| f.name.to_lowercase());
 
     Ok(TelegramChannel {
-        archive_view: ArchiveView::File,
+        archive_view,
         skip_deflated_id3v1: false,
         files: new_files,
     })
