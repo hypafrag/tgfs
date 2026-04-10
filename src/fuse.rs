@@ -478,6 +478,15 @@ impl Filesystem for TgfsFS {
             let path = self.path_for_ino(ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
             let deflated = self.is_deflated_entry(ino.0);
             debug!("open ino={} path='{}' fh={} deflated={}", ino, path, fh, deflated);
+            // FOPEN_STREAM: all files are backed by Telegram network requests with
+            // no cheap seeking — hint to the kernel to use sequential read-ahead
+            // and avoid optimisations that assume O(1) random access.
+            //
+            // FOPEN_NONSEEKABLE: deflate-compressed archive entries must be
+            // decompressed from the start; the per-fh DeflateStream state cannot
+            // rewind. Tell the kernel not to issue backward seeks so it never
+            // drives read() to an offset behind the decoder's current position,
+            // which would return EIO.
             let mut flags = FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH | FopenFlags::FOPEN_STREAM;
             if deflated { flags |= FopenFlags::FOPEN_NONSEEKABLE; }
             reply.opened(FileHandle(fh), flags);
