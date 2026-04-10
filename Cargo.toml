@@ -13,7 +13,7 @@ anyhow = "1"
 rpassword = "7"
 serde_yaml = "0.9"
 serde_json = "1.0"
-axum = "0.7"
+axum = "0.8"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 async-compression = { version = "0.4", features = ["tokio", "deflate"] }
@@ -21,8 +21,8 @@ urlencoding = "2"
 bytes = "1"
 mime_guess = "2"
 smallvec = "1"
-fuser = "0.14"
-flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+fuser = "0.17"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"

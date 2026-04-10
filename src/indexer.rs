@@ -8,7 +8,8 @@ use grammers_client::InvocationError;
 use grammers_client::tl;
 use grammers_session::types::PeerRef;
 use log::{debug, error, info, warn};
-use crate::index::{Config, FileEntry, FileType, ArchiveFileEntry, ArchiveView, DocParts, MsgIds, TelegramChannel};
+use crate::config::{Config, ArchiveView};
+use crate::index::{FileEntry, FileType, ArchiveFileEntry, DocParts, MsgIds, TelegramChannel};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
 
@@ -887,7 +888,7 @@ async fn index_saved_messages(
     mime_map: &mut HashMap<String, usize>,
     mime_vec: &mut Vec<String>,
     zip_cache: &mut ZipCache,
-    archive_view: crate::index::ArchiveView,
+    archive_view: crate::config::ArchiveView,
 ) -> anyhow::Result<TelegramChannel> {
     info!("Indexing Saved Messages...");
 

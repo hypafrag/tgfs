@@ -1,3 +1,4 @@
+mod config;
 mod index;
 mod indexer;
 mod server;
@@ -14,16 +15,18 @@ use grammers_session::storages::SqliteSession;
 use log::{error, info, warn};
 use rpassword;
 
+use config::{Config, LogConfig};
 use index::AppState;
 
 /// Initialize the global logger.
 ///
 /// Levels are color-coded (env_logger default palette: ERROR red, WARN yellow,
 /// INFO green, DEBUG blue, TRACE cyan). Default filter is `info`; override
-/// with the `RUST_LOG` env var (e.g. `RUST_LOG=tgfs=debug`).
-fn init_logger() {
+/// with `log:` in `tgfs.yml` or the `RUST_LOG` env var (`RUST_LOG` wins).
+fn init_logger(log: Option<&LogConfig>) {
     use std::io::Write as _;
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    let default_filter = log.map(|l| l.to_filter_string()).unwrap_or_else(|| "info".to_string());
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format(|buf, record| {
             let ts = buf.timestamp_millis();
             let level_style = buf.default_level_style(record.level());
@@ -69,13 +72,13 @@ async fn make_client(api_id: i32, proxy_url: Option<String>) -> anyhow::Result<C
     Ok(Client::new(pool.handle))
 }
 
-async fn setup_proxy(config: &index::Config) -> anyhow::Result<Option<String>> {
+async fn setup_proxy(config: &Config) -> anyhow::Result<Option<String>> {
     let proxy = match &config.proxy {
         Some(p) => p,
         None => return Ok(None),
     };
     match proxy.proxy_type {
-        index::ProxyType::Socks5 => {
+        config::ProxyType::Socks5 => {
             let url = match (&proxy.user, &proxy.password) {
                 (Some(u), Some(p)) => format!("socks5://{}:{}@{}:{}", u, p, proxy.host, proxy.port),
                 _ => format!("socks5://{}:{}", proxy.host, proxy.port),
@@ -83,7 +86,7 @@ async fn setup_proxy(config: &index::Config) -> anyhow::Result<Option<String>> {
             info!("Using SOCKS5 proxy: {}:{}", proxy.host, proxy.port);
             Ok(Some(url))
         }
-        index::ProxyType::Mtproxy => {
+        config::ProxyType::Mtproxy => {
             let secret = proxy.secret.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("MTProxy requires a `secret` field in the proxy config")
             })?;
@@ -96,9 +99,9 @@ async fn setup_proxy(config: &index::Config) -> anyhow::Result<Option<String>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logger();
     let config_path = parse_config_path();
-    let config = index::load_config(&config_path)?;
+    let config = config::load_config(&config_path)?;
+    init_logger(config.log.as_ref());
     if config.http_port.is_none() && config.mount_at.is_none() {
         return Err(anyhow::anyhow!("config must set at least one of `http_port` or `mount_at`"));
     }
@@ -156,14 +159,16 @@ async fn main() -> anyhow::Result<()> {
         let fs = fuse::TgfsFS::new(Arc::clone(&state));
         let mp = mountpoint.clone();
         tokio::task::spawn_blocking(move || {
-            fuser::mount2(fs, mp, &[
-                fuser::MountOption::AllowOther,
+            let mut fuse_config = fuser::Config::default();
+            fuse_config.acl = fuser::SessionACL::All;
+            fuse_config.mount_options = vec![
                 fuser::MountOption::AutoUnmount,
                 fuser::MountOption::RO,
                 // Match the BLKSIZE advertised in fuse.rs so the kernel issues
                 // bigger reads, reducing per-call FUSE event-loop overhead.
                 fuser::MountOption::CUSTOM(format!("max_read={}", fuse::BLKSIZE)),
-            ]).expect("FUSE mount failed");
+            ];
+            fuser::mount2(fs, mp, &fuse_config).expect("FUSE mount failed");
         })
     });
 

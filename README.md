@@ -78,6 +78,51 @@ Single-message documents (not grouped albums) support caption directives:
 - `name: path/to/file.ext` — override the filename and/or place the file under a virtual directory.
 - `type: file|media|zip` — override auto-classification. `media` forces inline playback; `file` forces download; `zip` enables archive indexing.
 
+### Proxy
+
+#### SOCKS5
+
+```yaml
+proxy:
+  host: proxy.example.com
+  port: 1080
+  # optional credentials
+  user: alice
+  password: secret
+```
+
+#### MTProxy
+
+```yaml
+proxy:
+  type: mtproxy
+  host: proxy.example.com
+  port: 443
+  secret: "dd1234567890abcdef1234567890abcdef"
+```
+
+The secret is the hex-encoded 16-byte proxy secret. A `dd` prefix (FakeTLS marker) is accepted and stripped automatically. tgfs starts a local SOCKS5 bridge to the MTProxy server and routes all Telegram traffic through it.
+
+### Logging
+
+The default log level is `info`. Override with a `log:` key in `tgfs.yml`:
+
+```yaml
+# global level
+log: debug
+```
+
+```yaml
+# per-module levels
+log:
+  tgfs: debug
+  grammers_mtsender: warn
+```
+
+Valid levels: `error`, `warn`, `info`, `debug`, `trace`.
+
+The `RUST_LOG` environment variable takes precedence over `log:` when set.
+
 ### `max_fetches_per_pid`
 
 Limits how many concurrent Telegram downloads a single process (PID) may have in-flight through the FUSE mount. When the limit is reached, new `read()` calls block until an in-flight fetch completes. File opens are never blocked.

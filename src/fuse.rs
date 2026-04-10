@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fuser::{FileAttr, FileType as FuseFileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
+use fuser::{FileAttr, FileType as FuseFileType, Filesystem, FopenFlags, FileHandle, INodeNo, Errno, OpenFlags, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen};
 use grammers_client::media::Media;
 use grammers_session::types::PeerRef;
 use log::{debug, error, trace, warn};
@@ -15,14 +15,14 @@ use flate2::read::DeflateDecoder;
 
 fn path_hash(p: &str) -> u64 {
     if p == "/" {
-        return fuser::FUSE_ROOT_ID;
+        return INodeNo::ROOT.0;
     }
     use std::collections::hash_map::DefaultHasher;
     let mut s = DefaultHasher::new();
     p.hash(&mut s);
     let v = s.finish();
     // avoid collisions with root inode and zero
-    if v == 0 || v == fuser::FUSE_ROOT_ID { v.wrapping_add(2) } else { v }
+    if v == 0 || v == INodeNo::ROOT.0 { v.wrapping_add(2) } else { v }
 }
 
 fn full_for(e: &FileEntry) -> String {
@@ -46,7 +46,7 @@ pub const BLKSIZE: u32 = 1024 * 1024;
 
 fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
     FileAttr {
-        ino, size: 0, blocks: 0,
+        ino: INodeNo(ino), size: 0, blocks: 0,
         atime: now, mtime: now, ctime: now, crtime: now,
         kind: FuseFileType::Directory,
         perm: 0o755, nlink: 2,
@@ -58,7 +58,7 @@ fn dir_attr(ino: u64, now: SystemTime) -> FileAttr {
 
 fn file_attr(ino: u64, size: u64, now: SystemTime) -> FileAttr {
     FileAttr {
-        ino, size, blocks: (size + 511) / 512,
+        ino: INodeNo(ino), size, blocks: (size + 511) / 512,
         atime: now, mtime: now, ctime: now, crtime: now,
         kind: FuseFileType::RegularFile,
         perm: 0o444, nlink: 1,
@@ -257,14 +257,7 @@ async fn acquire_owned_with_throttle_log(
     }
 }
 
-pub struct TgfsFS {
-    state: Arc<AppState>,
-    // mappings built at init
-    path_to_attr: HashMap<String, FileAttr>,
-    ino_to_path: HashMap<u64, String>,
-    children: HashMap<String, Vec<String>>,
-    // Captured at construction so blocking FUSE callbacks can drive async ops.
-    rt: Handle,
+struct TgfsFSMutable {
     // Streaming deflate decoders, one per open file handle, keyed by fh.
     // Kept alive between FUSE read chunks so we decompress sequentially
     // rather than re-downloading + re-decompressing from the start each call.
@@ -278,6 +271,19 @@ pub struct TgfsFS {
     /// Per-PID semaphores limiting concurrent Telegram fetches.
     /// Created lazily on first read from a given PID.
     pid_semaphores: HashMap<u32, Arc<tokio::sync::Semaphore>>,
+}
+
+pub struct TgfsFS {
+    state: Arc<AppState>,
+    // mappings built at init
+    path_to_attr: HashMap<String, FileAttr>,
+    ino_to_path: HashMap<u64, String>,
+    children: HashMap<String, Vec<String>>,
+    deflated_paths: std::collections::HashSet<String>,
+    // Captured at construction so blocking FUSE callbacks can drive async ops.
+    rt: Handle,
+    /// Mutable state behind a lock (fuser 0.17+ trait requires &self).
+    inner: Mutex<TgfsFSMutable>,
     /// Maximum concurrent fetches per PID (None = unlimited).
     max_fetches_per_pid: Option<usize>,
 }
@@ -286,6 +292,7 @@ impl TgfsFS {
     pub fn new(state: Arc<AppState>) -> Self {
         let mut path_to_attr: HashMap<String, FileAttr> = HashMap::new();
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut deflated_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let now = SystemTime::now();
 
@@ -348,21 +355,30 @@ impl TgfsFS {
                         let ae_parent = ensure_dirs_along(&mut path_to_attr, &mut children, &arc_dir, ae_parent_rel, now);
                         let file_mtime = f.mtime.unwrap_or(now);
                         add_file(&mut path_to_attr, &mut children, &ae_parent, ae_name, ae.uncompressed_size as u64, ae.unix_mode.unwrap_or(0), file_mtime);
+                        if ae.compression_method == 8 {
+                            deflated_paths.insert(format!("{}/{}", ae_parent, ae_name));
+                        }
                     }
                 }
             }
         }
 
-        let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino, p.clone())).collect();
+        let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino.0, p.clone())).collect();
 
         let max_fetches_per_pid = state.max_fetches_per_pid;
-        Self { state, path_to_attr, ino_to_path, children, rt: Handle::current(), deflate_streams: HashMap::new(), next_fh: 1, pid_semaphores: HashMap::new(), max_fetches_per_pid }
+        let inner = Mutex::new(TgfsFSMutable {
+            deflate_streams: HashMap::new(),
+            next_fh: 1,
+            pid_semaphores: HashMap::new(),
+        });
+        Self { state, path_to_attr, ino_to_path, children, deflated_paths, rt: Handle::current(), inner, max_fetches_per_pid }
     }
 
     /// Get or create the per-PID semaphore. Returns `None` when limiting is disabled.
-    fn pid_semaphore(&mut self, pid: u32) -> Option<Arc<tokio::sync::Semaphore>> {
+    fn pid_semaphore(&self, pid: u32) -> Option<Arc<tokio::sync::Semaphore>> {
         let limit = self.max_fetches_per_pid?;
-        Some(self.pid_semaphores.entry(pid).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit))).clone())
+        let mut inner = self.inner.lock().unwrap();
+        Some(inner.pid_semaphores.entry(pid).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit))).clone())
     }
 
     fn lookup_path(&self, path: &str) -> Option<&FileAttr> {
@@ -375,34 +391,51 @@ impl TgfsFS {
         self.ino_to_path.get(&ino).map(|s| s.as_str())
     }
 
+    /// Returns true if `ino` resolves to a deflate-compressed (method 8) archive entry.
+    fn is_deflated_entry(&self, ino: u64) -> bool {
+        self.ino_to_path.get(&ino).map_or(false, |p| self.deflated_paths.contains(p))
+    }
+
 }
 
 impl Filesystem for TgfsFS {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        let parent_path = match self.path_for_ino(parent) {
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &std::ffi::OsStr, size: u32, reply: fuser::ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.error(Errno::NO_XATTR);
+        }
+    }
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
+        let parent_path = match self.path_for_ino(parent.0) {
             Some(p) => p.to_string(),
-            None => { reply.error(libc::ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let name_str = name.to_string_lossy();
         let target = if parent_path == "/" { format!("/{}", name_str) } else { format!("{}/{}", parent_path, name_str) };
         if let Some(attr) = self.lookup_path(&target) {
-            reply.entry(&ATTR_TTL, attr, 0);
+            reply.entry(&ATTR_TTL, attr, fuser::Generation(0));
         } else {
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.path_for_ino(ino).and_then(|p| self.path_to_attr.get(p)) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.path_for_ino(ino.0).and_then(|p| self.path_to_attr.get(p)) {
             Some(a) => reply.attr(&ATTR_TTL, a),
-            None => reply.error(libc::ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let path = match self.path_for_ino(ino) {
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let path = match self.path_for_ino(ino.0) {
             Some(p) => p.to_string(),
-            None => { reply.error(libc::ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let mut entries: Vec<(u64, FuseFileType, String)> = Vec::new();
         // . and ..
@@ -413,56 +446,63 @@ impl Filesystem for TgfsFS {
             for name in children_vec.iter() {
                 let child_path = if path == "/" { format!("/{}", name) } else { format!("{}/{}", path, name) };
                 if let Some(attr) = self.path_to_attr.get(&child_path) {
-                    entries.push((attr.ino, if attr.kind == FuseFileType::Directory { FuseFileType::Directory } else { FuseFileType::RegularFile }, name.clone()));
+                    entries.push((attr.ino.0, if attr.kind == FuseFileType::Directory { FuseFileType::Directory } else { FuseFileType::RegularFile }, name.clone()));
                 }
             }
         }
 
         for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(ino, (i + 1) as i64, kind, name) { break; }
+            if reply.add(INodeNo(ino), (i + 1) as u64, kind, name) { break; }
         }
         reply.ok();
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let exists = self.path_for_ino(ino)
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let exists = self.path_for_ino(ino.0)
             .and_then(|p| self.path_to_attr.get(p))
             .map_or(false, |a| a.kind == FuseFileType::Directory);
-        if exists { reply.opened(0, 0); } else { reply.error(libc::ENOENT); }
+        if exists { reply.opened(FileHandle(0), FopenFlags::empty()); } else { reply.error(Errno::ENOENT); }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let exists = self.path_for_ino(ino)
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let exists = self.path_for_ino(ino.0)
             .and_then(|p| self.path_to_attr.get(p))
             .map_or(false, |a| a.kind == FuseFileType::RegularFile);
         if exists {
-            let fh = self.next_fh;
-            self.next_fh += 1;
-            let path = self.path_for_ino(ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
-            debug!("open ino={} path='{}' fh={}", ino, path, fh);
-            reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
+            let fh = {
+                let mut inner = self.inner.lock().unwrap();
+                let fh = inner.next_fh;
+                inner.next_fh += 1;
+                fh
+            };
+            let path = self.path_for_ino(ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
+            let deflated = self.is_deflated_entry(ino.0);
+            debug!("open ino={} path='{}' fh={} deflated={}", ino, path, fh, deflated);
+            let mut flags = FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH | FopenFlags::FOPEN_STREAM;
+            if deflated { flags |= FopenFlags::FOPEN_NONSEEKABLE; }
+            reply.opened(FileHandle(fh), flags);
         } else {
-            reply.error(libc::EISDIR);
+            reply.error(Errno::EISDIR);
         }
     }
 
-    fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        let had = self.deflate_streams.remove(&fh).is_some();
+    fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<fuser::LockOwner>, _flush: bool, reply: ReplyEmpty) {
+        let had = self.inner.lock().unwrap().deflate_streams.remove(&fh.0).is_some();
         // Try to resolve path for logging; not strictly required.
-        let path = self.path_for_ino(_ino).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
+        let path = self.path_for_ino(_ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
         debug!("release fh={} ino={} path='{}' had_deflate_stream={}", fh, _ino, path, had);
         reply.ok();
     }
 
-    fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<fuser::LockOwner>, reply: ReplyData) {
         debug!("read enter ino={} fh={} offset={} size={} pid={}", ino, fh, offset, size, _req.pid());
         let pid_sem = self.pid_semaphore(_req.pid());
         // Clone Arc so borrows for `files`/`ae` come from a local — leaving
         // `self` free to mutate `deflate_streams` below without borrow conflict.
         let state = self.state.clone();
-        let path = match self.ino_to_path.get(&ino) {
+        let path = match self.ino_to_path.get(&ino.0) {
             Some(p) => p.clone(),
-            None => { reply.error(libc::ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let ptrim = path.trim_start_matches('/');
         let mut p_iter = ptrim.splitn(2, '/');
@@ -470,11 +510,11 @@ impl Filesystem for TgfsFS {
         let rest = p_iter.next().unwrap_or("");
         let channel = match state.dir_to_channel.get(dir) {
             Some(c) => c.clone(),
-            None => { reply.error(libc::ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let tchan = match state.channels.get(&channel) {
             Some(c) => c,
-            None => { reply.error(libc::ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let channel_peer = tchan.peer;
         let files = &tchan.files;
@@ -489,21 +529,22 @@ impl Filesystem for TgfsFS {
             let state_for_fetch = state.clone();
             let sem = pid_sem.clone();
             let pid = _req.pid();
+            let fh_raw = fh.0;
             debug!("read direct ino={} fh={} parts={} offset={} size={}", ino, fh, parts_docs.len(), offset, size);
             self.rt.spawn(async move {
                 let _permit = match sem {
-                    Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh, "direct").await),
+                    Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "direct").await),
                     None => None,
                 };
-                trace!("read direct fh={} download_range_refresh start", fh);
+                trace!("read direct fh={} download_range_refresh start", fh_raw);
                 match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, offset as usize, size as usize).await {
                     Ok(buf) => {
-                        debug!("read direct fh={} got {} bytes", fh, buf.len());
+                        debug!("read direct fh={} got {} bytes", fh_raw, buf.len());
                         reply.data(&buf);
                     }
                     Err(e) => {
-                        error!("read direct fh={} download error: {:?}", fh, e);
-                        reply.error(libc::EIO);
+                        error!("read direct fh={} download error: {:?}", fh_raw, e);
+                        reply.error(Errno::EIO);
                     }
                 }
             });
@@ -525,22 +566,23 @@ impl Filesystem for TgfsFS {
             };
             let prefix_full = format!("{}/", full);
             let prefix_stem = format!("{}/", stem_full);
-            let inner = if rest.starts_with(&prefix_full) {
+            let inner_path = if rest.starts_with(&prefix_full) {
                 &rest[prefix_full.len()..]
             } else if rest.starts_with(&prefix_stem) {
                 &rest[prefix_stem.len()..]
             } else {
                 continue;
             };
-            let ae = match f.archive_entries.as_ref().unwrap().iter().find(|x| x.path == inner) {
+            let ae = match f.archive_entries.as_ref().unwrap().iter().find(|x| x.path == inner_path) {
                 Some(a) => a,
-                None => { reply.error(libc::ENOENT); return; }
+                None => { reply.error(Errno::ENOENT); return; }
             };
             debug!("read archive entry path='{}' inner='{}' compression={} data_offset={} compressed={} uncompressed={} fh={} offset={} size={}",
-                path, inner, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
+                path, inner_path, ae.compression_method, ae.data_offset, ae.compressed_size, ae.uncompressed_size, fh, offset, size);
             let parts_docs: Vec<Media> = f.parts.iter().cloned().collect();
             let msg_ids: Vec<i32> = f.msg_ids.iter().copied().collect();
             let data_offset = ae.data_offset as usize;
+            let fh_raw = fh.0;
 
             match ae.compression_method {
                 0 => {
@@ -552,12 +594,12 @@ impl Filesystem for TgfsFS {
                     let pid = _req.pid();
                     self.rt.spawn(async move {
                         let _permit = match sem {
-                            Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh, "stored").await),
+                            Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "stored").await),
                             None => None,
                         };
                         match download_range_refresh(&client, &parts_docs, &msg_ids, channel_peer, &state_for_fetch.fresh_docs, off, size as usize).await {
                             Ok(buf) => { trace!("stored entry got {} bytes", buf.len()); reply.data(&buf); }
-                            Err(e) => { error!("stored entry download error: {:?}", e); reply.error(libc::EIO); }
+                            Err(e) => { error!("stored entry download error: {:?}", e); reply.error(Errno::EIO); }
                         }
                     });
                     return;
@@ -577,23 +619,26 @@ impl Filesystem for TgfsFS {
                     // background task so the decoder rarely blocks on network.
                     let state_for_prefetch = state.clone();
                     let rt_clone = self.rt.clone();
-                    let stream = self.deflate_streams.entry(fh).or_insert_with(|| {
-                        let reader = spawn_prefetcher(&rt_clone, state_for_prefetch, parts_docs, msg_ids, channel_peer, data_offset, compressed_size);
-                        Arc::new(Mutex::new(DeflateStream {
-                            decoder: DeflateDecoder::new(reader),
-                            pos: 0,
-                        }))
-                    }).clone();
+                    let stream = {
+                        let mut fs_inner = self.inner.lock().unwrap();
+                        fs_inner.deflate_streams.entry(fh_raw).or_insert_with(|| {
+                            let reader = spawn_prefetcher(&rt_clone, state_for_prefetch, parts_docs, msg_ids, channel_peer, data_offset, compressed_size);
+                            Arc::new(Mutex::new(DeflateStream {
+                                decoder: DeflateDecoder::new(reader),
+                                pos: 0,
+                            }))
+                        }).clone()
+                    };
 
                     let sem = pid_sem.clone();
                     let rt_for_sem = self.rt.clone();
                     let pid = _req.pid();
                     self.rt.spawn_blocking(move || {
                         // Acquire per-PID fetch permit (blocks until a slot is free).
-                        let _permit = sem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh, "deflate")));
+                        let _permit = sem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh_raw, "deflate")));
                         let mut stream = stream.lock().unwrap();
                         trace!("deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
-                            fh, off, sz, stream.pos, uncompressed_size, compressed_size);
+                            fh_raw, off, sz, stream.pos, uncompressed_size, compressed_size);
 
                         // Workaround for players probing for ID3v1 at EOF on deflated inner files.
                         // When enabled per-channel, return zero bytes for small probe reads
@@ -606,7 +651,7 @@ impl Filesystem for TgfsFS {
                             let path_lower = ae_path.to_lowercase();
                             let looks_like_audio = path_lower.ends_with(".mp3") || path_lower.ends_with(".flac");
                             if looks_like_audio && sz == ID3V1_READ_SIZE && stream.pos < MAX_TOTAL_READ && uncompressed_size.saturating_sub(off) < DISTANCE_TO_FILE_END {
-                                debug!("suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae_path, fh, off, stream.pos);
+                                debug!("suppressed ID3v1 probe for channel='{}' inner='{}' fh={} off={} stream_pos={}", channel, ae_path, fh_raw, off, stream.pos);
                                 let zeros = vec![0u8; sz];
                                 reply.data(&zeros);
                                 return;
@@ -623,15 +668,15 @@ impl Filesystem for TgfsFS {
                             while remaining > 0 {
                                 let n = remaining.min(discard.len());
                                 match stream.decoder.read(&mut discard[..n]) {
-                                    Ok(0) => { reply.error(libc::EIO); return; }
+                                    Ok(0) => { reply.error(Errno::EIO); return; }
                                     Ok(r) => { stream.pos += r; remaining -= r; }
-                                    Err(_) => { reply.error(libc::EIO); return; }
+                                    Err(_) => { reply.error(Errno::EIO); return; }
                                 }
                             }
                         } else if off < stream.pos {
                             // Backward seek: impossible to handle without rewinding.
                             error!("deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
-                            reply.error(libc::EIO);
+                            reply.error(Errno::EIO);
                             return;
                         }
 
@@ -642,19 +687,19 @@ impl Filesystem for TgfsFS {
                             match stream.decoder.read(&mut buf[total..]) {
                                 Ok(0) => { trace!("deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
                                 Ok(n) => total += n,
-                                Err(e) => { error!("deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(libc::EIO); return; }
+                                Err(e) => { error!("deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(Errno::EIO); return; }
                             }
                         }
                         stream.pos += total;
-                        trace!("deflate read done fh={} produced={} new_pos={}", fh, total, stream.pos);
+                        trace!("deflate read done fh={} produced={} new_pos={}", fh_raw, total, stream.pos);
                         reply.data(&buf[..total]);
                     });
                     return;
                 }
-                _ => { reply.error(libc::ENOTSUP); return; }
+                _ => { reply.error(Errno::ENOTSUP); return; }
             }
         }
 
-        reply.error(libc::ENOENT);
+        reply.error(Errno::ENOENT);
     }
 }

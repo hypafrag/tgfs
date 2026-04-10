@@ -13,7 +13,7 @@ use tokio::io::BufReader;
 use async_compression::tokio::bufread::DeflateDecoder as AsyncDeflateDecoder;
 use mime_guess::from_path as guess_mime;
 
-use crate::index::{AppState, Entry, dir_listing, FileType, FileEntry, DocParts};
+use crate::index::{AppState, ArchiveView, Entry, dir_listing, FileType, FileEntry, DocParts};
 use crate::indexer::refresh_part_documents;
 use grammers_client::media::{Document, Media};
 use grammers_session::types::PeerRef;
@@ -310,7 +310,7 @@ fn match_archive<'a>(files: &'a [FileEntry], trimmed: &str, allow_exact: bool) -
     None
 }
 
-fn entries_for_root(files: &[FileEntry], channel: &str, archive_view: crate::index::ArchiveView) -> (Vec<Entry>, String) {
+fn entries_for_root(files: &[FileEntry], channel: &str, archive_view: crate::config::ArchiveView) -> (Vec<Entry>, String) {
     use std::collections::BTreeSet;
     let mut dirs: BTreeSet<String> = BTreeSet::new();
     let mut top_files: Vec<&FileEntry> = Vec::new();
@@ -332,7 +332,7 @@ fn entries_for_root(files: &[FileEntry], channel: &str, archive_view: crate::ind
         if f.file_type == FileType::Zip && f.archive_entries.is_some() {
             let stem = std::path::Path::new(&f.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&f.name).to_string();
             entries.push(Entry { href: format!("./{}/", encode_segments(&stem)), label: format!("{}/", stem), size: None, modified: None });
-            if archive_view == crate::index::ArchiveView::FileAndDirectory {
+            if archive_view == ArchiveView::FileAndDirectory {
                 entries.push(Entry { href: format!("./{}", encode_segments(&full)), label: f.name.clone(), size: f.size, modified: f.mtime });
             }
         } else {
@@ -368,7 +368,7 @@ fn entries_for_archive_listing(archive_entry: &FileEntry, _channel: &str, _trimm
     listing
 }
 
-fn entries_for_virtual_dir(files: &[FileEntry], _channel: &str, trimmed: &str, archive_view: crate::index::ArchiveView) -> Vec<Entry> {
+fn entries_for_virtual_dir(files: &[FileEntry], _channel: &str, trimmed: &str, archive_view: crate::config::ArchiveView) -> Vec<Entry> {
     use std::collections::BTreeSet;
     let mut seen = BTreeSet::new();
     let mut listing: Vec<Entry> = Vec::new();
@@ -390,11 +390,11 @@ fn entries_for_virtual_dir(files: &[FileEntry], _channel: &str, trimmed: &str, a
             // browsable-zip-as-directory branch and the plain-file branch.
             let entry = files.iter().find(|x| full_for(x) == combined);
             if let Some(e) = entry {
-                if e.file_type == FileType::Zip && e.archive_entries.is_some() && archive_view != crate::index::ArchiveView::File {
+                if e.file_type == FileType::Zip && e.archive_entries.is_some() && archive_view != ArchiveView::File {
                     // Expose the archive stem as a directory listing.
                     let stem = std::path::Path::new(&e.name).file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name).to_string();
                     listing.push(Entry { href: format!("./{}/", encode_segments(&stem)), label: format!("{}/", stem), size: None, modified: None });
-                    if archive_view == crate::index::ArchiveView::FileAndDirectory {
+                    if archive_view == ArchiveView::FileAndDirectory {
                         listing.push(Entry { href: format!("./{}", encode_segments(name)), label: name.to_string(), size: e.size, modified: e.mtime });
                     }
                     continue;
@@ -448,7 +448,7 @@ pub async fn handle_channel_path(
 
     if is_dir_request {
         if trimmed.is_empty() {
-            let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File);
+            let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File);
             let (entries, title) = entries_for_root(files, &dir, archive_view);
             return html_response(dir_listing(&title, Some("/"), &entries));
         }
@@ -463,7 +463,7 @@ pub async fn handle_channel_path(
         }
 
         // Virtual directory listing: list immediate children (dirs and files) under trimmed/
-        let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File);
+        let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File);
         let listing = entries_for_virtual_dir(files, &dir, trimmed, archive_view);
         let title = format!("Index of /{dir}/{trimmed}");
         return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
@@ -473,7 +473,7 @@ pub async fn handle_channel_path(
     // either a direct file (top-level or at a virtual path) or a file inside an archive
     if let Some(fentry) = files.iter().find(|e| full_for(e) == trimmed) {
         // if zip and archive_view is Directory-only, then we do not offer raw download; return 404
-        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(crate::index::ArchiveView::File) == crate::index::ArchiveView::Directory {
+        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File) == ArchiveView::Directory {
             return Err(StatusCode::NOT_FOUND);
         }
 
@@ -577,8 +577,8 @@ pub async fn handle_channel_path(
 pub fn make_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(handle_root))
-        .route("/:channel", get(handle_channel_root))
-        .route("/:channel/", get(handle_channel_root))
-        .route("/:channel/*path", get(handle_channel_path))
+        .route("/{channel}", get(handle_channel_root))
+        .route("/{channel}/", get(handle_channel_root))
+        .route("/{channel}/{*path}", get(handle_channel_path))
         .with_state(state)
 }
