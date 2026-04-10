@@ -39,10 +39,12 @@ fn default_archive_view() -> ArchiveView {
     ArchiveView::File
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyType {
+    #[default]
     Socks5,
+    Mtproxy,
 }
 
 #[derive(Deserialize)]
@@ -53,8 +55,13 @@ pub struct ProxyConfig {
     pub user: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// Hex-encoded MTProxy secret (16 bytes = 32 hex chars). A leading `dd` prefix is
+    /// accepted and stripped (it marks FakeTLS on the proxy side; the underlying 16-byte
+    /// secret is used for standard obfuscated transport on the client side).
+    #[serde(default)]
+    pub secret: Option<String>,
     #[serde(rename = "type", default)]
-    pub _proxy_type: Option<ProxyType>,
+    pub proxy_type: ProxyType,
 }
 
 #[derive(Deserialize)]

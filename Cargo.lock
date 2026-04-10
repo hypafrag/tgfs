@@ -2156,13 +2156,17 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 name = "tgfs"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-compression",
  "axum",
  "bytes",
+ "crc32fast",
+ "ctr",
  "env_logger",
  "flate2",
  "fuser",
+ "getrandom 0.2.17",
  "grammers-client",
  "grammers-mtsender",
  "grammers-session",
@@ -2173,6 +2177,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "smallvec",
  "tokio",
  "tokio-stream",

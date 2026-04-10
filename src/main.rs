@@ -3,6 +3,7 @@ mod indexer;
 mod server;
 mod fuse;
 mod zip_cache;
+mod mtproxy;
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
@@ -68,11 +69,28 @@ async fn make_client(api_id: i32, proxy_url: Option<String>) -> anyhow::Result<C
     Ok(Client::new(pool.handle))
 }
 
-fn build_proxy_url(config: &index::Config) -> Option<String> {
-    let proxy = config.proxy.as_ref()?;
-    match (&proxy.user, &proxy.password) {
-        (Some(user), Some(pass)) => Some(format!("socks5://{}:{}@{}:{}", user, pass, proxy.host, proxy.port)),
-        _ => Some(format!("socks5://{}:{}", proxy.host, proxy.port)),
+async fn setup_proxy(config: &index::Config) -> anyhow::Result<Option<String>> {
+    let proxy = match &config.proxy {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    match proxy.proxy_type {
+        index::ProxyType::Socks5 => {
+            let url = match (&proxy.user, &proxy.password) {
+                (Some(u), Some(p)) => format!("socks5://{}:{}@{}:{}", u, p, proxy.host, proxy.port),
+                _ => format!("socks5://{}:{}", proxy.host, proxy.port),
+            };
+            info!("Using SOCKS5 proxy: {}:{}", proxy.host, proxy.port);
+            Ok(Some(url))
+        }
+        index::ProxyType::Mtproxy => {
+            let secret = proxy.secret.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("MTProxy requires a `secret` field in the proxy config")
+            })?;
+            let port = mtproxy::start_bridge(&proxy.host, proxy.port, secret).await?;
+            info!("Using MTProxy {}:{} via local bridge on port {port}", proxy.host, proxy.port);
+            Ok(Some(format!("socks5://127.0.0.1:{port}")))
+        }
     }
 }
 
@@ -85,10 +103,7 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("config must set at least one of `http_port` or `mount_at`"));
     }
 
-    let proxy_url = build_proxy_url(&config);
-    if let Some(ref url) = proxy_url {
-        info!("Using proxy: {}", url);
-    }
+    let proxy_url = setup_proxy(&config).await?;
     let mut client = make_client(config.api_id, proxy_url.clone()).await?;
 
     if !client.is_authorized().await? {

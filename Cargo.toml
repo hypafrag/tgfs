@@ -26,3 +26,8 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
+sha2 = "0.10"
+aes = "0.8"
+ctr = "0.9"
+crc32fast = "1"
+getrandom = "0.2"
