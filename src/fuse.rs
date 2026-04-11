@@ -478,21 +478,11 @@ impl Filesystem for TgfsFS {
             let path = self.path_for_ino(ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
             let deflated = self.is_deflated_entry(ino.0);
             debug!("open ino={} path='{}' fh={} deflated={}", ino, path, fh, deflated);
-            // FOPEN_STREAM: all files are network-backed with no cheap seeking —
-            // hint to the kernel to use sequential read-ahead and avoid
-            // optimisations that assume O(1) random access.  Applies to deflated
-            // entries too: they are the most stream-like (decompression must
-            // proceed from the start).
-            //
-            // FOPEN_NONSEEKABLE is intentionally NOT set for deflated entries even
-            // though their DeflateStream cannot rewind. FOPEN_NONSEEKABLE causes
-            // the VFS to treat the fd like a pipe: tools that probe file size via
-            // lseek receive ESPIPE and may conclude the file is empty or fully read
-            // after the first chunk, stopping further read() calls. The sequential
-            // constraint is already enforced in userspace: read() returns EIO on
-            // backward seeks, so the kernel flag is not needed and actively harmful.
-            let flags = FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH | FopenFlags::FOPEN_STREAM;
-            reply.opened(FileHandle(fh), flags);
+            reply.opened(FileHandle(fh), if deflated {
+                FopenFlags::FOPEN_DIRECT_IO
+            } else {
+                FopenFlags::FOPEN_KEEP_CACHE
+            });
         } else {
             reply.error(Errno::EISDIR);
         }
