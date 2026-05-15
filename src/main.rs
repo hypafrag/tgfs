@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         channels,
         dir_to_channel,
         max_fetches_per_pid: config.max_fetches_per_pid,
+        max_fetches_total: config.max_fetches_total,
         fresh_docs: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 

@@ -106,6 +106,9 @@ pub struct Config {
     /// in-flight through the FUSE mount. Extra reads block until a slot opens.
     #[serde(default)]
     pub max_fetches_per_pid: Option<usize>,
+    /// Maximum number of concurrent Telegram fetches across all PIDs combined.
+    #[serde(default)]
+    pub max_fetches_total: Option<usize>,
     #[serde(default)]
     pub channels: Vec<ChannelEntry>,
 }

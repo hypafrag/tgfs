@@ -110,6 +110,8 @@ pub struct AppState {
     pub dir_to_channel: HashMap<String, String>,
     /// Per-PID concurrent fetch limit for FUSE (None = unlimited).
     pub max_fetches_per_pid: Option<usize>,
+    /// Process-wide concurrent fetch limit for FUSE (None = unlimited).
+    pub max_fetches_total: Option<usize>,
     /// Process-wide cache of refreshed `Document`s, keyed by document id.
     /// Populated on `FILE_REFERENCE_EXPIRED` recovery so subsequent reads of
     /// the same file reuse the fresh reference instead of re-fetching the

@@ -134,6 +134,12 @@ const DEFLATE_FETCH_CHUNK: usize = 2 * 1024 * 1024;
 /// background task awaits on `send().await` until the decoder catches up.
 /// Worst-case buffered compressed data ≈ DEFLATE_PREFETCH_DEPTH * DEFLATE_FETCH_CHUNK.
 const DEFLATE_PREFETCH_DEPTH: usize = 4;
+/// Decompressed bytes kept in RAM per open handle to allow backward seeks
+/// without restarting decompression from the beginning of the entry.
+const INFLATE_CACHE_SIZE: usize = 1024 * 1024;
+/// Forward seeks larger than this are rejected with EIO rather than inflating
+/// and discarding a potentially huge amount of compressed data.
+const MAX_FORWARD_SEEK: usize = 32 * 1024 * 1024;
 
 /// `std::io::Read` adapter over a tokio mpsc receiver fed by a background
 /// fetcher task. The decoder calls `read()` from a `spawn_blocking` thread,
@@ -233,8 +239,58 @@ fn spawn_prefetcher(
 /// Per-open-handle state for a deflate-compressed archive entry.
 struct DeflateStream {
     decoder: DeflateDecoder<PrefetchingReader>,
-    /// Byte position in the decompressed output the decoder is currently at.
+    /// Total decompressed bytes consumed from the decoder.
     pos: usize,
+    /// Circular buffer holding the most recent decompressed bytes.
+    /// Invariant: `cache` contains exactly `min(pos, INFLATE_CACHE_SIZE)` bytes,
+    /// covering stream positions `[pos - cache.len(), pos)`.
+    cache: std::collections::VecDeque<u8>,
+    // Fields needed to restart the decoder on seek-to-0.
+    state: Arc<AppState>,
+    parts: Vec<Media>,
+    msg_ids: Vec<i32>,
+    peer: Option<PeerRef>,
+    data_offset: usize,
+    compressed_size: usize,
+}
+
+impl DeflateStream {
+    fn cache_start(&self) -> usize {
+        self.pos - self.cache.len()
+    }
+
+    /// Decompress until `self.pos >= target`, feeding all output into `cache`.
+    /// Returns `Ok(())` on success or EOF (pos may be < target at EOF).
+    fn inflate_to(&mut self, target: usize) -> std::io::Result<()> {
+        use std::io::Read;
+        let mut tmp = vec![0u8; 65536];
+        while self.pos < target {
+            let want = (target - self.pos).min(tmp.len());
+            let n = self.decoder.read(&mut tmp[..want])?;
+            if n == 0 { break; }
+            self.cache.extend(&tmp[..n]);
+            self.pos += n;
+            let excess = self.cache.len().saturating_sub(INFLATE_CACHE_SIZE);
+            if excess > 0 { self.cache.drain(..excess); }
+        }
+        Ok(())
+    }
+
+    /// Discard all state and restart decompression from the beginning of the entry.
+    fn reset(&mut self, rt: &Handle) {
+        let reader = spawn_prefetcher(
+            rt,
+            self.state.clone(),
+            self.parts.clone(),
+            self.msg_ids.clone(),
+            self.peer,
+            self.data_offset,
+            self.compressed_size,
+        );
+        self.decoder = DeflateDecoder::new(reader);
+        self.pos = 0;
+        self.cache.clear();
+    }
 }
 
 /// Try to acquire a permit immediately; if none is available, log that the
@@ -248,8 +304,8 @@ async fn acquire_owned_with_throttle_log(
     match sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            debug!(
-                "throttled by max_fetches_per_pid pid={} fh={} site={} available={} waiting...",
+            warn!(
+                "fetch throttled pid={} fh={} site={} available={} waiting...",
                 pid, fh, site, sem.available_permits()
             );
             sem.acquire_owned().await.expect("semaphore closed")
@@ -286,6 +342,8 @@ pub struct TgfsFS {
     inner: Mutex<TgfsFSMutable>,
     /// Maximum concurrent fetches per PID (None = unlimited).
     max_fetches_per_pid: Option<usize>,
+    /// Process-wide fetch semaphore (None = unlimited).
+    global_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl TgfsFS {
@@ -366,12 +424,13 @@ impl TgfsFS {
         let ino_to_path: HashMap<u64, String> = path_to_attr.iter().map(|(p, a)| (a.ino.0, p.clone())).collect();
 
         let max_fetches_per_pid = state.max_fetches_per_pid;
+        let global_semaphore = state.max_fetches_total.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
         let inner = Mutex::new(TgfsFSMutable {
             deflate_streams: HashMap::new(),
             next_fh: 1,
             pid_semaphores: HashMap::new(),
         });
-        Self { state, path_to_attr, ino_to_path, children, deflated_paths, rt: Handle::current(), inner, max_fetches_per_pid }
+        Self { state, path_to_attr, ino_to_path, children, deflated_paths, rt: Handle::current(), inner, max_fetches_per_pid, global_semaphore }
     }
 
     /// Get or create the per-PID semaphore. Returns `None` when limiting is disabled.
@@ -499,6 +558,7 @@ impl Filesystem for TgfsFS {
     fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<fuser::LockOwner>, reply: ReplyData) {
         debug!("read enter ino={} fh={} offset={} size={} pid={}", ino, fh, offset, size, _req.pid());
         let pid_sem = self.pid_semaphore(_req.pid());
+        let global_sem = self.global_semaphore.clone();
         // Clone Arc so borrows for `files`/`ae` come from a local — leaving
         // `self` free to mutate `deflate_streams` below without borrow conflict.
         let state = self.state.clone();
@@ -530,10 +590,15 @@ impl Filesystem for TgfsFS {
             let client = state.client.clone();
             let state_for_fetch = state.clone();
             let sem = pid_sem.clone();
+            let gsem = global_sem.clone();
             let pid = _req.pid();
             let fh_raw = fh.0;
             debug!("read direct ino={} fh={} parts={} offset={} size={}", ino, fh, parts_docs.len(), offset, size);
             self.rt.spawn(async move {
+                let _permit_total = match gsem {
+                    Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "direct-total").await),
+                    None => None,
+                };
                 let _permit = match sem {
                     Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "direct").await),
                     None => None,
@@ -593,8 +658,13 @@ impl Filesystem for TgfsFS {
                     let client = state.client.clone();
                     let state_for_fetch = state.clone();
                     let sem = pid_sem.clone();
+                    let gsem = global_sem.clone();
                     let pid = _req.pid();
                     self.rt.spawn(async move {
+                        let _permit_total = match gsem {
+                            Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "stored-total").await),
+                            None => None,
+                        };
                         let _permit = match sem {
                             Some(s) => Some(acquire_owned_with_throttle_log(s, pid, fh_raw, "stored").await),
                             None => None,
@@ -624,19 +694,27 @@ impl Filesystem for TgfsFS {
                     let stream = {
                         let mut fs_inner = self.inner.lock().unwrap();
                         fs_inner.deflate_streams.entry(fh_raw).or_insert_with(|| {
-                            let reader = spawn_prefetcher(&rt_clone, state_for_prefetch, parts_docs, msg_ids, channel_peer, data_offset, compressed_size);
+                            let reader = spawn_prefetcher(&rt_clone, state_for_prefetch.clone(), parts_docs.clone(), msg_ids.clone(), channel_peer, data_offset, compressed_size);
                             Arc::new(Mutex::new(DeflateStream {
                                 decoder: DeflateDecoder::new(reader),
                                 pos: 0,
+                                cache: std::collections::VecDeque::new(),
+                                state: state_for_prefetch,
+                                parts: parts_docs,
+                                msg_ids,
+                                peer: channel_peer,
+                                data_offset,
+                                compressed_size,
                             }))
                         }).clone()
                     };
 
                     let sem = pid_sem.clone();
+                    let gsem = global_sem.clone();
                     let rt_for_sem = self.rt.clone();
                     let pid = _req.pid();
                     self.rt.spawn_blocking(move || {
-                        // Acquire per-PID fetch permit (blocks until a slot is free).
+                        let _permit_total = gsem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh_raw, "deflate-total")));
                         let _permit = sem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh_raw, "deflate")));
                         let mut stream = stream.lock().unwrap();
                         trace!("deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
@@ -660,41 +738,63 @@ impl Filesystem for TgfsFS {
                             }
                         }
 
-                        // Skip forward if the kernel jumped ahead (shouldn't happen in
-                        // normal sequential reads; caller should use STORE for random access).
-                        if off > stream.pos {
-                            debug!("deflate skip forward from {} to {} (skip {})", stream.pos, off, off - stream.pos);
-                            use std::io::Read as _;
-                            let mut remaining = off - stream.pos;
-                            let mut discard = vec![0u8; remaining.min(65536)];
-                            while remaining > 0 {
-                                let n = remaining.min(discard.len());
-                                match stream.decoder.read(&mut discard[..n]) {
-                                    Ok(0) => { reply.error(Errno::EIO); return; }
-                                    Ok(r) => { stream.pos += r; remaining -= r; }
-                                    Err(_) => { reply.error(Errno::EIO); return; }
-                                }
+                        // Backward seek beyond the 1 MB cache window: reset and re-inflate
+                        // from the start if the target is within the first 32 MB (same
+                        // tolerance as the forward-seek limit), otherwise return EIO.
+                        if off < stream.cache_start() {
+                            if off < MAX_FORWARD_SEEK {
+                                debug!("deflate backward seek channel='{}' entry='{}' fh={} off={} cache_start={} — resetting and re-inflating",
+                                    channel, ae_path, fh_raw, off, stream.cache_start());
+                                stream.reset(&rt_for_sem);
+                            } else {
+                                error!("deflate BACKWARD SEEK channel='{}' entry='{}' fh={} off={} cache_start={} — beyond first {}MB, returning EIO",
+                                    channel, ae_path, fh_raw, off, stream.cache_start(), MAX_FORWARD_SEEK / (1024 * 1024));
+                                reply.error(Errno::EIO);
+                                return;
                             }
-                        } else if off < stream.pos {
-                            // Backward seek: impossible to handle without rewinding.
-                            error!("deflate BACKWARD SEEK off={} stream.pos={} — returning EIO", off, stream.pos);
+                        }
+
+                        // Forward seek beyond the 32 MB limit.
+                        if off > stream.pos && off - stream.pos > MAX_FORWARD_SEEK {
+                            warn!("deflate FORWARD SEEK too large channel='{}' entry='{}' fh={} off={} stream.pos={} skip={} — returning EIO",
+                                channel, ae_path, fh_raw, off, stream.pos, off - stream.pos);
                             reply.error(Errno::EIO);
                             return;
                         }
 
-                        use std::io::Read as _;
-                        let mut buf = vec![0u8; sz];
-                        let mut total = 0;
-                        while total < sz {
-                            match stream.decoder.read(&mut buf[total..]) {
-                                Ok(0) => { trace!("deflate decoder returned 0 at total={} stream.pos={}", total, stream.pos); break; }
-                                Ok(n) => total += n,
-                                Err(e) => { error!("deflate decoder error: {:?} at total={} stream.pos={}", e, total, stream.pos); reply.error(Errno::EIO); return; }
-                            }
+                        if off > stream.pos {
+                            debug!("deflate skip forward from {} to {} (+{})", stream.pos, off, off - stream.pos);
                         }
-                        stream.pos += total;
-                        trace!("deflate read done fh={} produced={} new_pos={}", fh_raw, total, stream.pos);
-                        reply.data(&buf[..total]);
+
+                        // Inflate until the decoder has produced bytes through off+sz.
+                        // Forward skips and normal sequential reads are handled here;
+                        // all output goes into the cache so later backward seeks can use it.
+                        let target = (off + sz).min(uncompressed_size);
+                        if let Err(e) = stream.inflate_to(target) {
+                            error!("deflate inflate error: {e:?}");
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+
+                        // Serve bytes [off, off+sz) from the cache.
+                        let cache_start = stream.cache_start();
+                        let idx = off.saturating_sub(cache_start);
+                        let available = stream.cache.len().saturating_sub(idx);
+                        let to_serve = sz.min(available);
+                        let (s1, s2) = stream.cache.as_slices();
+                        let mut out = Vec::with_capacity(to_serve);
+                        let end = idx + to_serve;
+                        if end <= s1.len() {
+                            out.extend_from_slice(&s1[idx..end]);
+                        } else if idx >= s1.len() {
+                            let s2_idx = idx - s1.len();
+                            out.extend_from_slice(&s2[s2_idx..s2_idx + to_serve]);
+                        } else {
+                            out.extend_from_slice(&s1[idx..]);
+                            out.extend_from_slice(&s2[..end - s1.len()]);
+                        }
+                        trace!("deflate read done fh={} off={} produced={} new_pos={}", fh_raw, off, out.len(), stream.pos);
+                        reply.data(&out);
                     });
                     return;
                 }

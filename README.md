@@ -133,6 +133,16 @@ max_fetches_per_pid: 3
 
 Omit or leave unset for unlimited concurrency (default).
 
+### `max_fetches_total`
+
+Limits how many concurrent Telegram downloads may be in-flight across **all** processes combined. Complements `max_fetches_per_pid`: the total cap is the outer bound regardless of how many different PIDs are active.
+
+```yaml
+max_fetches_total: 8
+```
+
+Omit or leave unset for unlimited concurrency (default).
+
 ## Docker
 
 A multi-stage `Dockerfile` is provided. The runtime image is based on `debian:bookworm-slim` and contains only the stripped binary plus `ca-certificates` and `libfuse2` — no Rust toolchain or build artifacts.
