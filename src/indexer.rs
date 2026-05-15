@@ -258,11 +258,11 @@ pub async fn download_range(
         let avail = sizes[i].saturating_sub(start_in_part);
         if avail == 0 { i += 1; start_in_part = 0; continue; }
         let read_len = std::cmp::min(avail, need);
-        let doc = match &parts[i] {
-            Media::Document(d) => d,
-            _ => { return Err(anyhow::anyhow!("download_part_range requires a Document, got {:?}", parts[i])); }
+        let part_buf = match &parts[i] {
+            Media::Document(d) => download_part_range(client, d, start_in_part, read_len).await?,
+            Media::Photo(p) => download_part_range_photo(client, p, start_in_part, read_len).await?,
+            _ => return Err(anyhow::anyhow!("download_range: unsupported media type {:?}", parts[i])),
         };
-        let part_buf = download_part_range(client, doc, start_in_part, read_len).await?;
         if part_buf.len() < read_len {
             return Err(anyhow::anyhow!("failed to download requested range"));
         }
@@ -372,6 +372,71 @@ pub async fn download_range_refresh(
 /// the covering chunk range across `PARALLEL_DOWNLOAD_STREAMS` concurrent
 /// `iter_download` streams. Network latency hides behind itself, giving
 /// near-linear speedup up to the underlying connection-pool concurrency.
+async fn download_part_range_photo(
+    client: &Client,
+    photo: &grammers_client::media::Photo,
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if length == 0 { return Ok(Vec::new()); }
+    let first_chunk = offset / TG_CHUNK_SIZE;
+    let last_chunk = (offset + length - 1) / TG_CHUNK_SIZE;
+    let total_chunks = last_chunk - first_chunk + 1;
+    let in_first_chunk = offset % TG_CHUNK_SIZE;
+
+    let n_tasks = std::cmp::min(PARALLEL_DOWNLOAD_STREAMS, total_chunks);
+    let chunks_per_task = total_chunks.div_ceil(n_tasks);
+
+    let mut handles = Vec::with_capacity(n_tasks);
+    for t in 0..n_tasks {
+        let start_chunk = first_chunk + t * chunks_per_task;
+        if start_chunk > last_chunk { break; }
+        let end_chunk = std::cmp::min(first_chunk + (t + 1) * chunks_per_task - 1, last_chunk);
+        let take_n = end_chunk - start_chunk + 1;
+        let photo = photo.clone();
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let mut out: Vec<u8> = Vec::with_capacity(take_n * TG_CHUNK_SIZE);
+            for chunk_idx in 0..take_n {
+                let mut retries = 0u32;
+                loop {
+                    let mut dl = client
+                        .iter_download(&photo)
+                        .chunk_size(TG_CHUNK_SIZE as i32)
+                        .skip_chunks((start_chunk + chunk_idx) as i32);
+                    match dl.next().await {
+                        Ok(Some(chunk)) => { out.extend_from_slice(&chunk); break; }
+                        Ok(None) => break,
+                        Err(grammers_client::InvocationError::Rpc(ref rpc)) if rpc.name == "FLOOD_WAIT" => {
+                            let wait = rpc.value.unwrap_or(1);
+                            retries += 1;
+                            if retries > 5 {
+                                return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("FLOOD_WAIT retry limit exceeded"));
+                            }
+                            warn!("FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
+                            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+                        }
+                        Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
+                    }
+                }
+            }
+            Ok(out)
+        }));
+    }
+
+    let mut combined: Vec<u8> = Vec::with_capacity(total_chunks * TG_CHUNK_SIZE);
+    for h in handles {
+        let part = h.await??;
+        combined.extend_from_slice(&part);
+    }
+
+    if combined.len() <= in_first_chunk {
+        return Err(anyhow::anyhow!("failed to download requested range"));
+    }
+    let end = std::cmp::min(combined.len(), in_first_chunk + length);
+    Ok(combined[in_first_chunk..end].to_vec())
+}
+
 async fn download_part_range(
     client: &Client,
     doc: &Document,
