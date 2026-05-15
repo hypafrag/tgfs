@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
-use grammers_client::media::{Document, Media};
+use grammers_client::media::{Document, Downloadable, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
 use grammers_client::InvocationError;
@@ -368,13 +368,17 @@ pub async fn download_range_refresh(
     }
 }
 
-/// Download `[offset, offset+length)` from a single document part by splitting
-/// the covering chunk range across `PARALLEL_DOWNLOAD_STREAMS` concurrent
-/// `iter_download` streams. Network latency hides behind itself, giving
-/// near-linear speedup up to the underlying connection-pool concurrency.
-async fn download_part_range_photo(
+/// Shared download kernel: fetches [offset, offset+length) from a file identified
+/// by `location` on `file_dc`, using Telegram CDN when the server redirects there.
+///
+/// Each parallel task issues `upload.GetFile` with `cdn_supported = true`. If the
+/// server responds with `FileCdnRedirect`, the task switches to `upload.getCdnFile`
+/// on the CDN DC and decrypts the returned bytes with AES-256-CTR (Ctr128LE, the
+/// counter is the IV treated as a 128-bit LE integer plus the block number).
+async fn download_part_range_inner(
     client: &Client,
-    photo: &grammers_client::media::Photo,
+    file_dc: i32,
+    location: tl::enums::InputFileLocation,
     offset: usize,
     length: usize,
 ) -> anyhow::Result<Vec<u8>> {
@@ -393,32 +397,85 @@ async fn download_part_range_photo(
         if start_chunk > last_chunk { break; }
         let end_chunk = std::cmp::min(first_chunk + (t + 1) * chunks_per_task - 1, last_chunk);
         let take_n = end_chunk - start_chunk + 1;
-        let photo = photo.clone();
+        let location = location.clone();
         let client = client.clone();
         handles.push(tokio::spawn(async move {
             let mut out: Vec<u8> = Vec::with_capacity(take_n * TG_CHUNK_SIZE);
             for chunk_idx in 0..take_n {
+                let chunk_num = start_chunk + chunk_idx;
+                let chunk_off = (chunk_num * TG_CHUNK_SIZE) as i64;
                 let mut retries = 0u32;
-                loop {
-                    let mut dl = client
-                        .iter_download(&photo)
-                        .chunk_size(TG_CHUNK_SIZE as i32)
-                        .skip_chunks((start_chunk + chunk_idx) as i32);
-                    match dl.next().await {
-                        Ok(Some(chunk)) => { out.extend_from_slice(&chunk); break; }
-                        Ok(None) => break,
+                let chunk = loop {
+                    let req = tl::functions::upload::GetFile {
+                        precise: true,
+                        cdn_supported: true,
+                        location: location.clone(),
+                        offset: chunk_off,
+                        limit: TG_CHUNK_SIZE as i32,
+                    };
+                    match client.invoke_in_dc(file_dc, &req).await {
+                        Ok(tl::enums::upload::File::File(f)) => break f.bytes,
+                        Ok(tl::enums::upload::File::CdnRedirect(r)) => {
+                            let enc_key: [u8; 32] = r.encryption_key.try_into()
+                                .map_err(|_| anyhow::anyhow!("CDN key must be 32 bytes"))?;
+                            let enc_iv: [u8; 16] = r.encryption_iv.try_into()
+                                .map_err(|_| anyhow::anyhow!("CDN iv must be 16 bytes"))?;
+                            let cdn_dc = r.dc_id;
+                            let file_token = r.file_token;
+                            let mut cdn_retries = 0u32;
+                            let mut bytes = loop {
+                                let cdn_req = tl::functions::upload::GetCdnFile {
+                                    file_token: file_token.clone(),
+                                    offset: chunk_off,
+                                    limit: TG_CHUNK_SIZE as i32,
+                                };
+                                match client.invoke_in_dc(cdn_dc, &cdn_req).await {
+                                    Ok(tl::enums::upload::CdnFile::File(f)) => break f.bytes,
+                                    Ok(tl::enums::upload::CdnFile::ReuploadNeeded(n)) => {
+                                        let reup = tl::functions::upload::ReuploadCdnFile {
+                                            file_token: file_token.clone(),
+                                            request_token: n.request_token,
+                                        };
+                                        if let Err(e) = client.invoke_in_dc(file_dc, &reup).await {
+                                            warn!("reuploadCdnFile failed: {e:?}");
+                                        }
+                                    }
+                                    Err(grammers_client::InvocationError::Rpc(ref rpc)) if rpc.name == "FLOOD_WAIT" => {
+                                        let wait = rpc.value.unwrap_or(1);
+                                        cdn_retries += 1;
+                                        if cdn_retries > 5 {
+                                            return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("CDN FLOOD_WAIT exceeded"));
+                                        }
+                                        warn!("CDN FLOOD_WAIT {} at chunk {}, retry {}/5", wait, chunk_num, cdn_retries);
+                                        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+                                    }
+                                    Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
+                                }
+                            };
+                            // Decrypt: Ctr128LE (IV as LE-128 counter) seeked to chunk_off.
+                            use aes::cipher::{generic_array::GenericArray, KeyIvInit, StreamCipher, StreamCipherSeek};
+                            #[allow(deprecated)]
+                            let mut cipher = ctr::Ctr128LE::<aes::Aes256>::new(
+                                GenericArray::from_slice(&enc_key),
+                                GenericArray::from_slice(&enc_iv),
+                            );
+                            cipher.seek(chunk_off as u64);
+                            cipher.apply_keystream(&mut bytes);
+                            break bytes;
+                        }
                         Err(grammers_client::InvocationError::Rpc(ref rpc)) if rpc.name == "FLOOD_WAIT" => {
                             let wait = rpc.value.unwrap_or(1);
                             retries += 1;
                             if retries > 5 {
                                 return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("FLOOD_WAIT retry limit exceeded"));
                             }
-                            warn!("FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
+                            warn!("FLOOD_WAIT {} at chunk {}, retry {}/5", wait, chunk_num, retries);
                             tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
                         }
                         Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
                     }
-                }
+                };
+                out.extend_from_slice(&chunk);
             }
             Ok(out)
         }));
@@ -426,8 +483,7 @@ async fn download_part_range_photo(
 
     let mut combined: Vec<u8> = Vec::with_capacity(total_chunks * TG_CHUNK_SIZE);
     for h in handles {
-        let part = h.await??;
-        combined.extend_from_slice(&part);
+        combined.extend_from_slice(&h.await??);
     }
 
     if combined.len() <= in_first_chunk {
@@ -437,70 +493,34 @@ async fn download_part_range_photo(
     Ok(combined[in_first_chunk..end].to_vec())
 }
 
+async fn download_part_range_photo(
+    client: &Client,
+    photo: &grammers_client::media::Photo,
+    offset: usize,
+    length: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let file_dc = match &photo.raw.photo {
+        Some(tl::enums::Photo::Photo(p)) => p.dc_id,
+        _ => return Err(anyhow::anyhow!("photo not available")),
+    };
+    let location = photo.to_raw_input_location()
+        .ok_or_else(|| anyhow::anyhow!("photo not downloadable"))?;
+    download_part_range_inner(client, file_dc, location, offset, length).await
+}
+
 async fn download_part_range(
     client: &Client,
     doc: &Document,
     offset: usize,
     length: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    if length == 0 { return Ok(Vec::new()); }
-    let first_chunk = offset / TG_CHUNK_SIZE;
-    let last_chunk = (offset + length - 1) / TG_CHUNK_SIZE;
-    let total_chunks = last_chunk - first_chunk + 1;
-    let in_first_chunk = offset % TG_CHUNK_SIZE;
-
-    let n_tasks = std::cmp::min(PARALLEL_DOWNLOAD_STREAMS, total_chunks);
-    let chunks_per_task = total_chunks.div_ceil(n_tasks);
-
-    let mut handles = Vec::with_capacity(n_tasks);
-    for t in 0..n_tasks {
-        let start_chunk = first_chunk + t * chunks_per_task;
-        if start_chunk > last_chunk { break; }
-        let end_chunk = std::cmp::min(first_chunk + (t + 1) * chunks_per_task - 1, last_chunk);
-        let take_n = end_chunk - start_chunk + 1;
-        let doc = doc.clone();
-        let client = client.clone();
-        handles.push(tokio::spawn(async move {
-            let mut out: Vec<u8> = Vec::with_capacity(take_n * TG_CHUNK_SIZE);
-            for chunk_idx in 0..take_n {
-                let mut retries = 0u32;
-                loop {
-                    let mut dl = client
-                        .iter_download(&doc)
-                        .chunk_size(TG_CHUNK_SIZE as i32)
-                        .skip_chunks((start_chunk + chunk_idx) as i32);
-                    match dl.next().await {
-                        Ok(Some(chunk)) => { out.extend_from_slice(&chunk); break; }
-                        Ok(None) => break,
-                        Err(grammers_client::InvocationError::Rpc(ref rpc)) if rpc.name == "FLOOD_WAIT" => {
-                            let wait = rpc.value.unwrap_or(1);
-                            retries += 1;
-                            if retries > 5 {
-                                return Err::<Vec<u8>, anyhow::Error>(anyhow::anyhow!("FLOOD_WAIT retry limit exceeded"));
-                            }
-                            warn!("FLOOD_WAIT {} at chunk {}, retry {}/5", wait, start_chunk + chunk_idx, retries);
-                            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
-                        }
-                        Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
-                    }
-                }
-            }
-            Ok(out)
-        }));
-    }
-
-    // Concatenate in order so the returned bytes are contiguous.
-    let mut combined: Vec<u8> = Vec::with_capacity(total_chunks * TG_CHUNK_SIZE);
-    for h in handles {
-        let part = h.await??;
-        combined.extend_from_slice(&part);
-    }
-
-    if combined.len() <= in_first_chunk {
-        return Err(anyhow::anyhow!("failed to download requested range"));
-    }
-    let end = std::cmp::min(combined.len(), in_first_chunk + length);
-    Ok(combined[in_first_chunk..end].to_vec())
+    let file_dc = match &doc.raw.document {
+        Some(tl::enums::Document::Document(d)) => d.dc_id,
+        _ => return Err(anyhow::anyhow!("document not available")),
+    };
+    let location = doc.to_raw_input_location()
+        .ok_or_else(|| anyhow::anyhow!("document not downloadable"))?;
+    download_part_range_inner(client, file_dc, location, offset, length).await
 }
 
 fn find_eocd(tail: &[u8], tail_offset: u64) -> Option<(u64, u64)> {
