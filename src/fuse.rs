@@ -524,10 +524,9 @@ impl Filesystem for TgfsFS {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let exists = self.path_for_ino(ino.0)
-            .and_then(|p| self.path_to_attr.get(p))
-            .map_or(false, |a| a.kind == FuseFileType::RegularFile);
-        if exists {
+        let attr = self.path_for_ino(ino.0).and_then(|p| self.path_to_attr.get(p));
+        let is_file = attr.map_or(false, |a| a.kind == FuseFileType::RegularFile);
+        if is_file {
             let fh = {
                 let mut inner = self.inner.lock().unwrap();
                 let fh = inner.next_fh;
@@ -536,12 +535,19 @@ impl Filesystem for TgfsFS {
             };
             let path = self.path_for_ino(ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
             let deflated = self.is_deflated_entry(ino.0);
-            debug!("open ino={} path='{}' fh={} deflated={}", ino, path, fh, deflated);
-            reply.opened(FileHandle(fh), if deflated {
+            let file_size = attr.map_or(0, |a| a.size);
+            let flags = if deflated && file_size >= MAX_FORWARD_SEEK as u64 {
+                log::info!("open deflated fh={} path='{}' size={} (direct_io, too large to cache)", fh, path, file_size);
                 FopenFlags::FOPEN_DIRECT_IO
             } else {
+                if deflated {
+                    log::info!("open deflated fh={} path='{}' size={} (keep_cache)", fh, path, file_size);
+                }  else {
+                    debug!("open ino={} path='{}' fh={}", ino, path, fh);
+                }
                 FopenFlags::FOPEN_KEEP_CACHE
-            });
+            };
+            reply.opened(FileHandle(fh), flags);
         } else {
             reply.error(Errno::EISDIR);
         }
@@ -549,9 +555,12 @@ impl Filesystem for TgfsFS {
 
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<fuser::LockOwner>, _flush: bool, reply: ReplyEmpty) {
         let had = self.inner.lock().unwrap().deflate_streams.remove(&fh.0).is_some();
-        // Try to resolve path for logging; not strictly required.
         let path = self.path_for_ino(_ino.0).map(|s| s.to_string()).unwrap_or_else(|| "<unknown>".to_string());
-        debug!("release fh={} ino={} path='{}' had_deflate_stream={}", fh, _ino, path, had);
+        if had {
+            log::info!("release deflated fh={} path='{}'", fh, path);
+        } else {
+            debug!("release fh={} ino={} path='{}'", fh, _ino, path);
+        }
         reply.ok();
     }
 
@@ -717,8 +726,8 @@ impl Filesystem for TgfsFS {
                         let _permit_total = gsem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh_raw, "deflate-total")));
                         let _permit = sem.map(|s| rt_for_sem.block_on(acquire_owned_with_throttle_log(s, pid, fh_raw, "deflate")));
                         let mut stream = stream.lock().unwrap();
-                        trace!("deflate read fh={} off={} sz={} stream.pos={} uncompressed={} compressed={}",
-                            fh_raw, off, sz, stream.pos, uncompressed_size, compressed_size);
+                        debug!("deflate read fh={} off={} sz={} stream.pos={} entry='{}'",
+                            fh_raw, off, sz, stream.pos, ae_path);
 
                         // Workaround for players probing for ID3v1 at EOF on deflated inner files.
                         // When enabled per-channel, return zero bytes for small probe reads
@@ -775,6 +784,10 @@ impl Filesystem for TgfsFS {
                             reply.error(Errno::EIO);
                             return;
                         }
+                        if stream.pos < target {
+                            warn!("deflate EOF early fh={} entry='{}' expected pos={} actual pos={} off={} sz={}",
+                                fh_raw, ae_path, target, stream.pos, off, sz);
+                        }
 
                         // Serve bytes [off, off+sz) from the cache.
                         let cache_start = stream.cache_start();
@@ -793,7 +806,11 @@ impl Filesystem for TgfsFS {
                             out.extend_from_slice(&s1[idx..]);
                             out.extend_from_slice(&s2[..end - s1.len()]);
                         }
-                        trace!("deflate read done fh={} off={} produced={} new_pos={}", fh_raw, off, out.len(), stream.pos);
+                        if to_serve < sz && target < uncompressed_size {
+                            warn!("deflate short read fh={} entry='{}' off={} requested={} served={} cache_start={} cache_len={}",
+                                fh_raw, ae_path, off, sz, to_serve, cache_start, stream.cache.len());
+                        }
+                        debug!("deflate read done fh={} entry='{}' off={} served={} stream.pos={}", fh_raw, ae_path, off, out.len(), stream.pos);
                         reply.data(&out);
                     });
                     return;
