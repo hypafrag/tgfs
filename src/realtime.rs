@@ -44,7 +44,9 @@ impl Dispatcher {
             if g.source != ChannelSource::RegularChannel { continue; }
             if let Some(peer) = g.peer {
                 if peer.id.kind() == PeerKind::Channel {
-                    channel_id_to_name.insert(peer.id.bare_id(), name.clone());
+                    if let Some(id) = peer.id.bare_id() {
+                        channel_id_to_name.insert(id, name.clone());
+                    }
                 }
             }
         }
@@ -110,7 +112,8 @@ impl Dispatcher {
 
     fn channel_for_peer(&self, peer_id: PeerId) -> Option<String> {
         if peer_id.kind() != PeerKind::Channel { return None; }
-        self.channel_id_to_name.get(&peer_id.bare_id()).cloned()
+        let id = peer_id.bare_id()?;
+        self.channel_id_to_name.get(&id).cloned()
     }
 
     async fn upsert_message(

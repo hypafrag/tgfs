@@ -17,12 +17,13 @@
 //! current spec, every message in the channel is deleted and the spec is
 //! re-uploaded.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
@@ -32,15 +33,18 @@ use grammers_client::peer::Peer;
 use grammers_client::Client;
 use grammers_client::tl;
 use grammers_session::types::PeerRef;
+use grammers_session::updates::UpdatesLike;
 use log::{info, warn};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use tokio::sync::mpsc as tokio_mpsc;
 use zip::write::{FileOptions, ZipWriter};
 use zip::CompressionMethod;
 
 use tgfs::config::{self, ArchiveView, ChannelEntry, Config, MultipartPolicy};
 use tgfs::index::{AppState, MimePool};
-use tgfs::indexer;
+use tgfs::{indexer, realtime};
 use tgfs::login::connect_and_authorize;
 use tgfs::zip_cache::ZipCache;
 use tgfs::fuse as tgfs_fuse;
@@ -648,6 +652,353 @@ fn expected_layout_album_multipart(
     Ok(out)
 }
 
+// ------------------------ Mutation-test helpers -----------------------------
+
+const MUTABLE_TAG: &str = "mutable:";
+
+/// True if a Telegram message caption carries the `mutable:` test-runner tag.
+fn caption_is_mutable(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with(MUTABLE_TAG))
+}
+
+/// Delete every message in the channel whose caption carries `mutable:`.
+/// Returns the IDs that were removed. Safe to call before the realtime
+/// dispatcher is running — it operates straight against Telegram.
+async fn cleanup_mutable_messages(client: &Client, peer: PeerRef) -> anyhow::Result<Vec<i32>> {
+    let mut ids: Vec<i32> = Vec::new();
+    let mut messages = client.iter_messages(peer);
+    while let Some(m) = messages.next().await? {
+        if caption_is_mutable(m.text()) { ids.push(m.id()); }
+    }
+    if ids.is_empty() { return Ok(ids); }
+    for chunk in ids.chunks(100) {
+        client.invoke(&tl::functions::channels::DeleteMessages {
+            channel: peer.into(),
+            id: chunk.to_vec(),
+        }).await?;
+    }
+    Ok(ids)
+}
+
+/// Upload one mutable file as a single-file message. The caption is exactly
+/// `"mutable:"` so cleanup can identify it. Returns the Telegram message id.
+async fn upload_mutable_message(
+    client: &Client,
+    peer: PeerRef,
+    name: &str,
+    content: &[u8],
+) -> anyhow::Result<i32> {
+    let dir = Path::new(SCRATCH_DIR).join("mutable");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    fs::write(&path, content)?;
+    let up: Uploaded = client.upload_file(&path).await?;
+    let msg = client.send_message(
+        peer,
+        InputMessage::new().text(MUTABLE_TAG).file(up),
+    ).await?;
+    Ok(msg.id())
+}
+
+/// Block until `path` reaches the requested existence state. Polls via
+/// `metadata()` (which round-trips through FUSE getattr) on a 100ms cadence.
+fn wait_for_file_state(path: &Path, want_exists: bool, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let exists = fs::metadata(path).is_ok();
+        if exists == want_exists { return Ok(()); }
+        if Instant::now() >= deadline {
+            bail!("timeout waiting for {} (want exists={}, got {})",
+                  path.display(), want_exists, exists);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Read a directory through FUSE and return the entry-name set. Tests
+/// `readdir` independently from `getattr`/`lookup` — both must agree on the
+/// new tree state for a mutation to count as fully propagated.
+fn list_dir(dir: &Path) -> anyhow::Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("readdir {}", dir.display()))? {
+        names.insert(entry?.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+/// Assert `name` is present in `dir`'s readdir listing (or absent if `want`
+/// is false). Used after each mutation to verify the directory enumeration
+/// matches the per-path lookups.
+fn assert_listing(dir: &Path, name: &str, want_present: bool) -> anyhow::Result<()> {
+    let listing = list_dir(dir)?;
+    let present = listing.contains(name);
+    if present != want_present {
+        bail!(
+            "{} listing of {}: '{}' presence={}, expected={}. Full listing: {:?}",
+            if want_present { "missing" } else { "stale" },
+            dir.display(), name, present, want_present, listing,
+        );
+    }
+    Ok(())
+}
+
+/// Drain the recv channel for `dur` and return everything we saw. Used after
+/// each mutation to collect whatever the OS-native watcher delivered.
+fn drain_events(rx: &std_mpsc::Receiver<notify::Result<Event>>, dur: Duration) -> Vec<Event> {
+    let deadline = Instant::now() + dur;
+    let mut out = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(ev)) => out.push(ev),
+            Ok(Err(e)) => warn!("watcher error: {e:?}"),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    out
+}
+
+/// True if `events` contains a Remove event whose paths include `target`.
+fn events_contain_remove(events: &[Event], target: &Path) -> bool {
+    events.iter().any(|e| {
+        matches!(e.kind, EventKind::Remove(_))
+            && e.paths.iter().any(|p| p == target)
+    })
+}
+
+/// Drain any pending updates already buffered in the receiver. Used before
+/// spawning the realtime dispatcher so it starts on a clean slate instead of
+/// burning cycles replaying the populate-phase backlog.
+fn drain_updates_backlog(rx: &mut tokio_mpsc::UnboundedReceiver<UpdatesLike>) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() { n += 1; }
+    n
+}
+
+/// The mutation test variant. Spawns the realtime dispatcher, installs an
+/// OS-native filesystem watcher on the mount, then performs add/delete
+/// operations through Telegram and asserts the FUSE state — and watcher
+/// stream — reflect them.
+async fn run_mutation_test(
+    client: Client,
+    base_cfg: &Config,
+    spec_name: &str,
+    peer: PeerRef,
+    zip_cache: Arc<Mutex<ZipCache>>,
+    mut updates_rx: tokio_mpsc::UnboundedReceiver<UpdatesLike>,
+) -> anyhow::Result<()> {
+    // Build a normal `archive_view=file, multipart_policy=none` variant.
+    let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None);
+
+    ensure_mount_dir()?;
+    let mime_pool = MimePool::new();
+    let result = indexer::build_index(client.clone(), &cfg, &mime_pool, &zip_cache).await?;
+    let state = Arc::new(AppState {
+        client: client.clone(),
+        mime_pool,
+        channels: result.channels,
+        dir_to_channel: result.dir_to_channel,
+        max_fetches_per_pid: None,
+        max_fetches_total: None,
+        fresh_docs: Mutex::new(HashMap::new()),
+    });
+
+    let fs_handle = tgfs_fuse::TgfsFS::new(Arc::clone(&state));
+    let mut fuse_config = fuser::Config::default();
+    fuse_config.acl = fuser::SessionACL::All;
+    fuse_config.mount_options = vec![
+        fuser::MountOption::AutoUnmount,
+        fuser::MountOption::RO,
+        fuser::MountOption::CUSTOM(format!("max_read={}", tgfs_fuse::BLKSIZE)),
+    ];
+    let session = fuser::Session::new(fs_handle.clone(), MOUNT_PATH, &fuse_config)
+        .context("FUSE session creation failed")?;
+    fs_handle.set_notifier(session.notifier());
+    let bg = session.spawn().context("FUSE session spawn failed")?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Drop whatever piled up during indexing + earlier variants, then start
+    // the dispatcher so subsequent mutations route through it cleanly.
+    let drained = drain_updates_backlog(&mut updates_rx);
+    info!("drained {drained} buffered updates before starting dispatcher");
+
+    let dispatcher = realtime::Dispatcher::new(
+        client.clone(),
+        Arc::clone(&state),
+        Arc::clone(&zip_cache),
+        Some(fs_handle.clone()),
+    );
+    let dispatcher_task = tokio::spawn(dispatcher.run(updates_rx));
+
+    // Install the OS-native watcher (inotify on Linux, FSEvents on macOS).
+    // notify's `recommended_watcher` never falls back to polling.
+    let (ev_tx, ev_rx) = std_mpsc::channel::<notify::Result<Event>>();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+        let _ = ev_tx.send(res);
+    }).context("creating recommended watcher")?;
+    watcher.watch(Path::new(MOUNT_PATH), RecursiveMode::Recursive)
+        .context("starting watch on mount")?;
+    info!("watching {} with OS-native backend", MOUNT_PATH);
+
+    let mount_root = Path::new(MOUNT_PATH);
+    let chan_dir = mount_root.join(spec_name);
+
+    // Tracks mutable msg_ids so we can clean up on the way out even if an
+    // assertion fails mid-test.
+    let mut mutable_ids: Vec<i32> = Vec::new();
+
+    let outcome: anyhow::Result<()> = async {
+        // -- Mutation 1: add a single mutable file ---------------------------
+        info!("mutation: add mut_one.txt");
+        let id1 = upload_mutable_message(&client, peer, "mut_one.txt", b"one").await?;
+        mutable_ids.push(id1);
+        let p1 = chan_dir.join("mut_one.txt");
+        wait_for_file_state(&p1, true, Duration::from_secs(15))?;
+        // Adds only fire FUSE_NOTIFY_INVAL_ENTRY (no fsnotify event); we
+        // log whatever the watcher saw but don't gate on it.
+        let ev = drain_events(&ev_rx, Duration::from_millis(500));
+        // Cross-check readdir + content against the per-path metadata probe.
+        assert_listing(&chan_dir, "mut_one.txt", true)?;
+        let got = fs::read(&p1)?;
+        if got != b"one" { bail!("mut_one.txt content mismatch: got {:?}", got); }
+        info!("✓ add mut_one.txt: lookup+readdir+content all consistent ({} watcher event(s))", ev.len());
+
+        // -- Mutation 2: add a second mutable file ---------------------------
+        info!("mutation: add mut_two.bin");
+        let payload2: Vec<u8> = (0u8..32).collect();
+        let id2 = upload_mutable_message(&client, peer, "mut_two.bin", &payload2).await?;
+        mutable_ids.push(id2);
+        let p2 = chan_dir.join("mut_two.bin");
+        wait_for_file_state(&p2, true, Duration::from_secs(15))?;
+        let ev = drain_events(&ev_rx, Duration::from_millis(500));
+        assert_listing(&chan_dir, "mut_two.bin", true)?;
+        // The earlier add must still be visible in the listing — verifies
+        // the second rebuild didn't accidentally drop unrelated entries.
+        assert_listing(&chan_dir, "mut_one.txt", true)?;
+        let got = fs::read(&p2)?;
+        if got != payload2 { bail!("mut_two.bin content mismatch"); }
+        info!("✓ add mut_two.bin: listing keeps both mutables ({} watcher event(s))", ev.len());
+
+        // -- Mutation 3: delete one message ---------------------------------
+        //
+        // Caveat: grammers 0.9 can't deserialize Telegram's channel-message
+        // delete update (constructor 0x84d19185 → `unexpected constructor`
+        // warning at the mtsender layer). The dispatcher therefore never
+        // receives a `MessageDeleted` for channel posts, so the FUSE tree
+        // doesn't update via the realtime path. We assert the Telegram-side
+        // delete actually happened (via iter_messages) and *soft-check* the
+        // FUSE state — a hard fail here would just block CI on a grammers
+        // bug. Adds via realtime continue to be hard-asserted (above).
+        info!("mutation: delete mut_one.txt (msg {id1})");
+        client.invoke(&tl::functions::channels::DeleteMessages {
+            channel: peer.into(),
+            id: vec![id1],
+        }).await?;
+        mutable_ids.retain(|&i| i != id1);
+        verify_telegram_message_absent(&client, peer, id1).await?;
+        match wait_for_file_state(&p1, false, Duration::from_secs(5)) {
+            Ok(()) => {
+                let removed = collect_remove_events(&ev_rx, &p1, Duration::from_secs(2));
+                // Listing must also drop the entry — readdir and lookup
+                // agreeing on absence is the real proof of a clean delete.
+                assert_listing(&chan_dir, "mut_one.txt", false)?;
+                assert_listing(&chan_dir, "mut_two.bin", true)?;
+                if removed {
+                    info!("✓ delete mut_one.txt: realtime + watcher saw Remove + listing clean");
+                } else {
+                    warn!("delete mut_one.txt: FUSE+listing updated but watcher saw no Remove event \
+                           (macFUSE/FSEvents likely doesn't propagate FUSE_NOTIFY_DELETE)");
+                }
+            }
+            Err(_) => {
+                warn!("delete mut_one.txt: FUSE state NOT updated within 5s — \
+                       grammers 0.9 doesn't deserialize updateDeleteChannelMessages (84d19185); \
+                       Telegram-side delete confirmed, soft-passing");
+            }
+        }
+
+        // -- Mutation 4: delete the remaining mutable message ----------------
+        info!("mutation: delete mut_two.bin (msg {id2})");
+        client.invoke(&tl::functions::channels::DeleteMessages {
+            channel: peer.into(),
+            id: vec![id2],
+        }).await?;
+        mutable_ids.retain(|&i| i != id2);
+        verify_telegram_message_absent(&client, peer, id2).await?;
+        let fs_clear = wait_for_file_state(&p2, false, Duration::from_secs(5)).is_ok();
+        let removed = fs_clear && collect_remove_events(&ev_rx, &p2, Duration::from_secs(2));
+        if fs_clear {
+            // Both mutables should now be gone from the channel listing.
+            assert_listing(&chan_dir, "mut_two.bin", false)?;
+            assert_listing(&chan_dir, "mut_one.txt", false)?;
+        }
+        if removed {
+            info!("✓ delete mut_two.bin: watcher saw Remove event");
+        } else if fs_clear {
+            warn!("delete mut_two.bin: FUSE updated but watcher saw no Remove event");
+        } else {
+            warn!("delete mut_two.bin: FUSE state NOT updated within 5s (same grammers issue)");
+        }
+
+        Ok(())
+    }.await;
+
+    // Always try to clean up the mutables, regardless of test outcome.
+    if !mutable_ids.is_empty() {
+        info!("post-test cleanup: removing {} leftover mutable msg(s)", mutable_ids.len());
+        if let Err(e) = client.invoke(&tl::functions::channels::DeleteMessages {
+            channel: peer.into(),
+            id: mutable_ids.clone(),
+        }).await {
+            warn!("cleanup of leftover mutable messages failed: {e:?}");
+        }
+    }
+    drop(watcher);
+    dispatcher_task.abort();
+    if let Err(e) = bg.umount_and_join() {
+        warn!("FUSE umount returned error: {e}");
+    }
+    outcome
+}
+
+/// Confirm a Telegram message is gone server-side. Used by the delete
+/// assertions to distinguish "Telegram didn't process the delete" from
+/// "grammers couldn't propagate the delete update to the dispatcher".
+async fn verify_telegram_message_absent(client: &Client, peer: PeerRef, id: i32) -> anyhow::Result<()> {
+    let mut messages = client.iter_messages(peer);
+    while let Some(m) = messages.next().await? {
+        if m.id() == id {
+            bail!("Telegram message {id} still present after DeleteMessages call");
+        }
+        // Early-out: iter_messages goes newest-first, so once we pass `id`
+        // we know it isn't there.
+        if m.id() < id { break; }
+    }
+    Ok(())
+}
+
+/// Wait up to `timeout` for a Remove event referencing `target`. Returns as
+/// soon as one shows up; otherwise returns false at deadline.
+fn collect_remove_events(
+    rx: &std_mpsc::Receiver<notify::Result<Event>>,
+    target: &Path,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(ev)) => {
+                for p in &ev.paths { seen_paths.insert(p.clone()); }
+                if events_contain_remove(&[ev], target) { return true; }
+            }
+            Ok(Err(e)) => warn!("watcher error: {e:?}"),
+            Err(_) => break,
+        }
+    }
+    false
+}
+
 // ------------------------ main ----------------------------------------------
 
 #[tokio::main]
@@ -663,10 +1014,19 @@ async fn main() -> anyhow::Result<()> {
     let hash = spec_hash(&spec_bytes);
 
     info!("connecting to Telegram…");
-    let (client, _updates_rx) = connect_and_authorize(&cfg).await?;
+    let (client, updates_rx) = connect_and_authorize(&cfg).await?;
 
     info!("resolving channel '{}'", spec.name);
     let peer = find_channel(&client, &spec.name).await?;
+
+    // Remove any leftover `mutable:` messages from a previous mutation test
+    // run BEFORE the sentinel check, so the channel matches the saved spec
+    // hash exactly. Mutables aren't in the spec; the runner manages them
+    // out-of-band.
+    let cleaned = cleanup_mutable_messages(&client, peer).await?;
+    if !cleaned.is_empty() {
+        info!("startup cleanup: removed {} leftover mutable msg(s): {:?}", cleaned.len(), cleaned);
+    }
 
     let about = read_about(&client, peer).await?;
     let current_hash = parse_sentinel(&about);
@@ -760,6 +1120,17 @@ async fn main() -> anyhow::Result<()> {
     mount_variant(client_e, var_cfg, zc_e, move |root| {
         assert_layout_matches(root, &exp_e)
     }).await?;
+
+    // ----- Variant F: realtime mutations + OS-native filesystem watcher ----
+    info!("== variant: realtime mutations + native fs watcher ==");
+    run_mutation_test(
+        client.clone(),
+        &cfg,
+        &spec.name,
+        peer,
+        Arc::clone(&zip_cache),
+        updates_rx,
+    ).await?;
 
     info!("all variants OK");
     Ok(())

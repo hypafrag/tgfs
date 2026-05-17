@@ -37,10 +37,22 @@ ctr = "0.9"
 crc32fast = "1"
 getrandom = "0.2"
 
+# Until upstream grammers ships a fix for `channels.deleteMessages` not carrying
+# the deleted message IDs through to `UpdateDeleteChannelMessages.messages`,
+# point all grammers crates at the patched fork. The branch is the PR/MR.
+[patch.crates-io]
+grammers-client = { git = "https://codeberg.org/hypafrag/grammers.git", branch = "fix/deleted_messages_notified" }
+grammers-mtsender = { git = "https://codeberg.org/hypafrag/grammers.git", branch = "fix/deleted_messages_notified" }
+grammers-session = { git = "https://codeberg.org/hypafrag/grammers.git", branch = "fix/deleted_messages_notified" }
+grammers-mtproto = { git = "https://codeberg.org/hypafrag/grammers.git", branch = "fix/deleted_messages_notified" }
+grammers-tl-types = { git = "https://codeberg.org/hypafrag/grammers.git", branch = "fix/deleted_messages_notified" }
+
 [dev-dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hex = "0.4"
 base64 = "0.22"
+# FSEvents on macOS / inotify on Linux — native, never polling.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 # The integration test is an example because examples have access to
 # dev-dependencies (regular [[bin]] targets don't). Invoke as:
