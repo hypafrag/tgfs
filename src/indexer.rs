@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, Duration};
 use grammers_client::media::{Document, Downloadable, Media};
 use grammers_client::peer::Peer;
@@ -9,7 +9,10 @@ use grammers_client::tl;
 use grammers_session::types::PeerRef;
 use log::{debug, error, info, warn};
 use crate::config::{Config, ArchiveView};
-use crate::index::{FileEntry, FileType, ArchiveFileEntry, DocParts, MsgIds, TelegramChannel};
+use crate::index::{
+    FileEntry, FileType, ArchiveFileEntry, DocParts, MsgIds, TelegramChannel, RawEntry,
+    MimePool, ChannelSource,
+};
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
 
@@ -34,7 +37,6 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 /// cut at the earliest unmatched `[` or `(` (e.g. `"Into the Breach [010057"`
 /// → `"Into the Breach"`). Returns a &str into the original slice.
 fn trim_prefix_name(s: &str) -> &str {
-    // Find the first position of an unmatched opening bracket/paren.
     let mut bracket_opens: Vec<usize> = Vec::new();
     let mut paren_opens: Vec<usize> = Vec::new();
     for (i, c) in s.char_indices() {
@@ -52,16 +54,9 @@ fn trim_prefix_name(s: &str) -> &str {
     s[..cut].trim_end_matches(|c: char| c.is_whitespace() || c == '_')
 }
 
-/// Collapse files at the same virtual-directory level into sub-directories
-/// when two or more files share a common name prefix of at least `min_len`
-/// characters (after trimming trailing whitespace from the prefix).
-/// Modifies `path` on affected entries in-place; the rest of the server /
-/// FUSE path logic requires no changes.
 fn apply_prefix_collapse(files: &mut Vec<FileEntry>, min_len: usize) {
     if min_len == 0 || files.len() < 2 { return; }
 
-    // Bucket file indices by their current virtual path so we only collapse
-    // files that already live at the same directory level.
     let mut buckets: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for (i, f) in files.iter().enumerate() {
         let key = f.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -72,12 +67,9 @@ fn apply_prefix_collapse(files: &mut Vec<FileEntry>, min_len: usize) {
 
     for (_bucket_key, mut indices) in buckets {
         if indices.len() < 2 { continue; }
-        // Sort indices by lowercase name so adjacent entries share maximum prefix.
         indices.sort_by_key(|&i| files[i].name.to_lowercase());
         let names: Vec<&str> = indices.iter().map(|&i| files[i].name.as_str()).collect();
 
-        // Forward greedy scan: extend a group as long as the accumulated
-        // common prefix of the whole group stays >= min_len bytes.
         let mut start = 0;
         while start + 1 < names.len() {
             let mut prefix_bytes = common_prefix_len(names[start], names[start + 1]);
@@ -89,7 +81,6 @@ fn apply_prefix_collapse(files: &mut Vec<FileEntry>, min_len: usize) {
                 if new_len >= min_len { prefix_bytes = new_len; end += 1; } else { break; }
             }
 
-            // The directory name is the shared prefix, right-trimmed of whitespace.
             let dir_name = trim_prefix_name(&names[start][..prefix_bytes]).to_string();
             if dir_name.len() >= min_len {
                 for &idx in &indices[start..end] {
@@ -128,18 +119,11 @@ fn msg_mtime(msg: &grammers_client::message::Message) -> Option<SystemTime> {
 }
 
 pub fn photo_largest_size(p: &grammers_client::media::Photo) -> usize {
-    // Pick the largest *separately downloadable* variant. Inline thumbnails
-    // (`PhotoCachedSize`/`PhotoPathSize`/`PhotoStrippedSize`/`Empty`) are
-    // embedded in the TL Photo and never returned by `iter_download`, so
-    // including their byte length here would cause a size/stream mismatch
-    // for photos that happen to have only inline variants.
     if let Some(tl::enums::Photo::Photo(inner)) = &p.raw.photo {
         let mut best: usize = 0;
         for sz in inner.sizes.iter() {
             match sz {
                 tl::enums::PhotoSize::Size(s) => best = best.max(s.size as usize),
-                // `Progressive.sizes` is cumulative bytes per encoded layer;
-                // the last entry is the full image.
                 tl::enums::PhotoSize::Progressive(p) => {
                     if let Some(&last) = p.sizes.last() {
                         best = best.max(last as usize);
@@ -165,27 +149,29 @@ fn classify_file_type(type_override: &Option<FileType>, mime_type: &str, doc_nam
 }
 
 pub struct IndexBuildResult {
-    pub mime_vec: Vec<String>,
-    pub channels: HashMap<String, TelegramChannel>,
+    pub channels: HashMap<String, RwLock<TelegramChannel>>,
     pub dir_to_channel: HashMap<String, String>,
 }
 
 /// Fetch and parse the ZIP central directory for `docs` (one or more concatenated parts).
 /// Returns `None` if the archive can't be indexed (no EOCD, download failure, etc.).
-async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &mut ZipCache) -> Option<Vec<ArchiveFileEntry>> {
+async fn try_index_zip(
+    client: &Client,
+    docs: &[Document],
+    label: &str,
+    cache: &Mutex<ZipCache>,
+) -> Option<Vec<ArchiveFileEntry>> {
     let total: usize = docs.iter().map(|d| d.size().unwrap_or(0) as usize).sum();
-    // check cache first
-    // Use the document's original name but strip a trailing multipart
-    // suffix like `.00` so multipart parts map to the same cache key.
     let raw_name = docs.get(0).and_then(|d| d.name()).map(|s| s.to_string()).unwrap_or_else(|| label.to_string());
     let name_key = if let Some((base, _)) = split_part_suffix(&raw_name) { base.to_string() } else { raw_name.clone() };
     let key = ZipCacheKey { name: name_key.clone(), size: total };
-    if let Some(cached) = cache.get(&key) {
-        debug!("zip index cache hit for {} ({} bytes)", key.name, key.size);
-        return Some(cached);
+    {
+        let g = cache.lock().unwrap();
+        if let Some(cached) = g.get(&key) {
+            debug!("zip index cache hit for {} ({} bytes)", key.name, key.size);
+            return Some(cached);
+        }
     }
-    // Wrap once so we can reuse the unified `download_range` instead of
-    // maintaining a near-duplicate `Document`-only variant.
     let media_parts: Vec<Media> = docs.iter().cloned().map(Media::Document).collect();
     debug!("fetching EOCD tail of '{}' for indexing", label);
     let tail_len = std::cmp::min(total, 70_000);
@@ -201,9 +187,6 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
     debug!("central directory at {} ({} bytes)", cd_off, cd_size);
     let cd_bytes = download_range(client, &media_parts, cd_off as usize, cd_size as usize).await.ok()?;
     let (mut ae_list, lh_offsets) = parse_central_directory(&cd_bytes).ok()?;
-    // Fetch each local file header to resolve the true data offset.
-    // The local extra field length can differ from the central directory,
-    // so we must read it — but only once per entry, here at index time.
     for (ae, lh_offset) in ae_list.iter_mut().zip(lh_offsets.iter()) {
         let lh = download_range(client, &media_parts, *lh_offset as usize, 30).await.ok()?;
         if lh.len() < 30 || &lh[0..4] != [0x50, 0x4b, 0x03, 0x04] { return None; }
@@ -212,22 +195,15 @@ async fn try_index_zip(client: &Client, docs: &[Document], label: &str, cache: &
         ae.data_offset = lh_offset + 30 + name_len as u64 + extra_len as u64;
     }
     debug!("zip entries read: {}", ae_list.len());
-    cache.insert(ZipCacheKey { name: name_key, size: total }, ae_list.clone());
+    cache.lock().unwrap().insert(ZipCacheKey { name: name_key, size: total }, ae_list.clone());
     Some(ae_list)
 }
 
 /// Telegram chunk size for `iter_download`. Must be a power of 2; 64 KB is the
 /// standard MTProto chunk granularity.
 const TG_CHUNK_SIZE: usize = 64 * 1024;
-/// How many parallel `iter_download` streams to spawn per `download_part_range`
-/// call. Each stream walks a disjoint slice of contiguous 64 KB chunks. The
-/// `SenderPool` in `make_client` multiplexes these onto its connection pool.
 const PARALLEL_DOWNLOAD_STREAMS: usize = 4;
 
-// Download a byte range [offset, offset+length) from Telegram, spanning one or
-// more concatenated document parts. A single-document file is just a 1-element
-// slice. Used by both the indexer (central-directory parsing, local-header reads)
-// and the server (archive inner-file header reads).
 pub async fn download_range(
     client: &Client,
     parts: &[Media],
@@ -246,7 +222,6 @@ pub async fn download_range(
     if offset >= total { return Ok(Vec::new()); }
     let to_read = std::cmp::min(length, total - offset);
 
-    // locate starting part and in-part offset
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < sizes.len() && pos + sizes[i] <= offset { pos += sizes[i]; i += 1; }
@@ -275,11 +250,6 @@ pub async fn download_range(
     Ok(buf)
 }
 
-/// True if `e` (or any cause in its chain) is a Telegram
-/// `FILE_REFERENCE_EXPIRED` RPC error. References embedded in cached
-/// `Document`s expire after a few hours; the indexer keeps Documents around
-/// for the lifetime of the process, so download paths must be prepared to
-/// refresh on demand.
 pub fn is_file_ref_expired(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
         if let Some(InvocationError::Rpc(rpc)) = cause.downcast_ref::<InvocationError>() {
@@ -289,8 +259,6 @@ pub fn is_file_ref_expired(e: &anyhow::Error) -> bool {
     false
 }
 
-/// Re-fetch the source messages for `msg_ids` from `peer` and extract their
-/// document media. The returned `Document`s carry fresh `file_reference`s.
 pub async fn refresh_part_documents(
     client: &Client,
     peer: PeerRef,
@@ -308,8 +276,6 @@ pub async fn refresh_part_documents(
     Ok(out)
 }
 
-/// Substitute any `Document` parts with fresh copies from `fresh_docs` (keyed
-/// by document id). Photos and uncached docs are passed through unchanged.
 pub fn apply_fresh_docs(parts: &[Media], fresh_docs: &Mutex<HashMap<i64, Document>>) -> Vec<Media> {
     let cache = fresh_docs.lock().unwrap();
     parts
@@ -324,12 +290,6 @@ pub fn apply_fresh_docs(parts: &[Media], fresh_docs: &Mutex<HashMap<i64, Documen
         .collect()
 }
 
-/// `download_range` with `FILE_REFERENCE_EXPIRED` recovery. Looks up fresh
-/// document copies in `fresh_docs` first; on expiry refreshes via
-/// `get_messages_by_id`, populates the cache, and retries once.
-///
-/// Falls back to plain `download_range` (no retry) when no peer is known or
-/// `msg_ids` is misaligned with `parts`.
 pub async fn download_range_refresh(
     client: &Client,
     parts: &[Media],
@@ -368,13 +328,6 @@ pub async fn download_range_refresh(
     }
 }
 
-/// Shared download kernel: fetches [offset, offset+length) from a file identified
-/// by `location` on `file_dc`, using Telegram CDN when the server redirects there.
-///
-/// Each parallel task issues `upload.GetFile` with `cdn_supported = true`. If the
-/// server responds with `FileCdnRedirect`, the task switches to `upload.getCdnFile`
-/// on the CDN DC and decrypts the returned bytes with AES-256-CTR (Ctr128LE, the
-/// counter is the IV treated as a 128-bit LE integer plus the block number).
 async fn download_part_range_inner(
     client: &Client,
     file_dc: i32,
@@ -452,7 +405,6 @@ async fn download_part_range_inner(
                                     Err(e) => return Err::<Vec<u8>, anyhow::Error>(e.into()),
                                 }
                             };
-                            // Decrypt: Ctr128LE (IV as LE-128 counter) seeked to chunk_off.
                             use aes::cipher::{generic_array::GenericArray, KeyIvInit, StreamCipher, StreamCipherSeek};
                             #[allow(deprecated)]
                             let mut cipher = ctr::Ctr128LE::<aes::Aes256>::new(
@@ -529,12 +481,10 @@ fn find_eocd(tail: &[u8], tail_offset: u64) -> Option<(u64, u64)> {
         if &tail[i..i+4] == [0x50,0x4b,0x05,0x06] {
             let cd_size = u32le(tail, i+12) as u64;
             let cd_offset = u32le(tail, i+16) as u64;
-            // If either value is 0xFFFFFFFF, look for ZIP64 EOCD
             if cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
                 if let Some((z64_off, z64_sz)) = find_zip64_eocd(tail, i, tail_offset) {
                     return Some((z64_off, z64_sz));
                 }
-                // ZIP64 lookup failed; the 0xFFFFFFFF values are unusable
                 return None;
             }
             return Some((cd_offset, cd_size));
@@ -543,19 +493,13 @@ fn find_eocd(tail: &[u8], tail_offset: u64) -> Option<(u64, u64)> {
     None
 }
 
-/// Search for the ZIP64 End of Central Directory Locator (20 bytes, immediately
-/// before the standard EOCD) and then read the ZIP64 EOCD record from the tail.
 fn find_zip64_eocd(tail: &[u8], eocd_pos: usize, tail_offset: u64) -> Option<(u64, u64)> {
-    // The ZIP64 EOCD locator is 20 bytes and sits right before the standard EOCD.
     if eocd_pos < 20 { return None; }
     let loc = eocd_pos - 20;
     if &tail[loc..loc+4] != [0x50, 0x4b, 0x06, 0x07] { return None; }
-    // Locator field at offset 8: absolute offset of the ZIP64 EOCD record.
     let zip64_eocd_abs = u64le(tail, loc + 8);
-    // Check if the ZIP64 EOCD record is within our downloaded tail.
     if zip64_eocd_abs < tail_offset { return None; }
     let z64_pos = (zip64_eocd_abs - tail_offset) as usize;
-    // ZIP64 EOCD record is at least 56 bytes.
     if z64_pos + 56 > tail.len() { return None; }
     if &tail[z64_pos..z64_pos+4] != [0x50, 0x4b, 0x06, 0x06] { return None; }
     let cd_size = u64le(tail, z64_pos + 40);
@@ -563,9 +507,6 @@ fn find_zip64_eocd(tail: &[u8], eocd_pos: usize, tail_offset: u64) -> Option<(u6
     Some((cd_offset, cd_size))
 }
 
-/// Returns parsed entries alongside their local header offsets.
-/// `try_index_zip` uses the offsets to fetch each local header once and
-/// compute the true data offset (local extra_len can differ from the CD).
 fn parse_central_directory(cd: &[u8]) -> anyhow::Result<(Vec<ArchiveFileEntry>, Vec<u64>)> {
     let mut i: usize = 0;
     let mut entries = Vec::new();
@@ -585,7 +526,6 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<(Vec<ArchiveFileEntry>, 
         if var_start + name_len > cd.len() { break; }
         let name = String::from_utf8_lossy(&cd[var_start..var_start+name_len]).to_string();
 
-        // Parse ZIP64 extended information extra field if any value is 0xFFFFFFFF
         if uncompressed_size == 0xFFFF_FFFF || compressed_size == 0xFFFF_FFFF || local_header_offset == 0xFFFF_FFFF {
             let extra_start = var_start + name_len;
             let extra_end = std::cmp::min(extra_start + extra_len, cd.len());
@@ -607,7 +547,7 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<(Vec<ArchiveFileEntry>, 
             path: name,
             compressed_size: compressed_size as usize,
             uncompressed_size: uncompressed_size as usize,
-            data_offset: 0, // filled in by try_index_zip after fetching local headers
+            data_offset: 0,
             compression_method,
             unix_mode,
         });
@@ -615,9 +555,6 @@ fn parse_central_directory(cd: &[u8]) -> anyhow::Result<(Vec<ArchiveFileEntry>, 
     Ok((entries, lh_offsets))
 }
 
-/// Parse ZIP64 extended information extra field (tag 0x0001). Values appear in
-/// order: uncompressed_size, compressed_size, local_header_offset, disk_number —
-/// but only for fields whose standard-header value is 0xFFFFFFFF.
 fn parse_zip64_extra(extra: &[u8], uncompressed: &mut u64, compressed: &mut u64, header_offset: &mut u64) {
     let mut pos = 0;
     while pos + 4 <= extra.len() {
@@ -663,8 +600,198 @@ fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<File
     }
 }
 
-pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<IndexBuildResult> {
-    let mut channel_peers = HashMap::new();
+/// Distill a single Telegram message into a `RawEntry`. Returns `None` for
+/// non-media messages or those with empty/placeholder names. Used at both
+/// startup-indexing time and by the realtime dispatcher.
+///
+/// For single-message zip files this also fetches the ZIP central directory
+/// when `archive_view` requires browsable inner entries. Multipart zips have
+/// to be indexed at assembly time, where the concatenated part list is known.
+pub async fn message_to_raw_entry(
+    client: &Client,
+    msg: &grammers_client::message::Message,
+    archive_view: ArchiveView,
+    mime_pool: &MimePool,
+    zip_cache: &Mutex<ZipCache>,
+) -> Option<RawEntry> {
+    match msg.media() {
+        Some(Media::Document(doc)) => {
+            let raw_name = message_field(msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string());
+            let (file_name, _path_opt) = split_name(&raw_name);
+            if file_name.trim().is_empty() || file_name == "<unnamed>" { return None; }
+            let size = doc.size().map(|s| s as usize);
+            let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
+            let type_override = resolve_type_override(msg);
+            let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
+            let archive_entries = if final_type == FileType::Zip && archive_view != ArchiveView::File {
+                try_index_zip(client, &[doc.clone()], &file_name, zip_cache).await
+            } else {
+                None
+            };
+            let mime_idx = mime_pool.intern(&mime_type);
+            let mtime = msg_mtime(msg);
+            let doc_name = doc.name().map(|s| s.to_string());
+            Some(RawEntry {
+                msg_id: msg.id(),
+                media: Media::Document(doc),
+                raw_name,
+                doc_name,
+                size,
+                mime_idx,
+                mtime,
+                type_override,
+                mime_type,
+                archive_entries,
+            })
+        }
+        Some(Media::Photo(photo)) => {
+            let raw_name = message_field(msg, "name:").unwrap_or_else(|| format!("photo_{}.jpg", photo.id()));
+            let (file_name, _path_opt) = split_name(&raw_name);
+            if file_name.trim().is_empty() || file_name == "<unnamed>" { return None; }
+            let size = Some(photo_largest_size(&photo));
+            let mime_type = "image/jpeg".to_string();
+            let type_override = resolve_type_override(msg);
+            let mime_idx = mime_pool.intern(&mime_type);
+            let mtime = msg_mtime(msg);
+            Some(RawEntry {
+                msg_id: msg.id(),
+                media: Media::Photo(photo),
+                raw_name,
+                doc_name: None,
+                size,
+                mime_idx,
+                mtime,
+                type_override,
+                mime_type,
+                archive_entries: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Materialize a `RawEntry` into the (pre-grouping) `FileEntry` that one
+/// message produces. The assembler runs this for every raw entry, then fuses
+/// multipart parts together.
+fn raw_entry_to_file(rec: &RawEntry) -> FileEntry {
+    let (file_name, path_opt) = split_name(&rec.raw_name);
+    let doc_name_for_classify = rec.doc_name.as_deref().unwrap_or(&file_name);
+    let file_type = classify_file_type(&rec.type_override, &rec.mime_type, doc_name_for_classify);
+    FileEntry {
+        name: file_name,
+        path: path_opt,
+        parts: smallvec![rec.media.clone()],
+        msg_ids: smallvec![rec.msg_id],
+        size: rec.size,
+        mime_idx: rec.mime_idx,
+        archive_entries: rec.archive_entries.clone(),
+        file_type,
+        mtime: rec.mtime,
+    }
+}
+
+/// Assemble the public `FileEntry` list for a channel from its per-message
+/// `RawEntry` map. Runs multipart grouping, fetches ZIP indexes for multipart
+/// archives, sorts, and applies prefix collapse.
+pub async fn assemble_channel_files(
+    client: &Client,
+    raw_entries: &HashMap<i32, RawEntry>,
+    archive_view: ArchiveView,
+    collapse_by_prefix: Option<usize>,
+    zip_cache: &Mutex<ZipCache>,
+) -> Vec<FileEntry> {
+    let mut files: Vec<FileEntry> = raw_entries.values().map(raw_entry_to_file).collect();
+
+    // Detect multipart files by inspecting the document filename (not message overrides).
+    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        if let Some((base, part)) = split_part_suffix(f.doc_name()) {
+            groups.entry(base.to_string()).or_default().push((i, part));
+        }
+    }
+
+    let mut removed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+    for (base, mut entries) in groups.into_iter() {
+        if entries.len() < 2 { continue; }
+        entries.sort_by_key(|&(_, p)| p);
+        if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
+
+        let mut docs: DocParts = DocParts::new();
+        let mut combined_msg_ids: MsgIds = MsgIds::new();
+        let mut total_size: Option<usize> = Some(0);
+        let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
+        for idx in &parts_indices {
+            let f = &files[*idx];
+            docs.extend(f.parts.iter().cloned());
+            combined_msg_ids.extend(f.msg_ids.iter().copied());
+            match (total_size, f.size) {
+                (Some(acc), Some(s)) => total_size = Some(acc + s),
+                _ => total_size = None,
+            }
+        }
+
+        let mut exposed_name = base.clone();
+        if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
+            let f0 = &files[*first_idx];
+            let doc_name = f0.doc_name().to_string();
+            if f0.name != doc_name { exposed_name = f0.name.clone(); }
+        }
+
+        let first = &files[parts_indices[0]];
+
+        let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
+        if base.to_lowercase().ends_with(".zip")
+            && archive_view != ArchiveView::File
+            && !docs.is_empty()
+        {
+            let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
+            if doc_vec.len() == docs.len() {
+                debug!("Processing multipart archive: {}", exposed_name);
+                archive_entries_combined = try_index_zip(client, &doc_vec, &exposed_name, zip_cache).await;
+            }
+        }
+
+        let combined_file_type = first.file_type.clone();
+        let (exposed_base, exposed_path) = split_name(&exposed_name);
+
+        let combined = FileEntry {
+            name: exposed_base,
+            path: exposed_path,
+            parts: docs,
+            msg_ids: combined_msg_ids,
+            size: total_size,
+            mime_idx: first.mime_idx,
+            archive_entries: archive_entries_combined,
+            file_type: combined_file_type,
+            mtime: first.mtime,
+        };
+
+        for idx in parts_indices { removed.insert(idx); }
+        if combined.name.trim().is_empty() || combined.name == "<unnamed>" { continue; }
+        new_files.push(combined);
+    }
+
+    for (i, f) in files.drain(..).enumerate() {
+        if removed.contains(&i) { continue; }
+        if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
+        new_files.push(f);
+    }
+
+    new_files.sort_by_key(|f| f.name.to_lowercase());
+    if let Some(min_len) = collapse_by_prefix {
+        apply_prefix_collapse(&mut new_files, min_len);
+    }
+    new_files
+}
+
+pub async fn build_index(
+    client: Client,
+    config: &Config,
+    mime_pool: &MimePool,
+    zip_cache: &Mutex<ZipCache>,
+) -> anyhow::Result<IndexBuildResult> {
+    let mut channel_peers: HashMap<String, PeerRef> = HashMap::new();
     let mut dialogs = client.iter_dialogs();
     while let Some(dialog) = dialogs.next().await? {
         if let Peer::Channel(ch) = dialog.peer() {
@@ -676,18 +803,11 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         }
     }
 
-    // MIME interning structures
-    let mut mime_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut mime_vec: Vec<String> = Vec::new();
-    // build channel -> TelegramChannel map (files populated later)
-    let mut index: HashMap<String, TelegramChannel> = HashMap::new();
+    let mut index: HashMap<String, RwLock<TelegramChannel>> = HashMap::new();
     let mut dir_to_channel: HashMap<String, String> = config.channels.iter().map(|c| {
         let dir = c.directory.clone().unwrap_or_else(|| c.name.clone());
         (dir, c.name.clone())
     }).collect();
-
-    // load persistent zip index cache (keyed by document original name + total size)
-    let mut zip_cache = ZipCache::load("zip_index_cache.json.gz");
 
     for entry in &config.channels {
         let name = &entry.name;
@@ -697,172 +817,33 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
         };
 
         info!("Indexing {name}...");
-        let mut files = Vec::new();
+        let mut raw_entries: HashMap<i32, RawEntry> = HashMap::new();
         let mut messages = client.iter_messages(peer_ref);
         let mut processed_msgs: usize = 0;
         while let Some(msg) = messages.next().await? {
             processed_msgs += 1;
-            match msg.media() {
-                Some(Media::Document(doc)) => {
-                    let raw_name = message_field(&msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string());
-                    // parse out optional path prefix from message `name:` override
-                    let (file_name, path_opt) = split_name(&raw_name);
-                    let type_override = resolve_type_override(&msg);
-                    // Skip entries with empty or placeholder names
-                    if file_name.trim().is_empty() || file_name == "<unnamed>" {
-                        continue;
-                    }
-                    debug!("Processing file: {}", file_name);
-                    let size = doc.size();
-                    let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
-                    // Determine the final `file_type` for this entry. Preference order:
-                    // 1) explicit `type:` override in the message,
-                    // 2) MIME/type (audio/video => media, application/zip => zip),
-                    // 3) document filename extension (using the underlying
-                    //    `Document` name, not a `name:` override).
-                    let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
-                    // Multipart parts (`*.NN`) are classified as `File` (the
-                    // part name doesn't end in `.zip`), so this branch is
-                    // naturally skipped for them — no extra guard needed.
-                    let mut archive_entries: Option<Vec<ArchiveFileEntry>> = None;
-                    if final_type == FileType::Zip && entry.archive_view != ArchiveView::File {
-                        archive_entries = try_index_zip(&client, &[doc.clone()], &file_name, &mut zip_cache).await;
-                    }
-                    // intern mime_type
-                    let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                    let mtime = msg_mtime(&msg);
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Document(doc.clone())], msg_ids: smallvec![msg.id()], size, mime_idx, archive_entries, file_type: final_type.clone(), mtime });
-                }
-                Some(Media::Photo(photo)) => {
-                    // Photos: expose as files. Use `name:` override if present, otherwise synthesize a filename.
-                    let raw_name = message_field(&msg, "name:").unwrap_or_else(|| format!("photo_{}.jpg", photo.id()));
-                    let (file_name, path_opt) = split_name(&raw_name);
-                    let type_override = resolve_type_override(&msg);
-                    // Skip entries with empty or placeholder names
-                    if file_name.trim().is_empty() || file_name == "<unnamed>" {
-                        continue;
-                    }
-                    debug!("Processing photo: {}", file_name);
-                    let size = Some(photo_largest_size(&photo));
-                    let mime_type = "image/jpeg".to_string();
-                    let final_type = classify_file_type(&type_override, &mime_type, &file_name);
-                    let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| { mime_vec.push(mime_type.clone()); mime_vec.len() - 1 });
-                    let mtime = msg_mtime(&msg);
-                    files.push(FileEntry { name: file_name, path: path_opt, parts: smallvec![Media::Photo(photo.clone())], msg_ids: smallvec![msg.id()], size, mime_idx, archive_entries: None, file_type: final_type, mtime });
-                }
-                _ => {}
+            if let Some(raw) = message_to_raw_entry(&client, &msg, entry.archive_view, mime_pool, zip_cache).await {
+                raw_entries.insert(raw.msg_id, raw);
             }
         }
         info!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
-        debug!("{} files (pre-group)", files.len());
+        debug!("{} raw entries", raw_entries.len());
 
-        // Detect multipart files by inspecting the document filename (not message overrides).
-        // Pattern: <base>.<N digits> e.g. foo.00, foo.01, ... Numbering must start at 0
-        // and be contiguous.
-        let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
-        for (i, f) in files.iter().enumerate() {
-            if let Some((base, part)) = split_part_suffix(f.doc_name()) {
-                groups.entry(base.to_string()).or_default().push((i, part));
-            }
-        }
+        let files = assemble_channel_files(&client, &raw_entries, entry.archive_view, entry.collapse_by_prefix, zip_cache).await;
+        info!("{} files (post-assembly)", files.len());
 
-        // Build new files vector merging detected groups of >= 2 parts
-        let mut removed = std::collections::BTreeSet::new();
-        let mut new_files: Vec<FileEntry> = Vec::new();
-        for (base, mut entries) in groups.into_iter() {
-            if entries.len() < 2 { continue; }
-            entries.sort_by_key(|&(_, p)| p);
-            if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
-            // collect docs and sizes
-            let mut docs: DocParts = DocParts::new();
-            let mut combined_msg_ids: MsgIds = MsgIds::new();
-            let mut total_size: Option<usize> = Some(0);
-            let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
-            for idx in &parts_indices {
-                let f = &files[*idx];
-                docs.extend(f.parts.iter().cloned());
-                combined_msg_ids.extend(f.msg_ids.iter().copied());
-                match (total_size, f.size) {
-                    (Some(acc), Some(s)) => total_size = Some(acc + s),
-                    _ => total_size = None,
-                }
-            }
-
-            // Determine exposed name: if the .00 part (part 0) has a message override name, use it.
-            // Otherwise use the doc-derived base name.
-            let mut exposed_name = base.clone();
-            // find index with part == 0
-                if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
-                let f0 = &files[*first_idx];
-                let doc_name = f0.doc_name().to_string();
-                if f0.name != doc_name { // message override present
-                    exposed_name = f0.name.clone();
-                }
-            }
-
-            // Build a combined FileEntry using the first part as representative
-            let first = &files[parts_indices[0]];
-            // If the base name looks like a .zip, attempt to parse its central directory
-            // across the concatenated parts so we can expose inner entries.
-            let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
-            if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
-                // try_index_zip expects Documents; only attempt if all parts are Documents
-                let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
-                if doc_vec.len() == docs.len() {
-                    debug!("Processing multipart archive: {}", exposed_name);
-                    archive_entries_combined = try_index_zip(&client, &doc_vec, &exposed_name, &mut zip_cache).await;
-                }
-            }
-
-            // Determine combined file_type: prefer the first part's resolved file_type.
-            let combined_file_type = first.file_type.clone();
-
-            // For combined entries the `exposed_name` may include a path.
-            let (exposed_base, exposed_path) = split_name(&exposed_name);
-
-            let combined = FileEntry {
-                name: exposed_base,
-                path: exposed_path,
-                parts: docs,
-                msg_ids: combined_msg_ids,
-                size: total_size,
-                mime_idx: first.mime_idx,
-                archive_entries: archive_entries_combined,
-                file_type: combined_file_type,
-                mtime: first.mtime,
-            };
-
-            // mark removed indices
-            for idx in parts_indices { removed.insert(idx); }
-            // Skip combined entries with empty or placeholder names
-            if combined.name.trim().is_empty() || combined.name == "<unnamed>" {
-                continue;
-            }
-            new_files.push(combined);
-        }
-
-        // Append non-removed original entries
-        for (i, f) in files.into_iter().enumerate() {
-            if removed.contains(&i) { continue; }
-            if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
-            new_files.push(f);
-        }
-
-        // sort files by exposed name
-        new_files.sort_by_key(|f| f.name.to_lowercase());
-        info!("{} files (post-group)", new_files.len());
-        // collapse files sharing a common name prefix into virtual subdirectories
-        if let Some(min_len) = entry.collapse_by_prefix {
-            apply_prefix_collapse(&mut new_files, min_len);
-        }
-        // create TelegramChannel and insert
-        let tchan = TelegramChannel { archive_view: entry.archive_view, skip_deflated_id3v1: entry.skip_deflated_id3v1, files: new_files, peer: Some(peer_ref) };
-        index.insert(name.clone(), tchan);
+        let tchan = TelegramChannel {
+            archive_view: entry.archive_view,
+            skip_deflated_id3v1: entry.skip_deflated_id3v1,
+            collapse_by_prefix: entry.collapse_by_prefix,
+            files: Arc::new(files),
+            raw_entries,
+            peer: Some(peer_ref),
+            source: ChannelSource::RegularChannel,
+        };
+        index.insert(name.clone(), RwLock::new(tchan));
     }
 
-    // Index Saved Messages if configured. Files tagged via Telegram saved-message
-    // reaction tags are exposed as a directory per tag; untagged files live at the
-    // root of the saved_messages directory.
     if let Some(saved_cfg) = &config.saved_messages {
         let saved_dir = saved_cfg.directory.clone().unwrap_or_else(|| "saved_messages".to_string());
         if dir_to_channel.contains_key(&saved_dir) || index.contains_key(&saved_dir) {
@@ -871,26 +852,18 @@ pub async fn build_index(client: Client, config: &Config) -> anyhow::Result<Inde
                 saved_dir
             ));
         }
-        match index_saved_messages(&client, &mut mime_map, &mut mime_vec, &mut zip_cache, saved_cfg.archive_view).await {
+        match index_saved_messages(&client, mime_pool, zip_cache, saved_cfg.archive_view).await {
             Ok(channel) => {
-                index.insert(saved_dir.clone(), channel);
+                index.insert(saved_dir.clone(), RwLock::new(channel));
                 dir_to_channel.insert(saved_dir.clone(), saved_dir.clone());
             }
             Err(e) => error!("failed to index saved messages: {}", e),
         }
     }
 
-    // Persist the zip index cache once after the full index is built.
-    if let Err(e) = zip_cache.save() {
-        error!("failed to save zip cache: {}", e);
-    }
-
-    Ok(IndexBuildResult { mime_vec, channels: index, dir_to_channel })
+    Ok(IndexBuildResult { channels: index, dir_to_channel })
 }
 
-/// Hashable key derived from a Reaction so we can map reactions to their
-/// saved-tag titles. The Reaction enum itself is generated without `Hash`,
-/// so we project the discriminating fields ourselves.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 enum ReactionKey {
     Emoji(String),
@@ -906,9 +879,6 @@ fn reaction_key(r: &tl::enums::Reaction) -> ReactionKey {
     }
 }
 
-/// Fallback display label for a reaction that has no title set on its
-/// `messages.SavedReactionTags` entry — use the emoji glyph itself, or
-/// `custom_<id>` for custom-emoji tags.
 fn reaction_label(r: &tl::enums::Reaction) -> String {
     match r {
         tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
@@ -917,12 +887,6 @@ fn reaction_label(r: &tl::enums::Reaction) -> String {
     }
 }
 
-/// Walk a message's reactions and resolve which ones map to a known
-/// saved-reaction tag title. Avoids materialising an intermediate
-/// `Vec<Reaction>` for messages that have no reactions at all (the common
-/// case in Saved Messages). The `if let` over `ReactionCount` is currently
-/// irrefutable but kept that way so a future TL variant doesn't break the
-/// build — hence the `#[allow]`.
 #[allow(irrefutable_let_patterns)]
 fn extract_tag_titles(
     msg: &grammers_client::message::Message,
@@ -943,9 +907,6 @@ fn extract_tag_titles(
     out
 }
 
-/// Compact per-message record built during the saved-messages stream pass.
-/// We keep just enough to emit `FileEntry` rows in the second pass without
-/// holding raw `Message` objects around (which carry text, peer info, etc.).
 struct SavedRecord {
     media: Media,
     msg_id: i32,
@@ -956,38 +917,23 @@ struct SavedRecord {
     archive_entries: Option<Vec<ArchiveFileEntry>>,
     mtime: Option<SystemTime>,
     grouped_id: Option<i64>,
-    /// Tag titles resolved from this individual message's own reactions.
-    /// For grouped (album) messages this is ignored at emit time; we use
-    /// the per-`grouped_id` union instead so a tag applied to any single
-    /// part fans the whole album out under that tag.
     own_tag_titles: Vec<String>,
 }
 
-/// Index the user's Saved Messages dialog. Each document/photo message becomes
-/// one or more `FileEntry` rows: untagged files at the root, tagged files
-/// fanned out under one virtual directory per matching saved reaction tag.
-/// For album (grouped) messages, the tag set is the union over all album
-/// parts so a single reaction on any part propagates to every part.
 async fn index_saved_messages(
     client: &Client,
-    mime_map: &mut HashMap<String, usize>,
-    mime_vec: &mut Vec<String>,
-    zip_cache: &mut ZipCache,
-    archive_view: crate::config::ArchiveView,
+    mime_pool: &MimePool,
+    zip_cache: &Mutex<ZipCache>,
+    archive_view: ArchiveView,
 ) -> anyhow::Result<TelegramChannel> {
     info!("Indexing Saved Messages...");
 
-    // Resolve self peer for `iter_messages`. `Saved Messages` is the cloud
-    // chat with yourself; its peer is just your own User.
     let me = client.get_me().await?;
     let me_ref = me
         .to_ref()
         .await
         .ok_or_else(|| anyhow::anyhow!("could not resolve self peer"))?;
 
-    // Pull the list of saved reaction tags (with titles) once. The result
-    // gives us reaction → title mapping; reactions on messages that don't
-    // appear here are not user-defined tags and are ignored.
     let tags_resp = client
         .invoke(&tl::functions::messages::GetSavedReactionTags { peer: None, hash: 0 })
         .await?;
@@ -1004,9 +950,6 @@ async fn index_saved_messages(
     }
     debug!("saved reaction tags: {}", tag_titles.len());
 
-    // Stream messages once, building compact per-message records and
-    // accumulating per-album tag unions on the fly. We never need to keep
-    // the raw `Message` objects around after this loop.
     let mut records: Vec<SavedRecord> = Vec::new();
     let mut group_tag_titles: HashMap<i64, Vec<String>> = HashMap::new();
     let mut messages = client.iter_messages(me_ref);
@@ -1014,9 +957,6 @@ async fn index_saved_messages(
     while let Some(msg) = messages.next().await? {
         processed += 1;
 
-        // Materialise media-specific fields into a uniform tuple so the
-        // rest of the per-message logic can run once instead of being
-        // duplicated across the Document/Photo arms.
         let (media, name, size, mime_type) = match msg.media() {
             Some(Media::Document(doc)) => {
                 let n = doc.name().unwrap_or("<unnamed>").to_string();
@@ -1032,24 +972,11 @@ async fn index_saved_messages(
             _ => continue,
         };
 
-        // Skip placeholder/empty names early so we don't waste a zip-index
-        // round-trip on something we'd discard anyway.
         if name.trim().is_empty() || name == "<unnamed>" { continue; }
 
-        // No `type:`/`name:` overrides in saved messages — classify purely
-        // from MIME and filename. Multipart parts (`*.NN`) classify as
-        // `File` because the part name doesn't end in `.zip`, so the zip
-        // branch below is naturally skipped for them.
         let file_type = classify_file_type(&None, &mime_type, &name);
-        let mime_idx = *mime_map.entry(mime_type.clone()).or_insert_with(|| {
-            mime_vec.push(mime_type.clone());
-            mime_vec.len() - 1
-        });
+        let mime_idx = mime_pool.intern(&mime_type);
 
-        // Index ZIP central directory exactly once per source message. The
-        // previous implementation called `try_index_zip` inside the per-tag
-        // fan-out, re-doing the work (or at least re-hitting the cache) N
-        // times for an N-tagged archive.
         let archive_entries = if file_type == FileType::Zip {
             if let Media::Document(doc) = &media {
                 try_index_zip(client, &[doc.clone()], &name, zip_cache).await
@@ -1064,8 +991,6 @@ async fn index_saved_messages(
         let grouped_id = msg.grouped_id();
         let own_tag_titles = extract_tag_titles(&msg, &tag_titles);
 
-        // Accumulate per-album tag union as we stream so we don't need a
-        // second pass over messages just to compute it.
         if let Some(gid) = grouped_id {
             let bucket = group_tag_titles.entry(gid).or_default();
             for t in &own_tag_titles {
@@ -1077,7 +1002,7 @@ async fn index_saved_messages(
             media,
             msg_id: msg.id(),
             name,
-            size,
+            size: size.map(|s| s as usize),
             mime_idx,
             file_type,
             archive_entries,
@@ -1087,11 +1012,6 @@ async fn index_saved_messages(
         });
     }
 
-    // Now turn the records into `FileEntry` rows. Tag selection rule:
-    //   - grouped: use the per-album union (per-message reactions are
-    //     already folded into that union, so taking both would just
-    //     duplicate).
-    //   - non-grouped: use the message's own reactions.
     let mut files: Vec<FileEntry> = Vec::new();
     for rec in records.into_iter() {
         let titles: Vec<String> = match rec.grouped_id {
@@ -1126,11 +1046,7 @@ async fn index_saved_messages(
     );
 
     files.sort_by_key(|f| f.name.to_lowercase());
-    // Detect multipart files among saved messages and merge contiguous parts.
-    // Only merge parts that share the same tag `path` (i.e. same saved reaction
-    // tag placement). This avoids grouping parts that were fanned out under
-    // different tags.
-    let mut groups: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         if let Some((base, part)) = split_part_suffix(f.doc_name()) {
             groups.entry(base.to_string()).or_default().push((i, part));
@@ -1143,12 +1059,10 @@ async fn index_saved_messages(
         if entries.len() < 2 { continue; }
         entries.sort_by_key(|&(_, p)| p);
         if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
-        // Ensure all parts share the same tag path (both None or equal Some)
         let parts_indices: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
         let first_path = files[parts_indices[0]].path.clone();
         if !parts_indices.iter().all(|&idx| files[idx].path == first_path) { continue; }
 
-        // collect docs and sizes
         let mut docs: DocParts = DocParts::new();
         let mut combined_msg_ids: MsgIds = MsgIds::new();
         let mut total_size: Option<usize> = Some(0);
@@ -1162,15 +1076,11 @@ async fn index_saved_messages(
             }
         }
 
-        // Exposed name: use the base (no message overrides in saved messages)
         let exposed_name = base.clone();
-
-        // Representative from first part
         let first = &files[parts_indices[0]];
 
         let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
         if base.to_lowercase().ends_with(".zip") && !docs.is_empty() {
-            // try_index_zip expects Documents; only attempt if all parts are Documents.
             let doc_vec: Vec<Document> = docs
                 .iter()
                 .cloned()
@@ -1201,7 +1111,6 @@ async fn index_saved_messages(
         new_files.push(combined);
     }
 
-    // Append non-removed original entries
     for (i, f) in files.into_iter().enumerate() {
         if removed.contains(&i) { continue; }
         if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
@@ -1213,7 +1122,10 @@ async fn index_saved_messages(
     Ok(TelegramChannel {
         archive_view,
         skip_deflated_id3v1: false,
-        files: new_files,
+        collapse_by_prefix: None,
+        files: Arc::new(new_files),
+        raw_entries: HashMap::new(),
         peer: Some(me_ref),
+        source: ChannelSource::SavedMessages,
     })
 }

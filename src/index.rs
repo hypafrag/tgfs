@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use grammers_client::media::{Document, Media};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -99,12 +99,75 @@ impl FileEntry {
     }
 }
 
+/// Per-message snapshot used to rebuild the file index incrementally on updates.
+/// One `RawEntry` per accepted Telegram message; the assembler folds multipart
+/// parts together and runs prefix collapse to produce the final `FileEntry` list.
+#[derive(Clone)]
+pub struct RawEntry {
+    pub msg_id: i32,
+    pub media: Media,
+    /// Name as it should be exposed, possibly including a `dir/sub/` path prefix.
+    /// Honors the message `name:` override; otherwise the document filename, or
+    /// `photo_<id>.jpg` for photos.
+    pub raw_name: String,
+    /// Original document filename without override. Used for multipart suffix
+    /// detection (`<base>.NN`). `None` for photos.
+    pub doc_name: Option<String>,
+    pub size: Option<usize>,
+    pub mime_idx: usize,
+    pub mtime: Option<SystemTime>,
+    pub type_override: Option<FileType>,
+    pub mime_type: String,
+    /// Pre-fetched ZIP central directory for zip-classified single-message
+    /// entries. Multipart zips index archive_entries on the combined parts at
+    /// assembly time (where the full Document list is available).
+    pub archive_entries: Option<Vec<ArchiveFileEntry>>,
+}
+
+/// Interned MIME-type pool. Behind a Mutex so background update tasks can
+/// intern new types concurrently with serving requests.
+pub struct MimePool {
+    inner: Mutex<MimePoolInner>,
+}
+
+struct MimePoolInner {
+    vec: Vec<String>,
+    map: HashMap<String, usize>,
+}
+
+impl MimePool {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(MimePoolInner { vec: Vec::new(), map: HashMap::new() }) }
+    }
+
+    /// Insert `s` if absent and return its stable index. Cloned MIME strings
+    /// stay short, so the underlying allocation cost is negligible.
+    pub fn intern(&self, s: &str) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(&idx) = g.map.get(s) { return idx; }
+        let idx = g.vec.len();
+        g.vec.push(s.to_string());
+        g.map.insert(s.to_string(), idx);
+        idx
+    }
+
+    pub fn get(&self, idx: usize) -> Option<String> {
+        self.inner.lock().unwrap().vec.get(idx).cloned()
+    }
+}
+
+impl Default for MimePool {
+    fn default() -> Self { Self::new() }
+}
+
 pub struct AppState {
     pub client: Client,
-    // Deduplicated pool of MIME type strings shared across entries.
-    pub mime_pool: Vec<String>,
-    // Channel-level runtime attributes populated from config channels.
-    pub channels: HashMap<String, TelegramChannel>,
+    pub mime_pool: MimePool,
+    /// Per-channel state behind a RwLock so the realtime dispatcher can swap
+    /// in updated file lists without blocking concurrent reads of unrelated
+    /// channels. The outer `HashMap` itself is built once at startup and never
+    /// grows, so it doesn't need its own lock.
+    pub channels: HashMap<String, RwLock<TelegramChannel>>,
     // Maps directory name (used in URLs / FUSE paths) → channel name (index key).
     // When no `directory:` override is set, dir name == channel name.
     pub dir_to_channel: HashMap<String, String>,
@@ -119,14 +182,33 @@ pub struct AppState {
     pub fresh_docs: Mutex<HashMap<i64, Document>>,
 }
 
-#[derive(Clone)]
 pub struct TelegramChannel {
     pub archive_view: ArchiveView,
     pub skip_deflated_id3v1: bool,
-    pub files: Vec<FileEntry>,
+    pub collapse_by_prefix: Option<usize>,
+    /// Cheap-to-clone snapshot of the assembled file list. Swapped atomically
+    /// when raw_entries change; readers clone the Arc and drop the lock.
+    pub files: Arc<Vec<FileEntry>>,
+    /// One RawEntry per accepted Telegram message that contributed to the
+    /// index. Mutated by the realtime dispatcher; assembled into `files` on
+    /// each change.
+    pub raw_entries: HashMap<i32, RawEntry>,
     /// Resolved peer reference for the channel (or self peer for Saved Messages).
-    /// Used to re-fetch messages when refreshing expired file references.
+    /// Used to re-fetch messages when refreshing expired file references and to
+    /// route incoming updates to the correct channel.
     pub peer: Option<PeerRef>,
+    /// Channel kind. Realtime updates apply to `RegularChannel` only.
+    pub source: ChannelSource,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ChannelSource {
+    /// Backed by a Telegram channel; realtime updates are processed.
+    RegularChannel,
+    /// Backed by the Saved Messages chat; built once at startup, not updated
+    /// in realtime (tag reactions and album-grouping would need their own
+    /// streaming pipeline).
+    SavedMessages,
 }
 
 pub fn human_size(bytes: usize) -> String {
@@ -210,4 +292,3 @@ pub fn dir_listing(title: &str, _parent: Option<&str>, entries: &[Entry]) -> Str
     write!(body, "</tbody>\n</table>\n</body>\n</html>").unwrap();
     body
 }
-

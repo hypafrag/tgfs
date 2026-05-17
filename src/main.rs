@@ -5,24 +5,24 @@ mod server;
 mod fuse;
 mod zip_cache;
 mod mtproxy;
+mod realtime;
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
+use grammers_session::updates::UpdatesLike;
 use log::{error, info, warn};
 use rpassword;
+use tokio::sync::mpsc;
 
 use config::{Config, LogConfig};
-use index::AppState;
+use index::{AppState, MimePool};
+use zip_cache::ZipCache;
 
 /// Initialize the global logger.
-///
-/// Levels are color-coded (env_logger default palette: ERROR red, WARN yellow,
-/// INFO green, DEBUG blue, TRACE cyan). Default filter is `info`; override
-/// with `log:` in `tgfs.yml` or the `RUST_LOG` env var (`RUST_LOG` wins).
 fn init_logger(log: Option<&LogConfig>) {
     use std::io::Write as _;
     let default_filter = log.map(|l| l.to_filter_string()).unwrap_or_else(|| "info".to_string());
@@ -44,7 +44,6 @@ fn init_logger(log: Option<&LogConfig>) {
 const SESSION_FILE: &str = "session.sqlite3";
 const DEFAULT_CONFIG_FILE: &str = "tgfs.yml";
 
-/// Parse `--config <path>` from CLI args. Defaults to `tgfs.yml`.
 fn parse_config_path() -> String {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -64,12 +63,18 @@ fn prompt(label: &str) -> String {
     io::stdin().lock().lines().next().unwrap().unwrap().trim().to_string()
 }
 
-async fn make_client(api_id: i32, proxy_url: Option<String>) -> anyhow::Result<Client> {
+/// Build a Client and capture the SenderPool's updates receiver so the
+/// realtime dispatcher can subscribe to it. The dispatcher drives the same
+/// channel that `Client::stream_updates` reads from.
+async fn make_client(
+    api_id: i32,
+    proxy_url: Option<String>,
+) -> anyhow::Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>)> {
     let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
     let params = ConnectionParams { proxy_url, ..Default::default() };
     let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, params);
     tokio::spawn(pool.runner.run());
-    Ok(Client::new(pool.handle))
+    Ok((Client::new(pool.handle), pool.updates))
 }
 
 async fn setup_proxy(config: &Config) -> anyhow::Result<Option<String>> {
@@ -107,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let proxy_url = setup_proxy(&config).await?;
-    let mut client = make_client(config.api_id, proxy_url.clone()).await?;
+    let (mut client, mut updates_rx) = make_client(config.api_id, proxy_url.clone()).await?;
 
     if !client.is_authorized().await? {
         info!("Sending sign-in code to {}...", config.phone);
@@ -116,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
             Err(InvocationError::Rpc(e)) if e.is("AUTH_RESTART") => {
                 warn!("Session invalidated by Telegram, resetting...");
                 std::fs::remove_file(SESSION_FILE).ok();
-                client = make_client(config.api_id, proxy_url).await?;
+                let (c, rx) = make_client(config.api_id, proxy_url).await?;
+                client = c;
+                updates_rx = rx;
                 client.request_login_code(&config.phone, &config.api_hash).await?
             }
             Err(e) => return Err(e.into()),
@@ -142,10 +149,18 @@ async fn main() -> anyhow::Result<()> {
         info!("Signed in successfully.");
     }
 
-    let indexer::IndexBuildResult { mime_vec: mime_pool, channels, dir_to_channel } =
-        indexer::build_index(client.clone(), &config).await?;
+    let mime_pool = MimePool::new();
+    let zip_cache = Arc::new(Mutex::new(ZipCache::load("zip_index_cache.json.gz")));
+    let indexer::IndexBuildResult { channels, dir_to_channel } =
+        indexer::build_index(client.clone(), &config, &mime_pool, &zip_cache).await?;
+    // Persist the zip cache once after the full index is built; runtime
+    // additions during dispatch stay in-memory only.
+    if let Err(e) = zip_cache.lock().unwrap().save() {
+        error!("failed to save zip cache: {}", e);
+    }
+
     let state = Arc::new(AppState {
-        client,
+        client: client.clone(),
         mime_pool,
         channels,
         dir_to_channel,
@@ -154,24 +169,63 @@ async fn main() -> anyhow::Result<()> {
         fresh_docs: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
-    // Optionally mount FUSE filesystem in a blocking task.
-    let fuse_handle = config.mount_at.as_ref().map(|mountpoint| {
-        info!("Mounting FUSE filesystem at {mountpoint}");
-        let fs = fuse::TgfsFS::new(Arc::clone(&state));
-        let mp = mountpoint.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut fuse_config = fuser::Config::default();
-            fuse_config.acl = fuser::SessionACL::All;
-            fuse_config.mount_options = vec![
-                fuser::MountOption::AutoUnmount,
-                fuser::MountOption::RO,
-                // Match the BLKSIZE advertised in fuse.rs so the kernel issues
-                // bigger reads, reducing per-call FUSE event-loop overhead.
-                fuser::MountOption::CUSTOM(format!("max_read={}", fuse::BLKSIZE)),
-            ];
-            fuser::mount2(fs, mp, &fuse_config).expect("FUSE mount failed");
-        })
+    // Build the FUSE handle ahead of session creation so the realtime
+    // dispatcher can be wired to it. The Filesystem itself is cheaply cloned
+    // (Arc<Inner>) so both fuser and the dispatcher hold their own handles.
+    let fs_handle: Option<fuse::TgfsFS> = config.mount_at.as_ref().map(|_| {
+        fuse::TgfsFS::new(Arc::clone(&state))
     });
+
+    // Optionally mount FUSE filesystem in a blocking task. We use Session::new
+    // instead of the convenience mount2() so we can grab a Notifier handle and
+    // emit FUSE_NOTIFY_DELETE / FUSE_NOTIFY_INVAL_ENTRY events when the index
+    // changes — that's how inotify watchers on the mountpoint see updates.
+    let fuse_handle = if let Some(mp) = config.mount_at.clone() {
+        let fs = fs_handle.as_ref().expect("fs_handle present when mount_at set").clone();
+        info!("Mounting FUSE filesystem at {mp}");
+        let mut fuse_config = fuser::Config::default();
+        fuse_config.acl = fuser::SessionACL::All;
+        fuse_config.mount_options = vec![
+            fuser::MountOption::AutoUnmount,
+            fuser::MountOption::RO,
+            fuser::MountOption::CUSTOM(format!("max_read={}", fuse::BLKSIZE)),
+        ];
+        let session = fuser::Session::new(fs.clone(), &mp, &fuse_config)
+            .map_err(|e| anyhow::anyhow!("FUSE session create failed: {e}"))?;
+        fs.set_notifier(session.notifier());
+        Some(tokio::task::spawn_blocking(move || {
+            // Session::run consumes self and blocks until unmount.
+            // It's pub(crate); use spawn() which runs the loop in a background
+            // thread and gives us a join handle. We then block on the handle.
+            match session.spawn() {
+                Ok(bg) => {
+                    if let Err(e) = bg.join() {
+                        error!("FUSE session ended with error: {e}");
+                    }
+                }
+                Err(e) => error!("FUSE session spawn failed: {e}"),
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn the realtime dispatcher. It owns its clone of the FS handle so it
+    // can fire FUSE notifications when channel state mutates. When realtime is
+    // off, the updates receiver is dropped so the SenderPool's unbounded
+    // update buffer doesn't grow without bound.
+    if config.realtime {
+        let dispatcher = realtime::Dispatcher::new(
+            client.clone(),
+            Arc::clone(&state),
+            Arc::clone(&zip_cache),
+            fs_handle.clone(),
+        );
+        tokio::spawn(dispatcher.run(updates_rx));
+    } else {
+        info!("realtime updates disabled by config");
+        drop(updates_rx);
+    }
 
     // Optionally serve HTTP index.
     let http_handle = if let Some(port) = config.http_port {
@@ -186,8 +240,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // On SIGTERM or SIGINT, unmount the FUSE filesystem (if any) so the mount point
-    // is clean on container restart, then exit.
+    // On SIGTERM or SIGINT, unmount the FUSE filesystem (if any).
     if let Some(mp) = config.mount_at.clone() {
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
@@ -203,7 +256,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Wait for whichever services are running.
     match (fuse_handle, http_handle) {
         (Some(f), Some(h)) => { let _ = tokio::try_join!(f, h)?; }
         (Some(f), None) => { f.await?; }

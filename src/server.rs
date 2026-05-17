@@ -439,16 +439,17 @@ pub async fn handle_channel_path(
 ) -> Result<Response, StatusCode> {
     let dir = channel.trim_end_matches('/').to_string();
     let channel = state.dir_to_channel.get(&dir).cloned().ok_or(StatusCode::NOT_FOUND)?;
-    let tchan = state.channels.get(&channel).ok_or(StatusCode::NOT_FOUND)?;
-    let channel_peer = tchan.peer;
-    let files = &tchan.files;
+    let (channel_peer, archive_view, files) = {
+        let tchan = state.channels.get(&channel).ok_or(StatusCode::NOT_FOUND)?.read().unwrap();
+        (tchan.peer, tchan.archive_view, tchan.files.clone())
+    };
+    let files: &[FileEntry] = &files;
     let orig_path = path;
     let is_dir_request = orig_path.is_empty() || orig_path.ends_with('/');
     let trimmed = orig_path.trim_end_matches('/');
 
     if is_dir_request {
         if trimmed.is_empty() {
-            let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File);
             let (entries, title) = entries_for_root(files, &dir, archive_view);
             return html_response(dir_listing(&title, Some("/"), &entries));
         }
@@ -463,7 +464,6 @@ pub async fn handle_channel_path(
         }
 
         // Virtual directory listing: list immediate children (dirs and files) under trimmed/
-        let archive_view = state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File);
         let listing = entries_for_virtual_dir(files, &dir, trimmed, archive_view);
         let title = format!("Index of /{dir}/{trimmed}");
         return html_response(dir_listing(&title, Some(&parent_href(&dir, trimmed)), &listing));
@@ -473,11 +473,11 @@ pub async fn handle_channel_path(
     // either a direct file (top-level or at a virtual path) or a file inside an archive
     if let Some(fentry) = files.iter().find(|e| full_for(e) == trimmed) {
         // if zip and archive_view is Directory-only, then we do not offer raw download; return 404
-        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && state.channels.get(&channel).map(|a| a.archive_view).unwrap_or(ArchiveView::File) == ArchiveView::Directory {
+        if fentry.file_type == FileType::Zip && fentry.archive_entries.is_some() && archive_view == ArchiveView::Directory {
             return Err(StatusCode::NOT_FOUND);
         }
 
-        let mime = state.mime_pool.get(fentry.mime_idx).cloned().unwrap_or_else(|| "application/octet-stream".to_string());
+        let mime = state.mime_pool.get(fentry.mime_idx).unwrap_or_else(|| "application/octet-stream".to_string());
         let encoded_name = urlencoding::encode(&fentry.name).into_owned();
         let disposition = content_disposition(&fentry.file_type, &encoded_name);
 

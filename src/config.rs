@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ChannelEntry {
     pub name: String,
     #[serde(default)]
@@ -109,9 +109,16 @@ pub struct Config {
     /// Maximum number of concurrent Telegram fetches across all PIDs combined.
     #[serde(default)]
     pub max_fetches_total: Option<usize>,
+    /// Subscribe to Telegram updates and mutate the in-memory index when
+    /// channel messages are added, edited, or deleted. When mounted via FUSE,
+    /// kernel cache and inotify watchers are notified on each change. Default true.
+    #[serde(default = "default_realtime")]
+    pub realtime: bool,
     #[serde(default)]
     pub channels: Vec<ChannelEntry>,
 }
+
+fn default_realtime() -> bool { true }
 
 #[derive(Deserialize, Clone)]
 pub struct SavedMessagesConfig {
