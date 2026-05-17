@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::fuse::TgfsFS;
 use crate::index::{AppState, ChannelSource};
-use crate::indexer::{assemble_channel_files, message_to_raw_entry};
+use crate::indexer::{assemble_channel_files, extract_group_caption, message_to_raw_entry};
 use crate::zip_cache::ZipCache;
 
 /// Bind a Telegram update stream to the in-memory index. Mutates the channel's
@@ -131,30 +131,43 @@ impl Dispatcher {
             &self.state.mime_pool,
             &self.zip_cache,
         ).await;
+        let group_caption = extract_group_caption(msg);
 
-        let (mut raw_entries, collapse) = {
+        let (mut raw_entries, mut group_captions, collapse) = {
             let lock = self.state.channels.get(channel_name).unwrap();
             let g = lock.read().unwrap();
-            (g.raw_entries.clone(), g.collapse_by_prefix)
+            (g.raw_entries.clone(), g.group_captions.clone(), g.collapse_by_prefix)
         };
 
         let msg_id = msg.id();
         let had_old = raw_entries.contains_key(&msg_id);
+        let mut changed = false;
         match raw {
             Some(r) => {
                 debug!("realtime: upsert msg_id={} in channel='{}'", msg_id, channel_name);
                 raw_entries.insert(msg_id, r);
+                changed = true;
             }
             None if had_old => {
                 debug!("realtime: edit removed media, dropping msg_id={} in channel='{}'", msg_id, channel_name);
                 raw_entries.remove(&msg_id);
+                changed = true;
             }
-            None => return Ok(()),
+            None => {}
         }
+
+        if let Some((gid, cap)) = group_caption {
+            debug!("realtime: group caption update gid={} channel='{}'", gid, channel_name);
+            group_captions.insert(gid, cap);
+            changed = true;
+        }
+
+        if !changed { return Ok(()); }
 
         let new_files = assemble_channel_files(
             &self.client,
             &raw_entries,
+            &group_captions,
             archive_view,
             collapse,
             &self.zip_cache,
@@ -164,6 +177,7 @@ impl Dispatcher {
             let lock = self.state.channels.get(channel_name).unwrap();
             let mut g = lock.write().unwrap();
             g.raw_entries = raw_entries;
+            g.group_captions = group_captions;
             g.files = Arc::new(new_files);
         }
 
@@ -172,11 +186,11 @@ impl Dispatcher {
     }
 
     async fn delete_messages(&self, channel_name: &str, msg_ids: &[i32]) -> anyhow::Result<()> {
-        let (mut raw_entries, archive_view, collapse) = {
+        let (mut raw_entries, group_captions, archive_view, collapse) = {
             let lock = self.state.channels.get(channel_name)
                 .ok_or_else(|| anyhow::anyhow!("unknown channel {}", channel_name))?;
             let g = lock.read().unwrap();
-            (g.raw_entries.clone(), g.archive_view, g.collapse_by_prefix)
+            (g.raw_entries.clone(), g.group_captions.clone(), g.archive_view, g.collapse_by_prefix)
         };
 
         let mut changed = false;
@@ -191,6 +205,7 @@ impl Dispatcher {
         let new_files = assemble_channel_files(
             &self.client,
             &raw_entries,
+            &group_captions,
             archive_view,
             collapse,
             &self.zip_cache,

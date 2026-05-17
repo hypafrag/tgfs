@@ -30,15 +30,21 @@ CLI: `tgfs [--config <path>]`. Default config path is `tgfs.yml` in the working 
 
 **Directory listing.** `GET /` lists channels; `GET /{channel}/` lists files. Apache-style HTML index with sizes.
 
-**Virtual paths.** A message may prefix its document with `name: dir/sub/file.ext` to place the file under a virtual directory. Directories are synthesized from these paths and browsable.
+**Virtual paths.** A message may prefix its document with `path: dir/sub/file.ext` to place the file under a virtual directory. Directories are synthesized from these paths and browsable. A trailing `/` (e.g. `path: dir/sub/`) keeps the original document filename and applies the value as the parent directory only.
 
-**Message overrides** (single-message only, ignored for grouped albums):
-- `name: <path/filename>` — override filename and/or place under a virtual path.
+**Message overrides** (single-message):
+- `path: <path/filename>` — override the full virtual path (directory + filename).
+- `path: <dir>/` — directory-only override; original document filename is kept. Parsed by `resolve_path_override()` in `src/indexer.rs`.
 - `type: file|media|zip` — override classification. `media` forces inline `Content-Disposition` for in-browser playback; `file` forces attachment; `zip` enables archive indexing.
+
+**Grouped-album overrides** (one caption shared across every part of a Telegram album):
+- Captions are extracted by `extract_group_caption()` in `src/indexer.rs` and stored on `TelegramChannel.group_captions: HashMap<grouped_id, GroupCaption>`. Applied uniformly in `raw_entry_to_file()` at assembly time.
+- `path:` is **always** treated as a directory regardless of trailing slash. Original document filenames are kept on every part.
+- `type:` (file/media/zip) is applied to every part. ZIP archive indexes are not fetched retroactively at assembly time, so `type: zip` on a non-zip MIME won't yield browsable inner entries.
 
 **Auto classification** (when no `type:` override): `audio/*` or `video/*` MIME → media; `application/zip` or `.zip` extension → zip; otherwise file.
 
-**Multipart files.** Documents whose filenames match `<base>.NN` (two-digit part numbers starting at `.00`, contiguous) are auto-merged into a single logical file. Streaming seamlessly concatenates parts on download. The `.00` message's `name:` override (if any) sets the exposed name.
+**Multipart files.** Documents whose filenames match `<base>.NN` (two-digit part numbers starting at `.00`, contiguous) are auto-merged into a single logical file. Streaming seamlessly concatenates parts on download. The `.00` message's `path:` override (if any) sets the exposed name.
 
 **ZIP browsing.** For `zip`-classified files, the EOCD + central directory is fetched at index time (only the tail bytes, not the whole archive). Archive entries appear as a virtual subdirectory named after the archive stem. Inner files are extracted by ranged-downloading the relevant local file header + compressed payload and inflating on the fly.
 

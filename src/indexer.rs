@@ -11,7 +11,7 @@ use log::{debug, error, info, warn};
 use crate::config::{Config, ArchiveView};
 use crate::index::{
     FileEntry, FileType, ArchiveFileEntry, DocParts, MsgIds, TelegramChannel, RawEntry,
-    MimePool, ChannelSource,
+    MimePool, ChannelSource, GroupCaption,
 };
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
@@ -590,14 +590,59 @@ fn message_field(msg: &grammers_client::message::Message, key: &str) -> Option<S
     None
 }
 
+/// Interpret the value of a `path:` caption directive.
+///
+/// - Trailing `/` means "directory only": keep `original` as the filename,
+///   place it under the given directory (`path: foo/bar/` + `file.ext` →
+///   `foo/bar/file.ext`).
+/// - Otherwise the value is taken verbatim as the full virtual path,
+///   overriding both directory and filename (`path: foo/bar/other.ext`).
+/// - `None` or empty after stripping slashes means "use `original` as-is".
+fn resolve_path_override(value: Option<String>, original: &str) -> String {
+    let v = match value {
+        Some(v) => v,
+        None => return original.to_string(),
+    };
+    if v.ends_with('/') {
+        let dir = v.trim_end_matches('/');
+        if dir.is_empty() { original.to_string() } else { format!("{}/{}", dir, original) }
+    } else {
+        v
+    }
+}
+
 fn resolve_type_override(msg: &grammers_client::message::Message) -> Option<FileType> {
     let v = message_field(msg, "type:")?.to_lowercase();
-    match v.as_str() {
+    parse_type_value(&v)
+}
+
+fn parse_type_value(v: &str) -> Option<FileType> {
+    match v {
         "file" => Some(FileType::File),
         "media" => Some(FileType::Media),
         "zip" => Some(FileType::Zip),
         _ => None,
     }
+}
+
+/// Parse `path:` and `type:` from a grouped-album message. Unlike
+/// `message_field`, this reads captions on grouped messages — that's the
+/// whole point: an album carries one caption for all parts and we want to
+/// apply it uniformly.
+pub fn extract_group_caption(
+    msg: &grammers_client::message::Message,
+) -> Option<(i64, GroupCaption)> {
+    let gid = msg.grouped_id()?;
+    let mut cap = GroupCaption::default();
+    for line in msg.text().lines() {
+        if let Some(v) = line.strip_prefix("path:") {
+            cap.path_override = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("type:") {
+            cap.type_override = parse_type_value(v.trim().to_lowercase().as_str());
+        }
+    }
+    if cap.path_override.is_none() && cap.type_override.is_none() { return None; }
+    Some((gid, cap))
 }
 
 /// Distill a single Telegram message into a `RawEntry`. Returns `None` for
@@ -616,12 +661,21 @@ pub async fn message_to_raw_entry(
 ) -> Option<RawEntry> {
     match msg.media() {
         Some(Media::Document(doc)) => {
-            let raw_name = message_field(msg, "name:").unwrap_or_else(|| doc.name().unwrap_or("<unnamed>").to_string());
+            let grouped_id = msg.grouped_id();
+            let original = doc.name().unwrap_or("<unnamed>").to_string();
+            // For grouped messages the path/type directives belong to the
+            // album as a whole (see `extract_group_caption`) and are applied
+            // at assembly time, so skip per-message override resolution here.
+            let raw_name = if grouped_id.is_some() {
+                original.clone()
+            } else {
+                resolve_path_override(message_field(msg, "path:"), &original)
+            };
             let (file_name, _path_opt) = split_name(&raw_name);
             if file_name.trim().is_empty() || file_name == "<unnamed>" { return None; }
             let size = doc.size().map(|s| s as usize);
             let mime_type = doc.mime_type().unwrap_or("application/octet-stream").to_string();
-            let type_override = resolve_type_override(msg);
+            let type_override = if grouped_id.is_some() { None } else { resolve_type_override(msg) };
             let final_type = classify_file_type(&type_override, &mime_type, doc.name().unwrap_or(&file_name));
             let archive_entries = if final_type == FileType::Zip && archive_view != ArchiveView::File {
                 try_index_zip(client, &[doc.clone()], &file_name, zip_cache).await
@@ -642,15 +696,22 @@ pub async fn message_to_raw_entry(
                 type_override,
                 mime_type,
                 archive_entries,
+                grouped_id,
             })
         }
         Some(Media::Photo(photo)) => {
-            let raw_name = message_field(msg, "name:").unwrap_or_else(|| format!("photo_{}.jpg", photo.id()));
+            let grouped_id = msg.grouped_id();
+            let original = format!("photo_{}.jpg", photo.id());
+            let raw_name = if grouped_id.is_some() {
+                original.clone()
+            } else {
+                resolve_path_override(message_field(msg, "path:"), &original)
+            };
             let (file_name, _path_opt) = split_name(&raw_name);
             if file_name.trim().is_empty() || file_name == "<unnamed>" { return None; }
             let size = Some(photo_largest_size(&photo));
             let mime_type = "image/jpeg".to_string();
-            let type_override = resolve_type_override(msg);
+            let type_override = if grouped_id.is_some() { None } else { resolve_type_override(msg) };
             let mime_idx = mime_pool.intern(&mime_type);
             let mtime = msg_mtime(msg);
             Some(RawEntry {
@@ -664,6 +725,7 @@ pub async fn message_to_raw_entry(
                 type_override,
                 mime_type,
                 archive_entries: None,
+                grouped_id,
             })
         }
         _ => None,
@@ -672,11 +734,29 @@ pub async fn message_to_raw_entry(
 
 /// Materialize a `RawEntry` into the (pre-grouping) `FileEntry` that one
 /// message produces. The assembler runs this for every raw entry, then fuses
-/// multipart parts together.
-fn raw_entry_to_file(rec: &RawEntry) -> FileEntry {
-    let (file_name, path_opt) = split_name(&rec.raw_name);
+/// multipart parts together. For grouped-album members, the per-album caption
+/// (when present) overrides directory placement and classification.
+fn raw_entry_to_file(rec: &RawEntry, group_captions: &HashMap<i64, GroupCaption>) -> FileEntry {
+    let (file_name, mut path_opt) = split_name(&rec.raw_name);
     let doc_name_for_classify = rec.doc_name.as_deref().unwrap_or(&file_name);
-    let file_type = classify_file_type(&rec.type_override, &rec.mime_type, doc_name_for_classify);
+    let mut file_type = classify_file_type(&rec.type_override, &rec.mime_type, doc_name_for_classify);
+
+    if let Some(gid) = rec.grouped_id {
+        if let Some(cap) = group_captions.get(&gid) {
+            if let Some(p) = &cap.path_override {
+                // Always treat as directory for grouped messages — trailing
+                // slash is optional. The original document filename is kept.
+                let dir = p.trim_end_matches('/');
+                if !dir.is_empty() {
+                    path_opt = Some(std::path::PathBuf::from(dir));
+                }
+            }
+            if let Some(t) = &cap.type_override {
+                file_type = t.clone();
+            }
+        }
+    }
+
     FileEntry {
         name: file_name,
         path: path_opt,
@@ -696,11 +776,15 @@ fn raw_entry_to_file(rec: &RawEntry) -> FileEntry {
 pub async fn assemble_channel_files(
     client: &Client,
     raw_entries: &HashMap<i32, RawEntry>,
+    group_captions: &HashMap<i64, GroupCaption>,
     archive_view: ArchiveView,
     collapse_by_prefix: Option<usize>,
     zip_cache: &Mutex<ZipCache>,
 ) -> Vec<FileEntry> {
-    let mut files: Vec<FileEntry> = raw_entries.values().map(raw_entry_to_file).collect();
+    let mut files: Vec<FileEntry> = raw_entries
+        .values()
+        .map(|r| raw_entry_to_file(r, group_captions))
+        .collect();
 
     // Detect multipart files by inspecting the document filename (not message overrides).
     let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -818,18 +902,22 @@ pub async fn build_index(
 
         info!("Indexing {name}...");
         let mut raw_entries: HashMap<i32, RawEntry> = HashMap::new();
+        let mut group_captions: HashMap<i64, GroupCaption> = HashMap::new();
         let mut messages = client.iter_messages(peer_ref);
         let mut processed_msgs: usize = 0;
         while let Some(msg) = messages.next().await? {
             processed_msgs += 1;
+            if let Some((gid, cap)) = extract_group_caption(&msg) {
+                group_captions.insert(gid, cap);
+            }
             if let Some(raw) = message_to_raw_entry(&client, &msg, entry.archive_view, mime_pool, zip_cache).await {
                 raw_entries.insert(raw.msg_id, raw);
             }
         }
         info!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
-        debug!("{} raw entries", raw_entries.len());
+        debug!("{} raw entries, {} group captions", raw_entries.len(), group_captions.len());
 
-        let files = assemble_channel_files(&client, &raw_entries, entry.archive_view, entry.collapse_by_prefix, zip_cache).await;
+        let files = assemble_channel_files(&client, &raw_entries, &group_captions, entry.archive_view, entry.collapse_by_prefix, zip_cache).await;
         info!("{} files (post-assembly)", files.len());
 
         let tchan = TelegramChannel {
@@ -838,6 +926,7 @@ pub async fn build_index(
             collapse_by_prefix: entry.collapse_by_prefix,
             files: Arc::new(files),
             raw_entries,
+            group_captions,
             peer: Some(peer_ref),
             source: ChannelSource::RegularChannel,
         };
@@ -1125,6 +1214,7 @@ async fn index_saved_messages(
         collapse_by_prefix: None,
         files: Arc::new(new_files),
         raw_entries: HashMap::new(),
+        group_captions: HashMap::new(),
         peer: Some(me_ref),
         source: ChannelSource::SavedMessages,
     })

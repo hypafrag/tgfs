@@ -5,7 +5,7 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 ## Features
 
 - **Directory listing** — Apache-style HTML index with file sizes. `GET /` lists channels, `GET /{channel}/` lists files.
-- **Virtual paths** — messages with `name: dir/sub/file.ext` in the caption place files under virtual directories.
+- **Virtual paths** — messages with `path: dir/sub/file.ext` in the caption place files under virtual directories. A trailing `/` (e.g. `path: dir/sub/`) keeps the original document filename.
 - **ZIP browsing** — archive contents are browsable as directories. Only the central directory is fetched at index time; inner files are extracted on demand via ranged downloads and DEFLATE inflation.
 - **Multipart files** — documents named `<base>.00`, `<base>.01`, … are auto-merged into a single logical file with seamless streaming.
 - **HTTP Range requests** — seeking works in browsers and media players for single files, multipart concatenations, and inner-archive entries.
@@ -71,12 +71,40 @@ Controls how `.zip` files are exposed:
 | `directory`          | Browse archive contents only (raw download → 404) |
 | `file_and_directory` | Both raw download and browsable contents          |
 
+### `skip_deflated_id3v1`
+
+Per-channel workaround for audio players that probe the tail of every file for an ID3v1 tag (last 128 bytes, `TAG` magic). For deflate-compressed entries inside a ZIP, serving even a single byte near EOF requires inflating the **entire** compressed stream from the beginning — which can mean downloading and decoding gigabytes just to satisfy a 4 KB probe before playback starts.
+
+```yaml
+channels:
+  - name: Audiobooks
+    archive_view: directory
+    skip_deflated_id3v1: true
+```
+
+When enabled, the FUSE read handler short-circuits the probe and returns 4 KB of zeros instead of inflating the archive. The check fires only when **all** of these hold (so normal sequential decoding is unaffected):
+
+- The file lives inside a ZIP archive and is compressed with DEFLATE (method 8).
+- Its inner path ends in `.mp3` or `.flac` (case-insensitive).
+- The read size is exactly 4096 bytes.
+- The decoder has produced fewer than 128 KB so far (i.e. this happens right after open).
+- The read offset is within 16 KB of EOF.
+
+Since ID3v1 has been superseded by ID3v2 (which sits at the file start and is reachable without seeking), this trades the legacy tag for instant playback start. Defaults to `false`.
+
 ### Message caption overrides
 
-Single-message documents (not grouped albums) support caption directives:
+Caption directives are recognized in any message text:
 
-- `name: path/to/file.ext` — override the filename and/or place the file under a virtual directory.
+- `path: dir/sub/file.ext` — *(single-file messages only)* override the full virtual path. Both directory and filename are taken from the value.
+- `path: dir/sub/` — directory-only override. The original document filename is kept; the value (with the trailing slash stripped) becomes the parent directory. `path: /` is treated the same as omitting the directive.
 - `type: file|media|zip` — override auto-classification. `media` forces inline playback; `file` forces download; `zip` enables archive indexing.
+
+**Grouped albums (multi-file uploads)** behave differently because a single caption is attached to the whole group:
+
+- `path:` is **always treated as a directory** for every part of the album, with or without a trailing slash. The original document filenames are preserved. So `path: vacation` and `path: vacation/` are equivalent on an album and place every part under `vacation/`.
+- `type:` applies uniformly to every part of the album. `type: media` is the most common — e.g. a photo album captioned `path: vacation/`, where every photo becomes inline-playable under `vacation/`.
+- `type: zip` does **not** retroactively fetch archive indexes for parts whose underlying file wasn't already classified as a zip by MIME or `.zip` extension. Use the per-file caption (on a single-message upload) when you need browsable archives.
 
 ### Proxy
 

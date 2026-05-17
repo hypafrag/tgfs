@@ -107,8 +107,10 @@ pub struct RawEntry {
     pub msg_id: i32,
     pub media: Media,
     /// Name as it should be exposed, possibly including a `dir/sub/` path prefix.
-    /// Honors the message `name:` override; otherwise the document filename, or
-    /// `photo_<id>.jpg` for photos.
+    /// Honors the message `path:` override; otherwise the document filename, or
+    /// `photo_<id>.jpg` for photos. For grouped-album members this is always
+    /// just the document filename — the album's directory comes from the
+    /// per-group `GroupCaption` looked up at assembly time.
     pub raw_name: String,
     /// Original document filename without override. Used for multipart suffix
     /// detection (`<base>.NN`). `None` for photos.
@@ -122,6 +124,22 @@ pub struct RawEntry {
     /// entries. Multipart zips index archive_entries on the combined parts at
     /// assembly time (where the full Document list is available).
     pub archive_entries: Option<Vec<ArchiveFileEntry>>,
+    /// Telegram album id when this message is part of a grouped multi-file
+    /// upload. The album's caption (if any) is shared via `group_captions` on
+    /// the channel and applied at assembly time.
+    pub grouped_id: Option<i64>,
+}
+
+/// Shared caption directives for a Telegram album (grouped message). Looked up
+/// at assembly time and applied uniformly to every part of the group.
+#[derive(Clone, Default)]
+pub struct GroupCaption {
+    /// `path:` directive value, always interpreted as a directory for grouped
+    /// messages — the trailing-slash requirement does not apply. The original
+    /// document filename of each part is preserved.
+    pub path_override: Option<String>,
+    /// `type:` directive value applied to every part of the group.
+    pub type_override: Option<FileType>,
 }
 
 /// Interned MIME-type pool. Behind a Mutex so background update tasks can
@@ -193,6 +211,10 @@ pub struct TelegramChannel {
     /// index. Mutated by the realtime dispatcher; assembled into `files` on
     /// each change.
     pub raw_entries: HashMap<i32, RawEntry>,
+    /// Per-album captions for grouped Telegram messages. Keyed by `grouped_id`.
+    /// Populated when an album member carries caption text; applied uniformly
+    /// to every member of the group at assembly time.
+    pub group_captions: HashMap<i64, GroupCaption>,
     /// Resolved peer reference for the channel (or self peer for Saved Messages).
     /// Used to re-fetch messages when refreshing expired file references and to
     /// route incoming updates to the correct channel.
