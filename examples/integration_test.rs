@@ -477,9 +477,7 @@ where
 
     let body_result = tokio::task::spawn_blocking(move || body(Path::new(MOUNT_PATH))).await?;
 
-    if let Err(e) = bg.umount_and_join() {
-        warn!("FUSE umount returned error: {e}");
-    }
+    shutdown_fuse(bg, MOUNT_PATH).await;
     body_result
 }
 
@@ -650,6 +648,34 @@ fn expected_layout_album_multipart(
     }
 
     Ok(out)
+}
+
+/// Run `bg.umount_and_join()` on a blocking thread with a hard time budget.
+/// On Linux, fuser's umount path can hang indefinitely if the kernel doesn't
+/// release the mount cleanly the moment fusermount asks; we'd then sit on the
+/// `join()` forever. The fallback is a lazy unmount (`fusermount -u -z`),
+/// which detaches the mount immediately and lets future variants reuse the
+/// path. macOS doesn't ship `fusermount`, so the fallback is a no-op there —
+/// AutoUnmount from the mount options will tear things down once the bg
+/// session is finally dropped.
+async fn shutdown_fuse(bg: fuser::BackgroundSession, mount_path: &str) {
+    let task = tokio::task::spawn_blocking(move || bg.umount_and_join());
+    match tokio::time::timeout(Duration::from_secs(10), task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => warn!("FUSE umount returned error: {e}"),
+        Ok(Err(e)) => warn!("FUSE umount task panicked: {e}"),
+        Err(_) => {
+            warn!("FUSE umount_and_join timed out after 10s; forcing lazy unmount");
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("fusermount")
+                    .args(["-u", "-z", mount_path])
+                    .status();
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = mount_path; // silence unused warning on non-Linux
+        }
+    }
 }
 
 // ------------------------ Mutation-test helpers -----------------------------
@@ -955,9 +981,7 @@ async fn run_mutation_test(
     }
     drop(watcher);
     dispatcher_task.abort();
-    if let Err(e) = bg.umount_and_join() {
-        warn!("FUSE umount returned error: {e}");
-    }
+    shutdown_fuse(bg, MOUNT_PATH).await;
     outcome
 }
 
