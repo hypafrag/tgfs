@@ -101,3 +101,24 @@ channel:
                     body {
                       background: #ffffff;
                     }
+
+    # Suffix multipart — three separate single-file messages whose names match
+    # <base>.NN. With multipart_policy=suffix they are merged into one file.
+    - files:
+        - name: suffixed.00
+          text: "Hello, "
+    - files:
+        - name: suffixed.01
+          text: "world"
+    - files:
+        - name: suffixed.02
+          text: "!"
+
+    # Album multipart — one Telegram album. The multipart directive merges all
+    # files in the album into one under multipart_policy=album.
+    - text: "multipart: true"
+      files:
+        - name: album_part_a.txt
+          text: "foo"
+        - name: album_part_b.txt
+          text: "bar"

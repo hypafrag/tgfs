@@ -17,7 +17,7 @@
 //! current spec, every message in the channel is deleted and the spec is
 //! re-uploaded.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -554,6 +554,100 @@ fn assert_layout_matches(root: &Path, expected: &HashMap<String, Vec<u8>>) -> an
     Ok(())
 }
 
+// ------------------------ Multipart helpers ---------------------------------
+
+/// Parse `<stem>.NN` suffix filenames (exactly two decimal digits).
+fn parse_suffix_part(name: &str) -> Option<(String, u8)> {
+    let dot = name.rfind('.')?;
+    let ext = &name[dot + 1..];
+    if ext.len() == 2 && ext.bytes().all(|b| b.is_ascii_digit()) {
+        Some((name[..dot].to_string(), ext.parse().ok()?))
+    } else {
+        None
+    }
+}
+
+fn has_multipart_directive(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix("multipart:")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "" | "true" | "yes" | "1"))
+            .unwrap_or(false)
+    })
+}
+
+/// Expected layout for `multipart_policy=suffix`: `.NN` parts are merged into
+/// their base name; every other file appears individually.
+fn expected_layout_suffix_multipart(
+    channel_name: &str,
+    spec: &ChannelSpec,
+) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+    let mut suffix_groups: HashMap<String, BTreeMap<u8, Vec<u8>>> = HashMap::new();
+    let mut out = HashMap::new();
+
+    for msg in &spec.messages {
+        let dir_override = msg.text.as_deref().and_then(parse_path_directive);
+        for f in &msg.files {
+            if let Some((base, num)) = parse_suffix_part(&f.name) {
+                suffix_groups.entry(base).or_default().insert(num, f.build_bytes()?);
+            } else {
+                let bytes = f.build_bytes()?;
+                let prefix = match &dir_override {
+                    Some(d) => format!("{}/{}/", channel_name, d.trim_end_matches('/')),
+                    None => format!("{}/", channel_name),
+                };
+                out.insert(format!("{prefix}{}", f.name), bytes);
+            }
+        }
+    }
+
+    for (base, parts) in suffix_groups {
+        let merged: Vec<u8> = parts.into_values().flatten().collect();
+        out.insert(format!("{}/{}", channel_name, base), merged);
+    }
+
+    Ok(out)
+}
+
+/// Expected layout for `multipart_policy=album`: albums whose caption carries
+/// `multipart: true` are merged into the first file's name; everything else
+/// (including suffix-named files) appears individually.
+fn expected_layout_album_multipart(
+    channel_name: &str,
+    spec: &ChannelSpec,
+) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+    let mut out = HashMap::new();
+
+    for msg in &spec.messages {
+        let is_album_multipart = msg.files.len() > 1
+            && msg.text.as_deref().map(has_multipart_directive).unwrap_or(false);
+        let dir_override = msg.text.as_deref().and_then(parse_path_directive);
+
+        if is_album_multipart {
+            let first_name = &msg.files[0].name;
+            let mut merged: Vec<u8> = Vec::new();
+            for f in &msg.files {
+                merged.extend(f.build_bytes()?);
+            }
+            let prefix = match &dir_override {
+                Some(d) => format!("{}/{}/", channel_name, d.trim_end_matches('/')),
+                None => format!("{}/", channel_name),
+            };
+            out.insert(format!("{prefix}{first_name}"), merged);
+        } else {
+            for f in &msg.files {
+                let bytes = f.build_bytes()?;
+                let prefix = match &dir_override {
+                    Some(d) => format!("{}/{}/", channel_name, d.trim_end_matches('/')),
+                    None => format!("{}/", channel_name),
+                };
+                out.insert(format!("{prefix}{}", f.name), bytes);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 // ------------------------ main ----------------------------------------------
 
 #[tokio::main]
@@ -643,6 +737,28 @@ async fn main() -> anyhow::Result<()> {
     mount_variant(client_c, var_cfg, zc_c, move |root| {
         assert_layout_matches(root, &exp_c)?;
         Ok(())
+    }).await?;
+
+    // ----- Variant D: multipart_policy = suffix ---------------------------------
+    info!("== variant: archive_view=file, multipart_policy=suffix ==");
+    let expected_suffix = expected_layout_suffix_multipart(&spec.name, &spec)?;
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix);
+    let exp_d = expected_suffix;
+    let client_d = client.clone();
+    let zc_d = Arc::clone(&zip_cache);
+    mount_variant(client_d, var_cfg, zc_d, move |root| {
+        assert_layout_matches(root, &exp_d)
+    }).await?;
+
+    // ----- Variant E: multipart_policy = album ----------------------------------
+    info!("== variant: archive_view=file, multipart_policy=album ==");
+    let expected_album = expected_layout_album_multipart(&spec.name, &spec)?;
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album);
+    let exp_e = expected_album;
+    let client_e = client.clone();
+    let zc_e = Arc::clone(&zip_cache);
+    mount_variant(client_e, var_cfg, zc_e, move |root| {
+        assert_layout_matches(root, &exp_e)
     }).await?;
 
     info!("all variants OK");
