@@ -650,30 +650,46 @@ fn expected_layout_album_multipart(
     Ok(out)
 }
 
-/// Run `bg.umount_and_join()` on a blocking thread with a hard time budget.
-/// On Linux, fuser's umount path can hang indefinitely if the kernel doesn't
-/// release the mount cleanly the moment fusermount asks; we'd then sit on the
-/// `join()` forever. The fallback is a lazy unmount (`fusermount -u -z`),
-/// which detaches the mount immediately and lets future variants reuse the
-/// path. macOS doesn't ship `fusermount`, so the fallback is a no-op there —
-/// AutoUnmount from the mount options will tear things down once the bg
-/// session is finally dropped.
+/// Tear down the FUSE mount between variants.
+///
+/// On macOS, `bg.umount_and_join()` works reliably and is the cleanest path —
+/// AutoUnmount + libfuse_destroy unwind the mount and the worker thread exits.
+///
+/// On Linux, that same call consistently hangs in our environment: fusermount
+/// blocks (likely because the AutoUnmount helper and an explicit unmount race
+/// for the same mount), and `join()` then waits forever on a worker thread
+/// that's still blocked in `read(fuse_fd)`. We skip it and go straight to
+/// `fusermount -u -z` (lazy) — the kernel detaches the mount immediately, the
+/// FUSE fd closes, the worker thread's read returns 0, and the bg session can
+/// then be dropped on a blocking thread without hanging.
 async fn shutdown_fuse(bg: fuser::BackgroundSession, mount_path: &str) {
-    let task = tokio::task::spawn_blocking(move || bg.umount_and_join());
-    match tokio::time::timeout(Duration::from_secs(10), task).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => warn!("FUSE umount returned error: {e}"),
-        Ok(Err(e)) => warn!("FUSE umount task panicked: {e}"),
-        Err(_) => {
-            warn!("FUSE umount_and_join timed out after 10s; forcing lazy unmount");
-            #[cfg(target_os = "linux")]
-            {
-                let _ = std::process::Command::new("fusermount")
-                    .args(["-u", "-z", mount_path])
-                    .status();
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = mount_path; // silence unused warning on non-Linux
+    #[cfg(target_os = "linux")]
+    {
+        // Detach the mount first so the worker thread's read on the FUSE fd
+        // returns and it becomes joinable.
+        if let Err(e) = std::process::Command::new("fusermount")
+            .args(["-u", "-z", mount_path])
+            .status()
+        {
+            warn!("fusermount -u -z {mount_path} failed: {e}");
+        }
+        // Drop the session on a blocking thread — its Drop joins the worker.
+        // Bound the wait so a stray hang can't stall the whole test run.
+        let task = tokio::task::spawn_blocking(move || drop(bg));
+        if tokio::time::timeout(Duration::from_secs(5), task).await.is_err() {
+            warn!("FUSE bg session drop timed out after 5s — leaking the session");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mount_path;
+        let task = tokio::task::spawn_blocking(move || bg.umount_and_join());
+        match tokio::time::timeout(Duration::from_secs(10), task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => warn!("FUSE umount returned error: {e}"),
+            Ok(Err(e)) => warn!("FUSE umount task panicked: {e}"),
+            Err(_) => warn!("FUSE umount_and_join timed out after 10s"),
         }
     }
 }
