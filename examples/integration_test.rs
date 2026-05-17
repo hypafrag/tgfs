@@ -313,7 +313,11 @@ fn ensure_scratch_dir() -> anyhow::Result<()> {
 }
 
 fn scratch_path(idx: usize, name: &str) -> PathBuf {
-    Path::new(SCRATCH_DIR).join(format!("msg{:03}-{}", idx, name))
+    // Each message gets its own subdirectory so we can keep the original
+    // filename — grammers derives the Telegram document name from the path.
+    let dir = Path::new(SCRATCH_DIR).join(format!("msg{:03}", idx));
+    fs::create_dir_all(&dir).expect("create scratch subdir");
+    dir.join(name)
 }
 
 async fn upload_message(
