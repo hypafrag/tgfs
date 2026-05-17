@@ -89,7 +89,13 @@ Lives at `examples/integration_test.rs`. Uses real Telegram credentials from `tg
 cargo run --example integration_test
 # or with explicit paths
 cargo run --example integration_test -- --config tgfs.yml --spec test_channels.yml
+# turn up verbosity and capture to a file (file is truncated each run)
+cargo run --example integration_test -- --log-level debug --log-file integration_test.log
 ```
+
+`--log-level` accepts the same syntax as `RUST_LOG` (e.g. `debug`, `info,tgfs=trace`). When `--log-file` is omitted, logs go to stderr.
+
+**Troubleshooting tip.** When the runner errors or behaves unexpectedly, re-run with `--log-level debug --log-file integration_test.log` and inspect that file — it captures every Telegram RPC, FUSE callback, mount/unmount, and download in chronological order, which is faster to read than stepping through code.
 
 The runner is **destructive against the named test channel**. It deletes every message and re-uploads when the spec changes. The account running it must be an admin of that channel; if the channel doesn't exist in the account's dialogs, the runner errors out with instructions to create it manually.
 

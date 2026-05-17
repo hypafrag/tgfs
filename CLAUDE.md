@@ -72,6 +72,12 @@ This enables media seeking in browsers and players.
 - `src/server.rs` — axum router, directory listings (channel root / virtual dir / archive interior), file/multipart/archive streaming with Range support. Archive prefix matching for both directory and file paths goes through `match_archive()`.
 - `src/fuse.rs` — `TgfsFS` implementing `fuser::Filesystem`. `FileAttr` construction goes through `dir_attr`/`file_attr` helpers; the path tree is built via `ensure_dir`/`ensure_dirs_along`/`add_file`. Sync FUSE reads call into async download via `block_download()` on the cached runtime handle.
 
+## Troubleshooting via logs
+
+When the integration runner (`cargo run --example integration_test`) misbehaves, re-run with `--log-level debug --log-file integration_test.log` and read that file before stepping through code. The log captures every Telegram RPC, FUSE callback, mount/unmount cycle, and download in chronological order — usually faster than reproducing the failure in a debugger. `--log-file` truncates on each run, so previous noise is gone.
+
+For the production binary, the same `log:` config knob in `tgfs.yml` (or `RUST_LOG=debug`) routes the same instrumentation to stderr. Key targets when narrowing down: `tgfs::indexer` (channel walk + ZIP indexing), `tgfs::fuse` (FUSE callbacks + deflate prefetch), `tgfs::realtime` (update dispatcher), `tgfs::server` (HTTP), `grammers_mtsender` / `grammers_mtproto` (raw RPC).
+
 ## Docker
 
 Multi-stage `Dockerfile`: `rust:bookworm` builder (needs `pkg-config` + `libfuse-dev` to link `fuser`), `debian:bookworm-slim` runtime with only `ca-certificates` and `fuse` (libfuse2 + `fusermount`). Binary is stripped. Container reads config and persistent state from `/data`. FUSE inside the container needs `--cap-add SYS_ADMIN`, `--device /dev/fuse`, and an `rshared` bind-mount on the target directory. See `README.md` for full run commands.

@@ -51,18 +51,30 @@ use tgfs::fuse as tgfs_fuse;
 struct Args {
     config: String,
     spec: String,
+    log_level: String,
+    log_file: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut config = "tgfs.yml".to_string();
     let mut spec = "test_channels.yml".to_string();
+    let mut log_level = "info,tgfs=info".to_string();
+    let mut log_file: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => config = it.next().expect("--config requires a path"),
             "--spec" => spec = it.next().expect("--spec requires a path"),
+            "--log-level" => log_level = it.next().expect("--log-level requires a value"),
+            "--log-file" => log_file = Some(it.next().expect("--log-file requires a path")),
             "-h" | "--help" => {
-                eprintln!("Usage: integration_test [--config tgfs.yml] [--spec test_channels.yml]");
+                eprintln!(
+                    "Usage: integration_test [--config tgfs.yml] [--spec test_channels.yml] \
+                     [--log-level info,tgfs=debug] [--log-file integration_test.log]\n\
+                     \n\
+                     --log-file is truncated (created from scratch) at every run.\n\
+                     When --log-file is omitted, logs go to stderr."
+                );
                 std::process::exit(0);
             }
             other => {
@@ -71,7 +83,40 @@ fn parse_args() -> Args {
             }
         }
     }
-    Args { config, spec }
+    Args { config, spec, log_level, log_file }
+}
+
+/// REMINDER FOR FUTURE SELF: when integration tests fail or behave oddly,
+/// re-run with `--log-level debug --log-file integration_test.log` and read
+/// the resulting file. The log captures every Telegram RPC, FUSE callback,
+/// mount/unmount cycle, and download in chronological order — that's where
+/// to look first before stepping through code.
+fn init_logger(level: &str, log_file: Option<&str>) -> anyhow::Result<()> {
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
+    builder.format(|buf, record| {
+        let ts = buf.timestamp_millis();
+        let level_style = buf.default_level_style(record.level());
+        writeln!(
+            buf,
+            "{ts} {level_style}{:5}{level_style:#} {}: {}",
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+    if let Some(path) = log_file {
+        // Created from scratch on every run so each test invocation starts
+        // with a clean log file — no need to manually rotate between runs.
+        let file = fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open(path)
+            .with_context(|| format!("opening log file {}", path))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+        // Force-disable ANSI styles since they don't render usefully in files.
+        builder.write_style(env_logger::WriteStyle::Never);
+    }
+    builder.init();
+    Ok(())
 }
 
 // ------------------------ Spec types ----------------------------------------
@@ -509,8 +554,8 @@ fn assert_layout_matches(root: &Path, expected: &HashMap<String, Vec<u8>>) -> an
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tgfs=info")).init();
     let args = parse_args();
+    init_logger(&args.log_level, args.log_file.as_deref())?;
 
     info!("loading {} and {}", args.config, args.spec);
     let cfg = config::load_config(&args.config)?;
