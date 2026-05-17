@@ -248,6 +248,30 @@ fn split_parent_name(p: &str) -> (String, String) {
     }
 }
 
+/// Pure: compare an old `(path → ino)` snapshot of a channel subtree against
+/// the post-rebuild path set, returning the dentries to delete (with their
+/// inode numbers) and the names to invalidate. Extracted as a free function
+/// so it can be exercised in isolation without spinning up a `TgfsFS`.
+fn compute_diff(old: HashMap<String, u64>, new_paths: HashSet<String>) -> TreeDiff {
+    let mut added: Vec<(u64, String)> = Vec::new();
+    let mut removed: Vec<(u64, u64, String)> = Vec::new();
+    for (path, ino) in &old {
+        if !new_paths.contains(path) {
+            let (parent_path, name) = split_parent_name(path);
+            let parent_ino = path_hash(&parent_path);
+            removed.push((parent_ino, *ino, name));
+        }
+    }
+    for path in &new_paths {
+        if !old.contains_key(path) {
+            let (parent_path, name) = split_parent_name(path);
+            let parent_ino = path_hash(&parent_path);
+            added.push((parent_ino, name));
+        }
+    }
+    TreeDiff { added, removed }
+}
+
 const DEFLATE_FETCH_CHUNK: usize = 2 * 1024 * 1024;
 const DEFLATE_PREFETCH_DEPTH: usize = 4;
 const INFLATE_CACHE_SIZE: usize = 1024 * 1024;
@@ -497,29 +521,9 @@ impl TgfsFS {
             let old = tree.drop_channel(dir, false);
             let mut new_paths: HashSet<String> = HashSet::new();
             tree.add_channel(dir, archive_view, &files, &mut new_paths);
-            self.compute_diff(old, new_paths)
+            compute_diff(old, new_paths)
         };
         self.dispatch_notifications(&diff);
-    }
-
-    fn compute_diff(&self, old: HashMap<String, u64>, new_paths: HashSet<String>) -> TreeDiff {
-        let mut added: Vec<(u64, String)> = Vec::new();
-        let mut removed: Vec<(u64, u64, String)> = Vec::new();
-        for (path, ino) in &old {
-            if !new_paths.contains(path) {
-                let (parent_path, name) = split_parent_name(path);
-                let parent_ino = path_hash(&parent_path);
-                removed.push((parent_ino, *ino, name));
-            }
-        }
-        for path in &new_paths {
-            if !old.contains_key(path) {
-                let (parent_path, name) = split_parent_name(path);
-                let parent_ino = path_hash(&parent_path);
-                added.push((parent_ino, name));
-            }
-        }
-        TreeDiff { added, removed }
     }
 
     fn dispatch_notifications(&self, diff: &TreeDiff) {
@@ -915,3 +919,8 @@ impl Filesystem for TgfsFS {
         reply.error(Errno::ENOENT);
     }
 }
+
+
+#[cfg(test)]
+#[path = "../tests/fuse.rs"]
+mod tests;

@@ -579,15 +579,20 @@ fn parse_zip64_extra(extra: &[u8], uncompressed: &mut u64, compressed: &mut u64,
     }
 }
 
-/// Look up a `key:` field in a single (non-grouped) message's text.
-fn message_field(msg: &grammers_client::message::Message, key: &str) -> Option<String> {
-    if msg.grouped_id().is_some() { return None; }
-    for line in msg.text().lines() {
+/// Pure: find the first line starting with `key`, return the trimmed value.
+fn parse_field_in_text(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
         if let Some(value) = line.strip_prefix(key) {
             return Some(value.trim().to_string());
         }
     }
     None
+}
+
+/// Look up a `key:` field in a single (non-grouped) message's text.
+fn message_field(msg: &grammers_client::message::Message, key: &str) -> Option<String> {
+    if msg.grouped_id().is_some() { return None; }
+    parse_field_in_text(msg.text(), key)
 }
 
 /// Interpret the value of a `path:` caption directive.
@@ -633,16 +638,12 @@ fn parse_bool_value(v: &str) -> bool {
     matches!(s.as_str(), "" | "true" | "yes" | "1")
 }
 
-/// Parse `path:`, `type:`, and `multipart:` from a grouped-album message.
-/// Unlike `message_field`, this reads captions on grouped messages — that's
-/// the whole point: an album carries one caption for all parts and we want
-/// to apply it uniformly.
-pub fn extract_group_caption(
-    msg: &grammers_client::message::Message,
-) -> Option<(i64, GroupCaption)> {
-    let gid = msg.grouped_id()?;
+/// Pure: parse caption directives from raw text. Returns `None` when no
+/// recognized directive is present. Extracted from `extract_group_caption`
+/// so the parsing can be unit-tested without constructing a `Message`.
+pub fn parse_caption_directives(text: &str) -> Option<GroupCaption> {
     let mut cap = GroupCaption::default();
-    for line in msg.text().lines() {
+    for line in text.lines() {
         if let Some(v) = line.strip_prefix("path:") {
             cap.path_override = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("type:") {
@@ -652,6 +653,18 @@ pub fn extract_group_caption(
         }
     }
     if cap.path_override.is_none() && cap.type_override.is_none() && !cap.multipart { return None; }
+    Some(cap)
+}
+
+/// Parse `path:`, `type:`, and `multipart:` from a grouped-album message.
+/// Unlike `message_field`, this reads captions on grouped messages — that's
+/// the whole point: an album carries one caption for all parts and we want
+/// to apply it uniformly.
+pub fn extract_group_caption(
+    msg: &grammers_client::message::Message,
+) -> Option<(i64, GroupCaption)> {
+    let gid = msg.grouped_id()?;
+    let cap = parse_caption_directives(msg.text())?;
     Some((gid, cap))
 }
 
@@ -1356,3 +1369,8 @@ async fn index_saved_messages(
         source: ChannelSource::SavedMessages,
     })
 }
+
+
+#[cfg(test)]
+#[path = "../tests/indexer.rs"]
+mod tests;

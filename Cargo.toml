@@ -2,6 +2,11 @@
 name = "tgfs"
 version = "0.1.0"
 edition = "2024"
+# Unit tests live at `tests/<module>.rs` and are attached to their source
+# module via `#[path = "../tests/<module>.rs"] mod tests;`. Disable Cargo's
+# integration-test auto-discovery so it doesn't try to build those files as
+# standalone test binaries.
+autotests = false
 
 [dependencies]
 grammers-client = "0.9"

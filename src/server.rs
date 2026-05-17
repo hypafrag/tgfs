@@ -582,3 +582,8 @@ pub fn make_router(state: Arc<AppState>) -> Router {
         .route("/{channel}/{*path}", get(handle_channel_path))
         .with_state(state)
 }
+
+
+#[cfg(test)]
+#[path = "../tests/server.rs"]
+mod tests;

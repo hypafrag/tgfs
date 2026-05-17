@@ -78,7 +78,7 @@ pub struct FileEntry {
     pub mtime: Option<SystemTime>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileType {
     File,
     Media,
@@ -319,3 +319,8 @@ pub fn dir_listing(title: &str, _parent: Option<&str>, entries: &[Entry]) -> Str
     write!(body, "</tbody>\n</table>\n</body>\n</html>").unwrap();
     body
 }
+
+
+#[cfg(test)]
+#[path = "../tests/index.rs"]
+mod tests;

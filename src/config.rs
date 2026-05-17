@@ -21,7 +21,7 @@ pub struct ChannelEntry {
     pub multipart_policy: MultipartPolicy,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Default, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum MultipartPolicy {
     /// No multipart detection — every message is its own file.
@@ -180,3 +180,8 @@ pub fn load_config(path: &str) -> anyhow::Result<Config> {
         .map_err(|_| anyhow::anyhow!("{} not found", path))?;
     Ok(serde_yaml::from_str(&expand_env(&data))?)
 }
+
+
+#[cfg(test)]
+#[path = "../tests/config.rs"]
+mod tests;
