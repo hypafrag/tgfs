@@ -7,7 +7,7 @@ use grammers_client::Client;
 use grammers_session::types::PeerRef;
 use smallvec::SmallVec;
 
-pub use crate::config::ArchiveView;
+pub use crate::config::{ArchiveView, MultipartPolicy};
 
 pub type DocParts = SmallVec<[Media; 1]>;
 pub type MsgIds = SmallVec<[i32; 1]>;
@@ -140,6 +140,10 @@ pub struct GroupCaption {
     pub path_override: Option<String>,
     /// `type:` directive value applied to every part of the group.
     pub type_override: Option<FileType>,
+    /// `multipart:` directive (or `multipart: true`). Honored only when the
+    /// owning channel's `multipart_policy` is `MultipartPolicy::Album`, in
+    /// which case the album's parts are concatenated into a single file.
+    pub multipart: bool,
 }
 
 /// Interned MIME-type pool. Behind a Mutex so background update tasks can
@@ -204,6 +208,7 @@ pub struct TelegramChannel {
     pub archive_view: ArchiveView,
     pub skip_deflated_id3v1: bool,
     pub collapse_by_prefix: Option<usize>,
+    pub multipart_policy: MultipartPolicy,
     /// Cheap-to-clone snapshot of the assembled file list. Swapped atomically
     /// when raw_entries change; readers clone the Arc and drop the lock.
     pub files: Arc<Vec<FileEntry>>,

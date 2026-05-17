@@ -7,7 +7,7 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 - **Directory listing** — Apache-style HTML index with file sizes. `GET /` lists channels, `GET /{channel}/` lists files.
 - **Virtual paths** — messages with `path: dir/sub/file.ext` in the caption place files under virtual directories. A trailing `/` (e.g. `path: dir/sub/`) keeps the original document filename.
 - **ZIP browsing** — archive contents are browsable as directories. Only the central directory is fetched at index time; inner files are extracted on demand via ranged downloads and DEFLATE inflation.
-- **Multipart files** — documents named `<base>.00`, `<base>.01`, … are auto-merged into a single logical file with seamless streaming.
+- **Multipart files** — opt-in per channel. Either auto-merge documents named `<base>.00`, `<base>.01`, … or merge every part of an album that carries a `multipart:` caption. See [`multipart_policy`](#multipart_policy).
 - **HTTP Range requests** — seeking works in browsers and media players for single files, multipart concatenations, and inner-archive entries.
 - **Media playback** — audio and video files are served with inline `Content-Disposition` for in-browser playback.
 - **FUSE mount** — mount channels as a local read-only filesystem (macOS/Linux) for use with standard file tools. Archive entries preserve their original Unix permissions (Info-ZIP `external file attributes`) when available.
@@ -71,6 +71,35 @@ Controls how `.zip` files are exposed:
 | `directory`          | Browse archive contents only (raw download → 404) |
 | `file_and_directory` | Both raw download and browsable contents          |
 
+### `multipart_policy`
+
+Controls whether and how separate Telegram messages get fused into one logical file. Per-channel; defaults to `none`.
+
+```yaml
+channels:
+  - name: Releases
+    multipart_policy: suffix
+  - name: Backups
+    multipart_policy: album
+```
+
+| Value              | Behavior                                                                                                                            |
+|--------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `none` *(default)* | No merging. Each message is its own file.                                                                                           |
+| `suffix`           | Documents whose filenames match `<base>.00`, `<base>.01`, … (two-digit, contiguous, starting at `.00`) are merged into `<base>`.    |
+| `album`            | Every part of a Telegram album (grouped multi-file upload) whose caption carries a `multipart:` directive is concatenated into one. |
+
+**`album` details.** Add `multipart:` (or `multipart: true`) to the caption when you post an album. Parts are concatenated in chronological order (oldest msg_id first). The combined file's path comes from the caption's `path:`:
+
+- `path: vacation.mp4` → merged file appears at channel root as `vacation.mp4`.
+- `path: clips/vacation.mp4` → merged file at `clips/vacation.mp4`.
+- `path: clips/` (trailing `/`) → directory-only; merged file keeps the **first part's** original document filename, placed under `clips/`.
+- no `path:` directive → merged file uses the first part's original document filename, at channel root.
+
+When `multipart:` is *absent* from an album caption, the album behaves as N independent files placed under the optional `path:` directory (see [Message caption overrides](#message-caption-overrides)).
+
+Bare flag-style directives without a value parse as `true`, so `multipart:` and `multipart: true` are equivalent. `false`/`no`/`0` (and any other value) disables it.
+
 ### `skip_deflated_id3v1`
 
 Per-channel workaround for audio players that probe the tail of every file for an ID3v1 tag (last 128 bytes, `TAG` magic). For deflate-compressed entries inside a ZIP, serving even a single byte near EOF requires inflating the **entire** compressed stream from the beginning — which can mean downloading and decoding gigabytes just to satisfy a 4 KB probe before playback starts.
@@ -105,6 +134,9 @@ Caption directives are recognized in any message text:
 - `path:` is **always treated as a directory** for every part of the album, with or without a trailing slash. The original document filenames are preserved. So `path: vacation` and `path: vacation/` are equivalent on an album and place every part under `vacation/`.
 - `type:` applies uniformly to every part of the album. `type: media` is the most common — e.g. a photo album captioned `path: vacation/`, where every photo becomes inline-playable under `vacation/`.
 - `type: zip` does **not** retroactively fetch archive indexes for parts whose underlying file wasn't already classified as a zip by MIME or `.zip` extension. Use the per-file caption (on a single-message upload) when you need browsable archives.
+- `multipart:` flips the album into a **single concatenated file** (requires `multipart_policy: album` on the channel). In that mode `path:` uses single-message semantics again: trailing `/` is directory-only, otherwise the value is the full path of the merged file. See [`multipart_policy`](#multipart_policy).
+
+**Flag-style directives.** Any caption directive without a value (`key:`) parses as `key: true`. Currently only `multipart:` uses this form.
 
 ### Proxy
 

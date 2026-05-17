@@ -15,6 +15,25 @@ pub struct ChannelEntry {
     /// that prefix (trailing whitespace stripped). 0 / absent = disabled.
     #[serde(default)]
     pub collapse_by_prefix: Option<usize>,
+    /// How to merge several Telegram messages into one logical file. Default
+    /// `none` (no merging). See `MultipartPolicy` for the available strategies.
+    #[serde(default)]
+    pub multipart_policy: MultipartPolicy,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MultipartPolicy {
+    /// No multipart detection — every message is its own file.
+    #[default]
+    None,
+    /// Auto-merge documents whose filenames match `<base>.NN` (two-digit part
+    /// numbers starting at `.00`, contiguous).
+    Suffix,
+    /// Merge every file attached to a Telegram album whose caption carries a
+    /// `multipart:` (or `multipart: true`) directive. Parts are concatenated
+    /// in chronological (msg_id ascending) order.
+    Album,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]

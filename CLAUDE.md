@@ -44,7 +44,12 @@ CLI: `tgfs [--config <path>]`. Default config path is `tgfs.yml` in the working 
 
 **Auto classification** (when no `type:` override): `audio/*` or `video/*` MIME → media; `application/zip` or `.zip` extension → zip; otherwise file.
 
-**Multipart files.** Documents whose filenames match `<base>.NN` (two-digit part numbers starting at `.00`, contiguous) are auto-merged into a single logical file. Streaming seamlessly concatenates parts on download. The `.00` message's `path:` override (if any) sets the exposed name.
+**Multipart files.** Opt-in per channel via `multipart_policy: none|suffix|album` (default `none`).
+- `suffix`: documents matching `<base>.NN` (two-digit, contiguous, starting at `.00`) are merged. `.00`'s `path:` override (if any) sets the exposed name.
+- `album`: Telegram-album posts whose caption carries `multipart:` (or `multipart: true`) are concatenated in chronological msg_id order. The album's `path:` directive takes single-message semantics on the combined file (trailing `/` = directory-only).
+Streaming seamlessly concatenates parts on download. Logic lives in `assemble_suffix_multipart()` / `assemble_album_multipart()` in `src/indexer.rs`.
+
+**Flag-style caption directives.** A caption like `key:` with no value parses as `key: true` (`parse_bool_value()` in `src/indexer.rs`). Currently `multipart:` is the only flag-style directive; `true`/`yes`/`1`/empty are truthy, anything else falsy.
 
 **ZIP browsing.** For `zip`-classified files, the EOCD + central directory is fetched at index time (only the tail bytes, not the whole archive). Archive entries appear as a virtual subdirectory named after the archive stem. Inner files are extracted by ranged-downloading the relevant local file header + compressed payload and inflating on the fly.
 

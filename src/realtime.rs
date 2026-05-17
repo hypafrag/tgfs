@@ -133,10 +133,10 @@ impl Dispatcher {
         ).await;
         let group_caption = extract_group_caption(msg);
 
-        let (mut raw_entries, mut group_captions, collapse) = {
+        let (mut raw_entries, mut group_captions, collapse, multipart_policy) = {
             let lock = self.state.channels.get(channel_name).unwrap();
             let g = lock.read().unwrap();
-            (g.raw_entries.clone(), g.group_captions.clone(), g.collapse_by_prefix)
+            (g.raw_entries.clone(), g.group_captions.clone(), g.collapse_by_prefix, g.multipart_policy)
         };
 
         let msg_id = msg.id();
@@ -170,6 +170,7 @@ impl Dispatcher {
             &group_captions,
             archive_view,
             collapse,
+            multipart_policy,
             &self.zip_cache,
         ).await;
 
@@ -186,11 +187,11 @@ impl Dispatcher {
     }
 
     async fn delete_messages(&self, channel_name: &str, msg_ids: &[i32]) -> anyhow::Result<()> {
-        let (mut raw_entries, group_captions, archive_view, collapse) = {
+        let (mut raw_entries, group_captions, archive_view, collapse, multipart_policy) = {
             let lock = self.state.channels.get(channel_name)
                 .ok_or_else(|| anyhow::anyhow!("unknown channel {}", channel_name))?;
             let g = lock.read().unwrap();
-            (g.raw_entries.clone(), g.group_captions.clone(), g.archive_view, g.collapse_by_prefix)
+            (g.raw_entries.clone(), g.group_captions.clone(), g.archive_view, g.collapse_by_prefix, g.multipart_policy)
         };
 
         let mut changed = false;
@@ -208,6 +209,7 @@ impl Dispatcher {
             &group_captions,
             archive_view,
             collapse,
+            multipart_policy,
             &self.zip_cache,
         ).await;
 

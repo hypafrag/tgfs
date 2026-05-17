@@ -11,7 +11,7 @@ use log::{debug, error, info, warn};
 use crate::config::{Config, ArchiveView};
 use crate::index::{
     FileEntry, FileType, ArchiveFileEntry, DocParts, MsgIds, TelegramChannel, RawEntry,
-    MimePool, ChannelSource, GroupCaption,
+    MimePool, ChannelSource, GroupCaption, MultipartPolicy,
 };
 use crate::zip_cache::{ZipCache, ZipCacheKey};
 use smallvec::smallvec;
@@ -625,10 +625,18 @@ fn parse_type_value(v: &str) -> Option<FileType> {
     }
 }
 
-/// Parse `path:` and `type:` from a grouped-album message. Unlike
-/// `message_field`, this reads captions on grouped messages — that's the
-/// whole point: an album carries one caption for all parts and we want to
-/// apply it uniformly.
+/// Caption-directive boolean parsing. A bare key (`multipart:`) parses as
+/// `true`; explicit `true`/`yes`/`1` also true; everything else false. Used
+/// for flag-style directives where the presence of the key is itself meaningful.
+fn parse_bool_value(v: &str) -> bool {
+    let s = v.trim().to_lowercase();
+    matches!(s.as_str(), "" | "true" | "yes" | "1")
+}
+
+/// Parse `path:`, `type:`, and `multipart:` from a grouped-album message.
+/// Unlike `message_field`, this reads captions on grouped messages — that's
+/// the whole point: an album carries one caption for all parts and we want
+/// to apply it uniformly.
 pub fn extract_group_caption(
     msg: &grammers_client::message::Message,
 ) -> Option<(i64, GroupCaption)> {
@@ -639,9 +647,11 @@ pub fn extract_group_caption(
             cap.path_override = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("type:") {
             cap.type_override = parse_type_value(v.trim().to_lowercase().as_str());
+        } else if let Some(v) = line.strip_prefix("multipart:") {
+            cap.multipart = parse_bool_value(v);
         }
     }
-    if cap.path_override.is_none() && cap.type_override.is_none() { return None; }
+    if cap.path_override.is_none() && cap.type_override.is_none() && !cap.multipart { return None; }
     Some((gid, cap))
 }
 
@@ -779,6 +789,7 @@ pub async fn assemble_channel_files(
     group_captions: &HashMap<i64, GroupCaption>,
     archive_view: ArchiveView,
     collapse_by_prefix: Option<usize>,
+    multipart_policy: MultipartPolicy,
     zip_cache: &Mutex<ZipCache>,
 ) -> Vec<FileEntry> {
     let mut files: Vec<FileEntry> = raw_entries
@@ -786,7 +797,48 @@ pub async fn assemble_channel_files(
         .map(|r| raw_entry_to_file(r, group_captions))
         .collect();
 
-    // Detect multipart files by inspecting the document filename (not message overrides).
+    let mut removed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+
+    match multipart_policy {
+        MultipartPolicy::None => {}
+        MultipartPolicy::Suffix => {
+            assemble_suffix_multipart(
+                &files, archive_view, client, zip_cache, &mut removed, &mut new_files,
+            ).await;
+        }
+        MultipartPolicy::Album => {
+            assemble_album_multipart(
+                &files, raw_entries, group_captions, archive_view, client, zip_cache,
+                &mut removed, &mut new_files,
+            ).await;
+        }
+    }
+
+    for (i, f) in files.drain(..).enumerate() {
+        if removed.contains(&i) { continue; }
+        if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
+        new_files.push(f);
+    }
+
+    new_files.sort_by_key(|f| f.name.to_lowercase());
+    if let Some(min_len) = collapse_by_prefix {
+        apply_prefix_collapse(&mut new_files, min_len);
+    }
+    new_files
+}
+
+/// Merge documents whose underlying filenames match `<base>.NN` (two-digit
+/// contiguous part numbers starting at `.00`). Part 0 may carry a `path:`
+/// override that renames the combined file.
+async fn assemble_suffix_multipart(
+    files: &[FileEntry],
+    archive_view: ArchiveView,
+    client: &Client,
+    zip_cache: &Mutex<ZipCache>,
+    removed: &mut std::collections::BTreeSet<usize>,
+    new_files: &mut Vec<FileEntry>,
+) {
     let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         if let Some((base, part)) = split_part_suffix(f.doc_name()) {
@@ -794,8 +846,6 @@ pub async fn assemble_channel_files(
         }
     }
 
-    let mut removed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    let mut new_files: Vec<FileEntry> = Vec::new();
     for (base, mut entries) in groups.into_iter() {
         if entries.len() < 2 { continue; }
         entries.sort_by_key(|&(_, p)| p);
@@ -816,7 +866,7 @@ pub async fn assemble_channel_files(
         }
 
         let mut exposed_name = base.clone();
-        if let Some((first_idx, _first_part)) = entries.iter().find(|&&(_, p)| p == 0) {
+        if let Some((first_idx, _)) = entries.iter().find(|&&(_, p)| p == 0) {
             let f0 = &files[*first_idx];
             let doc_name = f0.doc_name().to_string();
             if f0.name != doc_name { exposed_name = f0.name.clone(); }
@@ -855,18 +905,100 @@ pub async fn assemble_channel_files(
         if combined.name.trim().is_empty() || combined.name == "<unnamed>" { continue; }
         new_files.push(combined);
     }
+}
 
-    for (i, f) in files.drain(..).enumerate() {
-        if removed.contains(&i) { continue; }
-        if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
-        new_files.push(f);
+/// Merge every file attached to a Telegram album whose caption carries
+/// `multipart:` (or `multipart: true`). Parts are concatenated in
+/// chronological msg_id order. The album's `path:` directive (if any) takes
+/// single-message semantics on the combined file: a trailing `/` is
+/// directory-only; otherwise it specifies the full virtual path including
+/// the merged filename.
+async fn assemble_album_multipart(
+    files: &[FileEntry],
+    raw_entries: &HashMap<i32, RawEntry>,
+    group_captions: &HashMap<i64, GroupCaption>,
+    archive_view: ArchiveView,
+    client: &Client,
+    zip_cache: &Mutex<ZipCache>,
+    removed: &mut std::collections::BTreeSet<usize>,
+    new_files: &mut Vec<FileEntry>,
+) {
+    // Bucket file indices by grouped_id, but only for groups that opted-in
+    // via `multipart:` in their caption.
+    let mut by_gid: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        let msg_id = match f.msg_ids.first() { Some(&id) => id, None => continue };
+        let rec = match raw_entries.get(&msg_id) { Some(r) => r, None => continue };
+        let gid = match rec.grouped_id { Some(g) => g, None => continue };
+        if !group_captions.get(&gid).map_or(false, |c| c.multipart) { continue; }
+        by_gid.entry(gid).or_default().push(i);
     }
 
-    new_files.sort_by_key(|f| f.name.to_lowercase());
-    if let Some(min_len) = collapse_by_prefix {
-        apply_prefix_collapse(&mut new_files, min_len);
+    for (gid, mut indices) in by_gid {
+        if indices.len() < 2 { continue; }
+        // Chronological order: oldest msg_id (earliest album part) first.
+        indices.sort_by_key(|&i| files[i].msg_ids[0]);
+
+        let mut docs: DocParts = DocParts::new();
+        let mut combined_msg_ids: MsgIds = MsgIds::new();
+        let mut total_size: Option<usize> = Some(0);
+        for idx in &indices {
+            let f = &files[*idx];
+            docs.extend(f.parts.iter().cloned());
+            combined_msg_ids.extend(f.msg_ids.iter().copied());
+            match (total_size, f.size) {
+                (Some(acc), Some(s)) => total_size = Some(acc + s),
+                _ => total_size = None,
+            }
+        }
+
+        let cap = match group_captions.get(&gid) { Some(c) => c, None => continue };
+        let first = &files[indices[0]];
+        let first_doc_name = first.doc_name().to_string();
+
+        // For album-multipart, `path:` follows single-message semantics:
+        // trailing `/` = directory-only (use original filename), otherwise the
+        // value specifies the full virtual path of the merged file.
+        let raw_combined_name = match &cap.path_override {
+            Some(p) if p.ends_with('/') => {
+                let dir = p.trim_end_matches('/');
+                if dir.is_empty() { first_doc_name.clone() } else { format!("{}/{}", dir, first_doc_name) }
+            }
+            Some(p) if !p.trim().is_empty() => p.clone(),
+            _ => first_doc_name.clone(),
+        };
+        let (exposed_base, exposed_path) = split_name(&raw_combined_name);
+
+        let combined_file_type = cap.type_override.clone().unwrap_or_else(|| first.file_type.clone());
+
+        let mut archive_entries_combined: Option<Vec<ArchiveFileEntry>> = None;
+        if combined_file_type == FileType::Zip
+            && archive_view != ArchiveView::File
+            && !docs.is_empty()
+        {
+            let doc_vec: Vec<Document> = docs.iter().cloned().filter_map(|m| if let Media::Document(d) = m { Some(d) } else { None }).collect();
+            if doc_vec.len() == docs.len() {
+                debug!("Processing album multipart archive: {}", exposed_base);
+                archive_entries_combined = try_index_zip(client, &doc_vec, &exposed_base, zip_cache).await;
+            }
+        }
+
+        let combined = FileEntry {
+            name: exposed_base,
+            path: exposed_path,
+            parts: docs,
+            msg_ids: combined_msg_ids,
+            size: total_size,
+            mime_idx: first.mime_idx,
+            archive_entries: archive_entries_combined,
+            file_type: combined_file_type,
+            mtime: first.mtime,
+        };
+
+        for idx in indices { removed.insert(idx); }
+        if combined.name.trim().is_empty() || combined.name == "<unnamed>" { continue; }
+        new_files.push(combined);
     }
-    new_files
 }
 
 pub async fn build_index(
@@ -917,13 +1049,14 @@ pub async fn build_index(
         info!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
         debug!("{} raw entries, {} group captions", raw_entries.len(), group_captions.len());
 
-        let files = assemble_channel_files(&client, &raw_entries, &group_captions, entry.archive_view, entry.collapse_by_prefix, zip_cache).await;
+        let files = assemble_channel_files(&client, &raw_entries, &group_captions, entry.archive_view, entry.collapse_by_prefix, entry.multipart_policy, zip_cache).await;
         info!("{} files (post-assembly)", files.len());
 
         let tchan = TelegramChannel {
             archive_view: entry.archive_view,
             skip_deflated_id3v1: entry.skip_deflated_id3v1,
             collapse_by_prefix: entry.collapse_by_prefix,
+            multipart_policy: entry.multipart_policy,
             files: Arc::new(files),
             raw_entries,
             group_captions,
@@ -1212,6 +1345,10 @@ async fn index_saved_messages(
         archive_view,
         skip_deflated_id3v1: false,
         collapse_by_prefix: None,
+        // Saved-messages keeps its own legacy suffix-merging pipeline below;
+        // this field is unused there because the saved indexer never calls
+        // assemble_channel_files.
+        multipart_policy: MultipartPolicy::None,
         files: Arc::new(new_files),
         raw_entries: HashMap::new(),
         group_captions: HashMap::new(),
