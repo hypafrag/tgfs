@@ -35,7 +35,9 @@ use grammers_client::tl;
 use grammers_session::types::PeerRef;
 use grammers_session::updates::UpdatesLike;
 use log::{info, warn};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(not(target_os = "macos"))]
+use notify::EventKind;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -801,6 +803,8 @@ fn drain_events(rx: &std_mpsc::Receiver<notify::Result<Event>>, dur: Duration) -
 }
 
 /// True if `events` contains a Remove event whose paths include `target`.
+/// Only used by `collect_remove_events`, which is itself macOS-skipped.
+#[cfg(not(target_os = "macos"))]
 fn events_contain_remove(events: &[Event], target: &Path) -> bool {
     events.iter().any(|e| {
         matches!(e.kind, EventKind::Remove(_))
@@ -922,15 +926,6 @@ async fn run_mutation_test(
         info!("✓ add mut_two.bin: listing keeps both mutables ({} watcher event(s))", ev.len());
 
         // -- Mutation 3: delete one message ---------------------------------
-        //
-        // Caveat: grammers 0.9 can't deserialize Telegram's channel-message
-        // delete update (constructor 0x84d19185 → `unexpected constructor`
-        // warning at the mtsender layer). The dispatcher therefore never
-        // receives a `MessageDeleted` for channel posts, so the FUSE tree
-        // doesn't update via the realtime path. We assert the Telegram-side
-        // delete actually happened (via iter_messages) and *soft-check* the
-        // FUSE state — a hard fail here would just block CI on a grammers
-        // bug. Adds via realtime continue to be hard-asserted (above).
         info!("mutation: delete mut_one.txt (msg {id1})");
         client.invoke(&tl::functions::channels::DeleteMessages {
             channel: peer.into(),
@@ -938,26 +933,12 @@ async fn run_mutation_test(
         }).await?;
         mutable_ids.retain(|&i| i != id1);
         verify_telegram_message_absent(&client, peer, id1).await?;
-        match wait_for_file_state(&p1, false, Duration::from_secs(5)) {
-            Ok(()) => {
-                let removed = collect_remove_events(&ev_rx, &p1, Duration::from_secs(2));
-                // Listing must also drop the entry — readdir and lookup
-                // agreeing on absence is the real proof of a clean delete.
-                assert_listing(&chan_dir, "mut_one.txt", false)?;
-                assert_listing(&chan_dir, "mut_two.bin", true)?;
-                if removed {
-                    info!("✓ delete mut_one.txt: realtime + watcher saw Remove + listing clean");
-                } else {
-                    warn!("delete mut_one.txt: FUSE+listing updated but watcher saw no Remove event \
-                           (macFUSE/FSEvents likely doesn't propagate FUSE_NOTIFY_DELETE)");
-                }
-            }
-            Err(_) => {
-                warn!("delete mut_one.txt: FUSE state NOT updated within 5s — \
-                       grammers 0.9 doesn't deserialize updateDeleteChannelMessages (84d19185); \
-                       Telegram-side delete confirmed, soft-passing");
-            }
-        }
+        wait_for_file_state(&p1, false, Duration::from_secs(5))?;
+        // Listing must drop the entry — readdir and lookup agreeing on
+        // absence is the real proof of a clean delete.
+        assert_listing(&chan_dir, "mut_one.txt", false)?;
+        assert_listing(&chan_dir, "mut_two.bin", true)?;
+        check_watcher_saw_delete("mut_one.txt", &ev_rx, &p1)?;
 
         // -- Mutation 4: delete the remaining mutable message ----------------
         info!("mutation: delete mut_two.bin (msg {id2})");
@@ -967,20 +948,11 @@ async fn run_mutation_test(
         }).await?;
         mutable_ids.retain(|&i| i != id2);
         verify_telegram_message_absent(&client, peer, id2).await?;
-        let fs_clear = wait_for_file_state(&p2, false, Duration::from_secs(5)).is_ok();
-        let removed = fs_clear && collect_remove_events(&ev_rx, &p2, Duration::from_secs(2));
-        if fs_clear {
-            // Both mutables should now be gone from the channel listing.
-            assert_listing(&chan_dir, "mut_two.bin", false)?;
-            assert_listing(&chan_dir, "mut_one.txt", false)?;
-        }
-        if removed {
-            info!("✓ delete mut_two.bin: watcher saw Remove event");
-        } else if fs_clear {
-            warn!("delete mut_two.bin: FUSE updated but watcher saw no Remove event");
-        } else {
-            warn!("delete mut_two.bin: FUSE state NOT updated within 5s (same grammers issue)");
-        }
+        wait_for_file_state(&p2, false, Duration::from_secs(5))?;
+        // Both mutables should now be gone from the channel listing.
+        assert_listing(&chan_dir, "mut_two.bin", false)?;
+        assert_listing(&chan_dir, "mut_one.txt", false)?;
+        check_watcher_saw_delete("mut_two.bin", &ev_rx, &p2)?;
 
         Ok(())
     }.await;
@@ -1001,9 +973,51 @@ async fn run_mutation_test(
     outcome
 }
 
+/// Watcher-event check after a confirmed delete.
+///
+/// Linux: `FUSE_NOTIFY_DELETE` reaches inotify, so the watcher MUST observe a
+/// Remove event — anything else is a regression and we hard-fail. Logs "✓" on
+/// pass.
+///
+/// macOS: macFUSE-emitted notify messages don't propagate into FSEvents (the
+/// notify crate's macOS backend). Asserting Remove events here would be testing
+/// the kernel-extension/FSEvents gap rather than tgfs behavior, so we skip the
+/// check — but **loudly**, at INFO level next to the "✓" pass lines, so the
+/// skip is impossible to miss when reading the log. The earlier
+/// `wait_for_file_state` + `assert_listing` checks have already validated that
+/// the deletion fully propagated through Telegram → grammers → dispatcher →
+/// FUSE tree; only the downstream "tell external watchers" hop is what we're
+/// declining to assert on macOS.
+fn check_watcher_saw_delete(
+    name: &str,
+    _rx: &std_mpsc::Receiver<notify::Result<Event>>,
+    _path: &Path,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        info!(
+            "⊘ delete {name}: FUSE + listing clean; SKIPPED watcher Remove-event \
+             check on macOS (macFUSE doesn't deliver FUSE_NOTIFY_DELETE to FSEvents)"
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if collect_remove_events(_rx, _path, Duration::from_secs(2)) {
+            info!("✓ delete {name}: FUSE + listing clean; watcher saw Remove event");
+            Ok(())
+        } else {
+            bail!(
+                "delete {name}: FUSE state updated but the native fs watcher saw \
+                 no Remove event — FUSE_NOTIFY_DELETE didn't propagate to inotify"
+            );
+        }
+    }
+}
+
 /// Confirm a Telegram message is gone server-side. Used by the delete
 /// assertions to distinguish "Telegram didn't process the delete" from
-/// "grammers couldn't propagate the delete update to the dispatcher".
+/// "the delete update never reached the dispatcher".
 async fn verify_telegram_message_absent(client: &Client, peer: PeerRef, id: i32) -> anyhow::Result<()> {
     let mut messages = client.iter_messages(peer);
     while let Some(m) = messages.next().await? {
@@ -1018,7 +1032,10 @@ async fn verify_telegram_message_absent(client: &Client, peer: PeerRef, id: i32)
 }
 
 /// Wait up to `timeout` for a Remove event referencing `target`. Returns as
-/// soon as one shows up; otherwise returns false at deadline.
+/// soon as one shows up; otherwise returns false at deadline. Only used on
+/// platforms where the OS-native watcher receives FUSE delete events
+/// (currently: not macOS — see `check_watcher_saw_delete`).
+#[cfg(not(target_os = "macos"))]
 fn collect_remove_events(
     rx: &std_mpsc::Receiver<notify::Result<Event>>,
     target: &Path,
