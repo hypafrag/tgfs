@@ -36,6 +36,15 @@ aes = "0.8"
 ctr = "0.9"
 crc32fast = "1"
 getrandom = "0.2"
+indicatif = "0.17"
+
+[[bin]]
+name = "tgfs"
+path = "src/main.rs"
+
+[[bin]]
+name = "tgup"
+path = "src/bin/tgup.rs"
 
 # Until upstream grammers ships a fix for `channels.deleteMessages` not carrying
 # the deleted message IDs through to `UpdateDeleteChannelMessages.messages`,
