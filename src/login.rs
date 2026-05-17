@@ -30,7 +30,17 @@ pub async fn make_client(
     api_id: i32,
     proxy_url: Option<String>,
 ) -> anyhow::Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>)> {
-    let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
+    make_client_with_session(api_id, proxy_url, SESSION_FILE).await
+}
+
+/// Same as [`make_client`] but reads the SQLite session from `session_path`
+/// instead of the default `session.sqlite3` in the current directory.
+pub async fn make_client_with_session(
+    api_id: i32,
+    proxy_url: Option<String>,
+    session_path: &str,
+) -> anyhow::Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>)> {
+    let session = Arc::new(SqliteSession::open(session_path).await?);
     let params = ConnectionParams { proxy_url, ..Default::default() };
     let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, params);
     tokio::spawn(pool.runner.run());
@@ -70,8 +80,19 @@ pub async fn setup_proxy(config: &Config) -> anyhow::Result<Option<String>> {
 pub async fn connect_and_authorize(
     config: &Config,
 ) -> anyhow::Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>)> {
+    connect_and_authorize_with_session(config, SESSION_FILE).await
+}
+
+/// Like [`connect_and_authorize`] but stores/reads the SQLite session at
+/// `session_path`. Used by `tgup` to keep the session under
+/// `~/.config/tgfs/session.sqlite3` rather than the current directory.
+pub async fn connect_and_authorize_with_session(
+    config: &Config,
+    session_path: &str,
+) -> anyhow::Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>)> {
     let proxy_url = setup_proxy(config).await?;
-    let (mut client, mut updates_rx) = make_client(config.api_id, proxy_url.clone()).await?;
+    let (mut client, mut updates_rx) =
+        make_client_with_session(config.api_id, proxy_url.clone(), session_path).await?;
 
     if client.is_authorized().await? {
         return Ok((client, updates_rx));
@@ -82,8 +103,9 @@ pub async fn connect_and_authorize(
         Ok(t) => t,
         Err(InvocationError::Rpc(e)) if e.is("AUTH_RESTART") => {
             warn!("Session invalidated by Telegram, resetting...");
-            std::fs::remove_file(SESSION_FILE).ok();
-            let (c, rx) = make_client(config.api_id, proxy_url).await?;
+            std::fs::remove_file(session_path).ok();
+            let (c, rx) =
+                make_client_with_session(config.api_id, proxy_url, session_path).await?;
             client = c;
             updates_rx = rx;
             client.request_login_code(&config.phone, &config.api_hash).await?

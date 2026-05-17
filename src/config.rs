@@ -103,6 +103,39 @@ impl LogConfig {
     }
 }
 
+/// ffmpeg invocation parameters used by `tgup --encode-video`. `encode_args`
+/// is appended to `ffmpeg -y -loglevel error -i <input>` (with the output
+/// container forced to mp4 piped to stdout). `thumbnail_args` is the same but
+/// for the per-video JPEG thumbnail attached to uploaded video messages.
+#[derive(Deserialize, Clone)]
+pub struct FfmpegConfig {
+    #[serde(default = "default_ffmpeg_encode_args")]
+    pub encode_args: String,
+    #[serde(default = "default_ffmpeg_thumbnail_args")]
+    pub thumbnail_args: String,
+}
+
+impl Default for FfmpegConfig {
+    fn default() -> Self {
+        Self {
+            encode_args: default_ffmpeg_encode_args(),
+            thumbnail_args: default_ffmpeg_thumbnail_args(),
+        }
+    }
+}
+
+fn default_ffmpeg_encode_args() -> String {
+    "-threads 2 -c:v libx264 -preset veryslow -profile:v main -level 4.1 -crf 23 \
+     -pix_fmt yuv420p -movflags +faststart \
+     -vf \"scale=-2:720:force_original_aspect_ratio=decrease\" \
+     -r 24 -g 48 -sc_threshold 0 -c:a aac -b:a 128k -ar 48000".to_string()
+}
+
+fn default_ffmpeg_thumbnail_args() -> String {
+    "-vf \"thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease\" \
+     -frames:v 1 -q:v 5".to_string()
+}
+
 #[derive(Deserialize)]
 pub struct Config {
     pub api_id: i32,
@@ -114,6 +147,10 @@ pub struct Config {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub mount_at: Option<String>,
+    /// ffmpeg invocation parameters. Used only by `tgup --encode-video`; the
+    /// daemon itself never shells out to ffmpeg.
+    #[serde(default)]
+    pub ffmpeg: FfmpegConfig,
     /// If set, expose Saved Messages as a top-level directory.
     /// Use `directory` to set the top-level directory name; `archive_view`
     /// controls how ZIP archives are exposed (`file|directory|file_and_directory`).
