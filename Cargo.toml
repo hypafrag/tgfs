@@ -36,3 +36,15 @@ aes = "0.8"
 ctr = "0.9"
 crc32fast = "1"
 getrandom = "0.2"
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+hex = "0.4"
+base64 = "0.22"
+
+# The integration test is an example because examples have access to
+# dev-dependencies (regular [[bin]] targets don't). Invoke as:
+#   cargo run --example integration_test
+[[example]]
+name = "integration_test"
+path = "examples/integration_test.rs"

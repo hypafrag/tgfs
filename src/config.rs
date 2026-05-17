@@ -48,7 +48,7 @@ fn default_archive_view() -> ArchiveView {
     ArchiveView::File
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyType {
     #[default]
@@ -56,7 +56,7 @@ pub enum ProxyType {
     Mtproxy,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
     pub host: String,
     pub port: u16,

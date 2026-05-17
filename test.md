@@ -79,9 +79,74 @@ Caption directive parsing, multipart suffix detection, ZIP central-directory par
 - `dir_listing` HTML output is stable and renders deterministically; a `insta` snapshot would catch unintentional HTML changes.
 - Sorted channel listings and `fmt_system_time` round-trips would also fit.
 
+## Integration test runner
+
+Lives at `examples/integration_test.rs`. Uses real Telegram credentials from `tgfs.yml` (ignoring its `channels:` block) and reads a channel spec from `test_channels.yml`. Connects, repopulates a dedicated test channel if its spec hash drifts, then mounts the channel under three `archive_view` settings and asserts the layout and file contents.
+
+### Running
+
+```bash
+cargo run --example integration_test
+# or with explicit paths
+cargo run --example integration_test -- --config tgfs.yml --spec test_channels.yml
+```
+
+The runner is **destructive against the named test channel**. It deletes every message and re-uploads when the spec changes. The account running it must be an admin of that channel; if the channel doesn't exist in the account's dialogs, the runner errors out with instructions to create it manually.
+
+### Idempotency
+
+The runner stores `tgfs-integration-test-spec=<sha256>` in the channel's "about" (description) field. On the next run, it computes the SHA-256 of the spec YAML bytes and compares. Match → skip repopulation. Mismatch → delete all messages, re-upload, write new hash.
+
+### Spec format (`test_channels.yml`)
+
+```yaml
+channel:
+  name: test-channel               # must already exist in the account
+  messages:
+    - text: "plain text message"   # no attachments
+    - text: "with files"
+      files:
+        - { name: a.txt, text: "hello" }       # inline UTF-8
+        - { name: b.bin, blob: "<base64>" }    # inline binary
+    - text: "path: subdir/"        # caption directive — places files under subdir/
+      files:
+        - { name: c.md, text: "..." }
+    - text: "with zip"
+      files:
+        - name: project.zip
+          zip:
+            - { name: README.md, deflated: true,  text: "..." }
+            - { name: logo.bin,  deflated: false, blob: "..." }   # stored, not deflated
+            - name: src                                            # directory
+              content:
+                - { name: main.py, deflated: true, text: "..." }
+```
+
+Each `FileSpec` has exactly one of `text:` / `blob:` / `zip:`. Each `ZipEntry` is either a file (`text:`/`blob:` + `deflated:` flag, default `true`) or a directory (`content:` list of nested entries). Caption text in a `MessageSpec` becomes the Telegram message caption; a `path:` line there exercises the path-directive code path through the indexer.
+
+### Coverage at the mount layer
+
+For each `archive_view` value (`file`, `directory`, `file_and_directory`), the runner mounts at `/tmp/tgfs/test/mount`, walks the expected paths, reads each file, and byte-compares against the spec-derived expected content:
+
+- **`file`**: top-level files plus the zip as a flat document (zip-as-file read exercised).
+- **`directory`**: top-level files (zip itself is hidden) plus every inner-zip entry, with deflate compression covered on the read path.
+- **`file_and_directory`**: union of the above.
+
+Files under `path: subdir/` are looked up at `<channel>/subdir/<name>` so the path-directive routing is verified through the mount.
+
+### Scratch space
+
+Built files live under `/tmp/tgfs/test/<msgNNN>-<filename>` so Telegram has a real file path to upload from. The mount goes at `/tmp/tgfs/test/mount`. Both are created by the runner.
+
+### Limitations / known issues
+
+- **Network and Telegram quota.** First run is expensive (deletes + uploads); subsequent runs hit only the dialogs walk + about read.
+- **Photo/video media** isn't covered yet — only document uploads. The spec format supports it, but the runner forces `force_file: true` via `InputMessage::file()`.
+- **`multipart_policy: album` and `suffix`** aren't yet variants of the test matrix — currently only `archive_view` is varied. Easy to add a `messages: [{multipart: true, files: [...]}]` test case once large-file support arrives.
+
 ## TODO: integration tests
 
-Defer to a future commit. These need infrastructure that unit tests intentionally avoid:
+These remain on the wish list; the runner above covers small-file, single-channel cases:
 
 - **End-to-end multipart assembly.** Construct a fake channel via `assemble_channel_files` with synthetic `RawEntry` fixtures (Photo media — easier to construct than Document) and verify multipart `suffix` vs `album` produce the expected `FileEntry` layout. Requires mocking or constructing `grammers_client::media::Media`, which has no constructor — needs a test fixture loaded from a saved `tl::types::*` payload or a thin wrapper trait inserted around media access.
 - **FUSE tree rebuild + Notifier dispatch.** Run `TgfsFS::rebuild_channel` against a fixture `AppState` (no real Telegram), then either inspect `tree` state directly or stub the `Notifier` to record calls. Verifies add/remove path diff is correctly translated into `delete` / `inval_entry` notifications. Needs a way to construct a `TgfsFS` without `Handle::current()` (e.g. with a `tokio::test` runtime) and without the `Notifier` to actually send messages over a fuse fd.

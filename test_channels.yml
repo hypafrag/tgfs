@@ -1,0 +1,102 @@
+channel:
+  name: TGFS Test
+  messages:
+    # Simple text-only message
+    - text: |
+        Hello from test channel.
+        This message has no attachments.
+
+    # Message with plain text files
+    - text: Message with text attachments
+      files:
+        - name: readme.txt
+          text: |
+            This is a plain text file.
+            Multiple lines are supported.
+
+        - name: config.json
+          text: |
+            {
+              "env": "test",
+              "debug": true
+            }
+
+    # Message with binary blob attachment
+    - text: Message with binary file
+      files:
+        - name: image.png
+          blob: |
+            iVBORw0KGgoAAAANSUhEUgAAAAUA
+            AAAFCAYAAACNbyblAAAAHElEQVQI12P4
+            //8/w38GIAXDIBKE0DHxgljNBAAO
+            9TXL0Y4OHwAAAABJRU5ErkJggg==
+
+    # Message using the `path:` directive to place a single file under a virtual dir.
+    - text: |
+        path: docs/
+
+      files:
+        - name: notes.md
+          text: |
+            Filed under docs/ via the `path:` caption directive.
+
+    # Message with ZIP archive — each inner file specifies its compression
+    # via the `deflated` flag. Default for omitted flag is `true`.
+    - text: Message with zip archive
+      files:
+        - name: project.zip
+          zip:
+            # File in archive root (deflated)
+            - name: README.md
+              deflated: true
+              text: |
+                # Demo Project
+                This file is inside ZIP archive.
+
+            # Binary file in archive root, stored (not deflated)
+            - name: logo.bin
+              deflated: false
+              blob: |
+                AAECAwQFBgcICQoLDA0ODw==
+
+            # Directory in archive
+            - name: src
+              content:
+                - name: main.py
+                  deflated: true
+                  text: |
+                    def main():
+                        print("hello")
+
+                    if __name__ == "__main__":
+                        main()
+
+                - name: utils
+                  content:
+                    - name: helpers.py
+                      deflated: true
+                      text: |
+                        def add(a, b):
+                            return a + b
+
+                    - name: data.bin
+                      deflated: false
+                      blob: |
+                        SGVsbG8gZnJvbSBiaW5hcnkgZGF0YQ==
+
+            # Another nested directory
+            - name: assets
+              content:
+                - name: icons
+                  content:
+                    - name: app.ico
+                      deflated: false
+                      blob: |
+                        AQIDBAUGBwgJCgsMDQ4P
+
+                - name: styles.css
+                  deflated: true
+                  text: |
+                    body {
+                      background: #ffffff;
+                    }
