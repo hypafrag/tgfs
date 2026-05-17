@@ -666,6 +666,24 @@ impl Filesystem for TgfsFS {
         }
     }
 
+    // Read-only filesystem: there is never dirty state to write back. We reply
+    // `ok()` (rather than letting fuser default to `ENOSYS`) so the post-condition
+    // each hook promises — "all pending writes are durable" — is truthfully
+    // reported, instead of claiming the operation isn't supported. The kernel
+    // remaps `ENOSYS` to success here, so behavior is identical either way; the
+    // win is semantic accuracy plus quieter logs.
+    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<fuser::LockOwner>, _flush: bool, reply: ReplyEmpty) {
         let had = self.inner.inner.lock().unwrap().deflate_streams.remove(&fh.0).is_some();
         let path = self.inner.tree.read().unwrap().ino_to_path.get(&_ino.0).cloned().unwrap_or_else(|| "<unknown>".to_string());
