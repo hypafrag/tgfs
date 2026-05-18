@@ -24,11 +24,6 @@ use super::upload::{
     finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, VideoInfo,
 };
 
-/// Telegram rejects `InputFileBig` (the only API the streaming pipeline uses)
-/// for files at or below 10 MB with `FILE_PART_LENGTH_INVALID` at send time.
-/// We bail before send so the user gets a clear message instead.
-const MIN_BIG_FILE_BYTES: u64 = 10 * 1024 * 1024;
-
 /// Build the ffmpeg argv list (everything between `-i <input>` and `pipe:1`)
 /// from the structured config. Tuned for streaming and seekability:
 ///
@@ -394,26 +389,6 @@ pub async fn run_encoded_video(
 
     if files.is_empty() {
         bail!("ffmpeg produced no output for '{}'", source.display());
-    }
-
-    // Every part went through saveBigFilePart, which requires InputFileBig at
-    // send time — and Telegram rejects InputFileBig for files <= 10 MB. The
-    // streaming pipeline can't fall back to the small-file API mid-upload, so
-    // bail clearly if the encode (or its trailing multipart part) landed below
-    // the threshold.
-    for (idx, raw) in files.iter().enumerate() {
-        if raw.size <= MIN_BIG_FILE_BYTES {
-            let where_ = if files.len() == 1 {
-                format!("encoded '{}'", doc_filename)
-            } else {
-                format!("multipart part .{:02} of '{}'", idx, doc_filename)
-            };
-            bail!(
-                "{} is {} bytes (<= 10 MiB); small encoded videos are not yet \
-                 supported by the streaming uploader",
-                where_, raw.size,
-            );
-        }
     }
 
     // Single-message case.

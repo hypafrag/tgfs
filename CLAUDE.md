@@ -92,10 +92,26 @@ For the production binary, the same `log:` config knob in `tgfs.yml` (or `RUST_L
 Streaming/seeking baselines are always emitted: fragmented MP4 (`-movflags +frag_keyframe+empty_moov+default_base_moof`), 24 fps with a 2-second GOP (`-r 24 -g 48`), pixel format `yuv420p`. `thumbnail_args()` is hardcoded (`thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease`, one frame, q:v 5) — no config knob.
 
 **Encoded-video upload invariants.** `run_encoded_video()` in `src/bin/tgup/ffmpeg.rs`:
-- Must not branch on encoded size — small and large videos take the same code path. Don't probe the source size or buffer the ffmpeg head to pick between upload APIs.
+- Must not branch on encoded size — all videos take the same code path regardless of output size.
 - Must not buffer more than one 512 KB chunk of encoded data before pushing to Telegram. Stream ffmpeg's stdout straight into `upload_one_big_file` (`upload.saveBigFilePart` + `InputFileBig`); peak RAM stays at `TG_CHUNK`.
 
-**Small encoded files are not supported (yet).** Telegram rejects `InputFileBig` for files at or below 10 MiB with `FILE_PART_LENGTH_INVALID`, and the streaming pipeline can't fall back to the small-file API (`saveFilePart` + `InputFile`) mid-upload without buffering the first 10 MiB. After upload completes, `run_encoded_video()` checks `RawBigFile.size` for every part and bails with a clear error if any is ≤ 10 MiB (`MIN_BIG_FILE_BYTES`). Polish the large-file path first; revisit small-file support later.
+**Progress tracking design.** Two-bar layout: a per-file bar (`file_pb`) and an aggregate total bar (`total_pb`).
+
+- *Simple file uploads* (`upload_part_as_message`, `upload_album`): both bars are driven directly from bytes read by `ProgressReader` inside `client.upload_stream`. Bar length = file size on disk; position = bytes uploaded so far. `update_progress = true`.
+
+- *Encoded video uploads* (`run_encoded_video`): the encoded output size is unknown at plan time and may be larger or smaller than the source, so **bars must not be tied to encoded bytes**. Instead:
+  - ffmpeg is invoked with `-progress pipe:2`, which emits `key=value` lines (including `out_time_us`) on stderr.
+  - A dedicated async task reads `out_time_us` from that stream. `out_time_us` is the encoded timestamp in microseconds of the last processed frame — a monotonically increasing proxy for how far through the source file ffmpeg has read.
+  - `file_pb` length = `source_size`; position = `(out_time_us / duration_us) × source_size`.
+  - `total_pb` receives increments computed the same way: `(Δout_time_us / duration_us) × source_size`.
+  - After the upload loop, a top-up ensures `total_pb` receives exactly `source_size` in total (compensating for fp rounding and the final `out_time_us` not reaching `duration_us` exactly).
+  - Both bars are snapped to 100 % once ffmpeg exits and the progress task drains.
+  - The uploader (`upload_one_big_file`) receives `update_progress = false` for encoded videos and never touches either bar, eliminating any race between the two drivers.
+  - Fallback: when `duration_us` is unavailable (ffprobe failed), `update_progress = true` is passed and the uploader drives bars from encoded bytes as a best-effort estimate.
+
+- *Why not use `total_size` from the progress pipe?* ffmpeg emits `total_size=N/A` for fragmented MP4 written to a pipe, making it unreliable.
+- *Why not use bitrate × duration as an estimate?* codecs like `h264_videotoolbox` use quality-based VBR (`-q:v`), not a bitrate target, so the output can be larger than the source. Any size estimate derived from bitrate is wrong often enough to cause the bar to freeze or overflow.
+- *Why `out_time_us` and not `out_time_ms`?* Despite the name, ffmpeg's `out_time_ms` carries the same microsecond value as `out_time_us` — both are in µs. The code reads `out_time_us` to avoid the ambiguity.
 
 ## Docker
 
