@@ -3,7 +3,8 @@
 
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
 use grammers_client::Client;
@@ -17,9 +18,12 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use super::plan::{PartSource, UploadPart};
-use super::progress::{set_bar_style, set_label, ProgressReader, SliceReader};
+use super::progress::{fmt_speed, set_bar_style, set_label, ProgressReader, SliceReader, LABEL_WIDTH};
 
 pub const TG_CHUNK: usize = 512 * 1024; // MTProto SaveBigFilePart chunk size
+/// Maximum number of `SaveBigFilePart` tasks allowed in flight at once.
+/// Caps the encode-buffer fill at `UPLOAD_CONCURRENCY × TG_CHUNK` bytes.
+pub const UPLOAD_CONCURRENCY: usize = 4;
 
 /// Metadata used to upload a part as a playable video message instead of a
 /// document attachment.
@@ -28,12 +32,13 @@ pub struct VideoInfo {
     pub duration: Duration,
     pub width: i32,
     pub height: i32,
+    pub streamable: bool,
 }
 
 pub fn video_attribute(info: &VideoInfo) -> Attribute {
     Attribute::Video {
         round_message: false,
-        supports_streaming: true,
+        supports_streaming: info.streamable,
         duration: info.duration,
         w: info.width,
         h: info.height,
@@ -183,6 +188,21 @@ pub fn finalize_big_file(raw: &RawBigFile, name: String) -> Uploaded {
     )
 }
 
+/// Per-file sub-bars for the encoded-video upload path.
+/// Passed to `upload_one_big_file` to track buffer fill and upload throughput.
+pub struct VideoUploadBars {
+    /// Bar showing combined bytes currently held in encode buffers
+    /// (0 – UPLOAD_CONCURRENCY × TG_CHUNK = 4 MB).
+    pub buf_pb: ProgressBar,
+    /// Counter used purely for its `bytes_per_sec` readout: Telegram upload speed.
+    pub upload_pb: ProgressBar,
+    /// Bytes in complete (fully-filled) buffers waiting for SaveBigFilePart to finish.
+    pub buf_fill: Arc<AtomicU64>,
+    /// Bytes accumulated so far into the buffer currently being filled from the pipe.
+    /// Reset to 0 each time a buffer is handed off for upload.
+    pub partial_fill: Arc<AtomicU64>,
+}
+
 /// Read up to `max_bytes` from `reader` and push them to Telegram in
 /// `TG_CHUNK`-sized parts via `upload.saveBigFilePart`. Returns the raw file
 /// handle (file_id + part count) and whether the reader is at EOF.
@@ -207,6 +227,7 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     // uploaded bytes. When false, an external driver (e.g. the ffmpeg
     // progress task) owns the bars and the uploader stays silent.
     update_progress: bool,
+    video_bars: Option<&VideoUploadBars>,
 ) -> anyhow::Result<(Option<RawBigFile>, bool)> {
     let file_id = random_file_id();
     let mut part_idx: i32 = 0;
@@ -214,10 +235,11 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     let mut eof = false;
     let mut scratch = [0u8; 64 * 1024];
 
-    // Use double-buffering: while one part is being uploaded we fill the
-    // next buffer. We spawn upload tasks for each part and await them at
-    // the end of the function to preserve ordering and error propagation.
-    let mut pending: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+    // Cap in-flight upload tasks to UPLOAD_CONCURRENCY: when the queue is full
+    // we await the oldest task before spawning a new one, providing back-pressure
+    // so the encoder cannot queue more than UPLOAD_CONCURRENCY × TG_CHUNK bytes.
+    let mut pending: std::collections::VecDeque<tokio::task::JoinHandle<anyhow::Result<()>>> =
+        std::collections::VecDeque::new();
     // Two alternating buffers: `cur_buf` holds the part we're about to send,
     // `next_buf` is filled while `cur_buf` is uploading.
     let mut cur_buf: Option<Vec<u8>> = None;
@@ -238,6 +260,9 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                     .context("reading ffmpeg stdout")?;
                 if n == 0 { eof = true; break; }
                 buf.extend_from_slice(&scratch[..n]);
+                if let Some(vb) = video_bars {
+                    vb.partial_fill.store(buf.len() as u64, Ordering::Relaxed);
+                }
             }
             if buf.is_empty() { break; }
             cur_buf = Some(buf);
@@ -269,14 +294,28 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
             file_total_parts_param = -1;
         }
 
+        // Track buffer fill: add this part's bytes before upload starts.
+        // partial_fill is reset to 0 because this buffer is now complete.
+        if let Some(vb) = video_bars {
+            vb.partial_fill.store(0, Ordering::Relaxed);
+            let new_fill = vb.buf_fill.fetch_add(n, Ordering::Relaxed) + n;
+            vb.buf_pb.set_position(new_fill);
+        }
         // Spawn upload for this part. Move `buf` into the task so we can
         // continue filling `next_buf` concurrently.
         let client_clone = client.clone();
         let file_id_c = file_id;
         let part_idx_c = part_idx;
         let tparam = file_total_parts_param;
+        let vb_buf_fill = video_bars.map(|vb| vb.buf_fill.clone());
+        let vb_buf_pb   = video_bars.map(|vb| vb.buf_pb.clone());
+        let vb_upload_pb = video_bars.map(|vb| vb.upload_pb.clone());
+        let part_len = n;
+        // Timestamp taken just before the RPC is dispatched so that elapsed
+        // time measures pure network round-trip, not buffer-fill idle time.
+        let t0 = Instant::now();
         let handle = tokio::spawn(async move {
-            client_clone
+            let res = client_clone
                 .invoke(&tl::functions::upload::SaveBigFilePart {
                     file_id: file_id_c,
                     file_part: part_idx_c,
@@ -285,9 +324,32 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                 })
                 .await
                 .with_context(|| format!("saveBigFilePart {}", part_idx_c))
-                .map(|_v| ())
+                .map(|_| ());
+            if res.is_ok() {
+                if let (Some(bf), Some(bp), Some(up)) = (vb_buf_fill, vb_buf_pb, vb_upload_pb) {
+                    let prev = bf.fetch_sub(part_len, Ordering::Relaxed);
+                    bp.set_position(prev.saturating_sub(part_len));
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        up.set_message(format!(
+                            "{:<w$} {}",
+                            "upload speed",
+                            fmt_speed(part_len as f64 / elapsed),
+                            w = LABEL_WIDTH,
+                        ));
+                    }
+                }
+            }
+            res
         });
-        pending.push(handle);
+        pending.push_back(handle);
+
+        // Back-pressure: drain the oldest pending task if we've hit the cap.
+        if pending.len() >= UPLOAD_CONCURRENCY {
+            let oldest = pending.pop_front().unwrap();
+            let res = oldest.await.context("join upload task")?;
+            res?;
+        }
 
         uploaded += n;
         if update_progress {
@@ -320,6 +382,9 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                     .context("reading ffmpeg stdout")?;
                 if m == 0 { eof = true; break; }
                 buf.extend_from_slice(&scratch[..m]);
+                if let Some(vb) = video_bars {
+                    vb.partial_fill.store(buf.len() as u64, Ordering::Relaxed);
+                }
             }
             if buf.is_empty() {
                 // No data for next part; continue loop which will see EOF.
@@ -332,7 +397,7 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
         }
     }
 
-    // Await any pending upload tasks and propagate their errors.
+    // Await any remaining pending upload tasks and propagate their errors.
     for h in pending {
         let res = h.await.context("join upload task")?;
         res?;

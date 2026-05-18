@@ -179,6 +179,12 @@ pub struct VideoArgs {
     /// divisibility hint and can produce odd widths libx264 rejects).
     #[serde(default = "default_vres")]
     pub vres: u32,
+    /// When true (default), emit `-movflags +frag_keyframe+empty_moov+default_base_moof`,
+    /// `-sc_threshold 0` (libx264 only), and `-g 48` so the output is seekable
+    /// as a fragmented MP4 stream. Set to false to let ffmpeg use its defaults
+    /// (e.g. for archival encodes where streaming is not required).
+    #[serde(default = "default_streamable")]
+    pub streamable: bool,
 }
 
 impl Default for VideoArgs {
@@ -187,6 +193,7 @@ impl Default for VideoArgs {
             codec: default_video_codec(),
             libx264preset: default_libx264_preset(),
             vres: default_vres(),
+            streamable: default_streamable(),
         }
     }
 }
@@ -194,6 +201,7 @@ impl Default for VideoArgs {
 fn default_video_codec() -> String { "auto".into() }
 fn default_libx264_preset() -> String { "slow".into() }
 fn default_vres() -> u32 { 720 }
+fn default_streamable() -> bool { true }
 
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]

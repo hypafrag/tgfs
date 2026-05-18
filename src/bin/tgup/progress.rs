@@ -106,3 +106,75 @@ pub fn set_spinner_style(pb: &ProgressBar) {
     );
     pb.enable_steady_tick(Duration::from_millis(120));
 }
+
+/// Wraps a reader and increments a single `ProgressBar` by bytes read.
+/// Used to track encode throughput from the ffmpeg stdout pipe.
+pub struct SpeedReader<R> {
+    pub inner: R,
+    pub pb: ProgressBar,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for SpeedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let after = buf.filled().len();
+        let delta = (after - before) as u64;
+        if delta > 0 {
+            self.pb.inc(delta);
+        }
+        r
+    }
+}
+
+/// Single-line speed readout using indicatif's built-in `bytes_per_sec`.
+/// Suitable when the bar is incremented continuously (e.g. the encode pipe).
+pub fn set_throughput_style(pb: &ProgressBar, label: &str) {
+    pb.set_style(
+        ProgressStyle::with_template(&format!(
+            "  {{msg:<{w}}} {{bytes_per_sec}}",
+            w = LABEL_WIDTH,
+        ))
+        .unwrap(),
+    );
+    pb.set_message(label.to_string());
+    pb.enable_steady_tick(Duration::from_millis(200));
+}
+
+/// Style for speeds computed externally (point-in-time per-chunk measurements).
+/// The caller is responsible for calling `pb.set_message(fmt_speed(...))` after
+/// each measurement; indicatif's built-in rate is not used.
+pub fn set_manual_speed_style(pb: &ProgressBar, initial_label: &str) {
+    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+    pb.set_message(format!("{:<w$}", initial_label, w = LABEL_WIDTH));
+    pb.disable_steady_tick();
+}
+
+/// Format a bytes-per-second value as a human-readable string using binary
+/// prefixes (KiB/s, MiB/s, GiB/s), matching indicatif's `{bytes_per_sec}` style.
+pub fn fmt_speed(bps: f64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    if bps >= GIB      { format!("{:.2} GiB/s", bps / GIB) }
+    else if bps >= MIB { format!("{:.2} MiB/s", bps / MIB) }
+    else if bps >= KIB { format!("{:.1} KiB/s", bps / KIB) }
+    else               { format!("{:.0} B/s", bps) }
+}
+
+/// Compact bar showing encode-buffer fill level (0 – 1 MB).
+pub fn set_buffer_bar_style(pb: &ProgressBar) {
+    pb.set_style(
+        ProgressStyle::with_template(&format!(
+            "  {{msg:<{w}}} [{{bar:30.yellow/black}}] {{bytes}}/{{total_bytes}}",
+            w = LABEL_WIDTH,
+        ))
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb.set_message("encode buffer");
+}

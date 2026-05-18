@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{bail, Context as _};
@@ -11,7 +12,7 @@ use grammers_client::Client;
 use grammers_client::media::InputMedia;
 use grammers_client::message::InputMessage;
 use grammers_session::types::PeerRef;
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar};
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::process::Command;
@@ -19,9 +20,10 @@ use tokio::process::Command;
 use tgfs::config::{EncodeArgs, MultipartPolicy, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
-use super::progress::{set_label, set_bar_style, set_spinner_style};
+use super::progress::{set_label, set_bar_style, set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style, SpeedReader};
 use super::upload::{
-    finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, VideoInfo,
+    finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, TG_CHUNK,
+    UPLOAD_CONCURRENCY, VideoInfo, VideoUploadBars,
 };
 
 /// Build the ffmpeg argv list (everything between `-i <input>` and `pipe:1`)
@@ -63,9 +65,11 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
             a.extend(["-profile:v".into(), "main".into()]);
             a.extend(["-level".into(), "4.1".into()]);
             a.extend(["-crf".into(), "23".into()]);
-            // Keep keyframes only at the regular GOP boundary so seeking
-            // lands on predictable offsets.
-            a.extend(["-sc_threshold".into(), "0".into()]);
+            if cfg.video.streamable {
+                // Keep keyframes only at the regular GOP boundary so seeking
+                // lands on predictable offsets.
+                a.extend(["-sc_threshold".into(), "0".into()]);
+            }
         }
         "h264_videotoolbox" => {
             // videotoolbox has no CRF; -q:v 50 is a reasonable mid-quality
@@ -77,10 +81,12 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     }
 
     a.extend(["-pix_fmt".into(), "yuv420p".into()]);
-    a.extend([
-        "-movflags".into(),
-        "+frag_keyframe+empty_moov+default_base_moof".into(),
-    ]);
+    if cfg.video.streamable {
+        a.extend([
+            "-movflags".into(),
+            "+frag_keyframe+empty_moov+default_base_moof".into(),
+        ]);
+    }
 
     a.extend([
         "-vf".into(),
@@ -91,7 +97,9 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     ]);
 
     a.extend(["-r".into(), "24".into()]);
-    a.extend(["-g".into(), "48".into()]);
+    if cfg.video.streamable {
+        a.extend(["-g".into(), "48".into()]);
+    }
 
     a.extend(["-c:a".into(), cfg.audio.codec.clone()]);
     a.extend(["-b:a".into(), cfg.audio.bitrate.clone()]);
@@ -223,6 +231,7 @@ async fn probe_video_file(path: &Path) -> Option<VideoInfo> {
         duration: Duration::from_secs_f64(d.max(0.0)),
         width: w,
         height: h,
+        streamable: true, // filled in by caller
     })
 }
 
@@ -235,6 +244,7 @@ pub async fn run_encoded_video(
     encode_args: &[String],
     thumbnail_args: &[String],
     item: &UploadItem,
+    mp: &MultiProgress,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
 ) -> anyhow::Result<()> {
@@ -252,9 +262,11 @@ pub async fn run_encoded_video(
         _ => unreachable!(),
     };
 
-    // Probe source for duration/dimensions (fragmented MP4 over pipe doesn't
-    // report total duration, and Telegram re-derives dimensions anyway).
-    let video_info = probe_video_file(&source).await;
+    // Probe source for duration/dimensions.
+    let video_info = probe_video_file(&source).await.map(|mut v| {
+        v.streamable = encode_args.iter().any(|a| a.contains("frag_keyframe"));
+        v
+    });
 
     // Thumbnail.
     let thumb_bytes = make_thumbnail_to_buffer(&source, thumbnail_args, file_pb).await?;
@@ -273,7 +285,7 @@ pub async fn run_encoded_video(
     cmd.arg("-progress").arg("pipe:2");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
+    let raw_stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
     // Duration in microseconds — denominator for mapping out_time_us to a
@@ -289,6 +301,38 @@ pub async fn run_encoded_video(
     set_label(file_pb, format!("uploading {}", doc_filename));
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(0);
+
+    // Sub-bars inserted between file_pb and total_pb for the duration of the
+    // encode+upload: buffer fill level, encode throughput, upload throughput.
+    let buf_pb = mp.insert_after(file_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));
+    set_buffer_bar_style(&buf_pb);
+    let encode_pb = mp.insert_after(&buf_pb, ProgressBar::new(0));
+    set_throughput_style(&encode_pb, "encode speed");
+    let upload_pb = mp.insert_after(&encode_pb, ProgressBar::new(0));
+    set_manual_speed_style(&upload_pb, "upload speed");
+    let video_bars = VideoUploadBars {
+        buf_pb: buf_pb.clone(),
+        upload_pb: upload_pb.clone(),
+        buf_fill: Arc::new(AtomicU64::new(0)),
+        partial_fill: Arc::new(AtomicU64::new(0)),
+    };
+    // Periodically refresh the buffer-fill bar so it updates at ~1 Hz even
+    // when no fill/drain events fire (e.g. encoder is slower than uploader).
+    let buf_tick_fill    = video_bars.buf_fill.clone();
+    let buf_tick_partial = video_bars.partial_fill.clone();
+    let buf_tick_pb      = buf_pb.clone();
+    let buf_tick_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let total = buf_tick_fill.load(std::sync::atomic::Ordering::Relaxed)
+                + buf_tick_partial.load(std::sync::atomic::Ordering::Relaxed);
+            buf_tick_pb.set_position(total);
+        }
+    });
+    // Wrap raw_stdout so each byte read from ffmpeg also increments encode_pb.
+    let mut tracked_stdout = SpeedReader { inner: raw_stdout, pb: encode_pb.clone() };
 
     // Shared stderr buffer for error reporting after child.wait().
     let stderr_buf = Arc::new(AsyncMutex::new(String::new()));
@@ -352,8 +396,8 @@ pub async fn run_encoded_video(
     let mut peek: Option<u8> = None;
     loop {
         let (raw, eof) = upload_one_big_file(
-            client, &mut stdout, &mut peek, PART_MAX,
-            file_pb, total_pb, uploader_drives,
+            client, &mut tracked_stdout, &mut peek, PART_MAX,
+            file_pb, total_pb, uploader_drives, Some(&video_bars),
         ).await?;
         if let Some(r) = raw { files.push(r); }
         if eof { break; }
@@ -365,6 +409,9 @@ pub async fn run_encoded_video(
             );
         }
     }
+
+    buf_tick_handle.abort();
+    let _ = buf_tick_handle.await;
 
     // Reap ffmpeg. After it exits its stderr pipe closes, so the progress
     // task drains to completion.
@@ -381,6 +428,9 @@ pub async fn run_encoded_video(
     // Snap file bar to 100 %.
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(source_size);
+    encode_pb.finish_and_clear();
+    buf_pb.finish_and_clear();
+    upload_pb.finish_and_clear();
 
     if !status.success() {
         let err = stderr_buf.lock().await.clone();

@@ -104,7 +104,7 @@ async fn run() -> anyhow::Result<()> {
     // LABEL_WIDTH).
     total_pb.set_style(
         ProgressStyle::with_template(&format!(
-            "{{msg:<{w}.{w}}} [{{bar:30.green/blue}}] {{bytes}}/{{total_bytes}} ({{bytes_per_sec}}, {{eta}})",
+            "{{msg:<{w}.{w}}} [{{bar:50.green/blue}}] {{bytes}}/{{total_bytes}} ({{eta}})",
             w = LABEL_WIDTH,
         ))
         .unwrap()
@@ -130,7 +130,7 @@ async fn run() -> anyhow::Result<()> {
                 run_encoded_video(
                     &client, peer,
                     &encode_args, &thumb_args,
-                    item, &file_pb, &total_pb,
+                    item, &mp, &file_pb, &total_pb,
                 ).await?;
             }
         }
