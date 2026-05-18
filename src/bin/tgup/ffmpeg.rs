@@ -20,7 +20,7 @@ use tokio::process::Command;
 use tgfs::config::{EncodeArgs, MultipartPolicy, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
-use super::progress::{set_label, set_bar_style, set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style, SpeedReader};
+use super::progress::{fmt_mib, set_label, set_bar_style, set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style, SpeedReader};
 use super::upload::{
     finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, TG_CHUNK,
     UPLOAD_CONCURRENCY, VideoInfo, VideoUploadBars,
@@ -114,7 +114,7 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
 pub fn thumbnail_args() -> Vec<String> {
     [
         "-vf",
-        "thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease",
+        "thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease,hue=s=0",
         "-frames:v",
         "1",
         "-q:v",
@@ -315,20 +315,30 @@ pub async fn run_encoded_video(
         upload_pb: upload_pb.clone(),
         buf_fill: Arc::new(AtomicU64::new(0)),
         partial_fill: Arc::new(AtomicU64::new(0)),
+        total_uploaded: Arc::new(AtomicU64::new(0)),
     };
     // Periodically refresh the buffer-fill bar so it updates at ~1 Hz even
     // when no fill/drain events fire (e.g. encoder is slower than uploader).
-    let buf_tick_fill    = video_bars.buf_fill.clone();
-    let buf_tick_partial = video_bars.partial_fill.clone();
-    let buf_tick_pb      = buf_pb.clone();
+    let buf_tick_fill     = video_bars.buf_fill.clone();
+    let buf_tick_partial  = video_bars.partial_fill.clone();
+    let buf_tick_uploaded = video_bars.total_uploaded.clone();
+    let buf_tick_pb       = buf_pb.clone();
+    let buf_max = (TG_CHUNK * UPLOAD_CONCURRENCY) as u64;
     let buf_tick_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let total = buf_tick_fill.load(std::sync::atomic::Ordering::Relaxed)
+            let fill = buf_tick_fill.load(std::sync::atomic::Ordering::Relaxed)
                 + buf_tick_partial.load(std::sync::atomic::Ordering::Relaxed);
-            buf_tick_pb.set_position(total);
+            let processed = buf_tick_uploaded.load(std::sync::atomic::Ordering::Relaxed);
+            buf_tick_pb.set_position(fill);
+            buf_tick_pb.set_message(format!(
+                "{} / {}  (processed: {})",
+                fmt_mib(fill),
+                fmt_mib(buf_max),
+                fmt_mib(processed),
+            ));
         }
     });
     // Wrap raw_stdout so each byte read from ffmpeg also increments encode_pb.

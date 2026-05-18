@@ -18,7 +18,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use super::plan::{PartSource, UploadPart};
-use super::progress::{fmt_speed, set_bar_style, set_label, ProgressReader, SliceReader, LABEL_WIDTH};
+use super::progress::{fmt_mib, fmt_speed, set_bar_style, set_label, ProgressReader, SliceReader, LABEL_WIDTH};
 
 pub const TG_CHUNK: usize = 512 * 1024; // MTProto SaveBigFilePart chunk size
 /// Maximum number of `SaveBigFilePart` tasks allowed in flight at once.
@@ -201,6 +201,8 @@ pub struct VideoUploadBars {
     /// Bytes accumulated so far into the buffer currently being filled from the pipe.
     /// Reset to 0 each time a buffer is handed off for upload.
     pub partial_fill: Arc<AtomicU64>,
+    /// Cumulative bytes confirmed uploaded to Telegram for this file.
+    pub total_uploaded: Arc<AtomicU64>,
 }
 
 /// Read up to `max_bytes` from `reader` and push them to Telegram in
@@ -310,6 +312,8 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
         let vb_buf_fill = video_bars.map(|vb| vb.buf_fill.clone());
         let vb_buf_pb   = video_bars.map(|vb| vb.buf_pb.clone());
         let vb_upload_pb = video_bars.map(|vb| vb.upload_pb.clone());
+        let vb_total_uploaded = video_bars.map(|vb| vb.total_uploaded.clone());
+        let buf_max = (TG_CHUNK * UPLOAD_CONCURRENCY) as u64;
         let part_len = n;
         // Timestamp taken just before the RPC is dispatched so that elapsed
         // time measures pure network round-trip, not buffer-fill idle time.
@@ -326,9 +330,19 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                 .with_context(|| format!("saveBigFilePart {}", part_idx_c))
                 .map(|_| ());
             if res.is_ok() {
-                if let (Some(bf), Some(bp), Some(up)) = (vb_buf_fill, vb_buf_pb, vb_upload_pb) {
+                if let (Some(bf), Some(bp), Some(up), Some(tu)) =
+                    (vb_buf_fill, vb_buf_pb, vb_upload_pb, vb_total_uploaded)
+                {
                     let prev = bf.fetch_sub(part_len, Ordering::Relaxed);
-                    bp.set_position(prev.saturating_sub(part_len));
+                    let new_fill = prev.saturating_sub(part_len);
+                    let processed = tu.fetch_add(part_len, Ordering::Relaxed) + part_len;
+                    bp.set_position(new_fill);
+                    bp.set_message(format!(
+                        "{} / {}  (processed: {})",
+                        fmt_mib(new_fill),
+                        fmt_mib(buf_max),
+                        fmt_mib(processed),
+                    ));
                     let elapsed = t0.elapsed().as_secs_f64();
                     if elapsed > 0.0 {
                         up.set_message(format!(

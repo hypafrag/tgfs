@@ -166,15 +166,23 @@ pub fn fmt_speed(bps: f64) -> String {
     else               { format!("{:.0} B/s", bps) }
 }
 
-/// Compact bar showing encode-buffer fill level (0 – 1 MB).
+/// Compact bar showing encode-buffer fill level.
+/// Uses `{prefix}` for the fixed label, `{bar}` for the fill indicator,
+/// and `{msg}` for the caller-formatted size + processed annotation.
 pub fn set_buffer_bar_style(pb: &ProgressBar) {
     pb.set_style(
         ProgressStyle::with_template(&format!(
-            "  {{msg:<{w}}} [{{bar:30.yellow/black}}] {{bytes}}/{{total_bytes}}",
+            "  {{prefix:<{w}}} [{{bar:30.yellow/black}}] {{msg}}",
             w = LABEL_WIDTH,
         ))
         .unwrap()
         .progress_chars("=>-"),
     );
-    pb.set_message("encode buffer");
+    pb.set_prefix("encode buffer");
+    pb.set_message("0.00 MiB / 0.00 MiB  (processed: 0.00 MiB)");
+}
+
+/// Format a byte count as MiB with two decimal places.
+pub fn fmt_mib(bytes: u64) -> String {
+    format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
