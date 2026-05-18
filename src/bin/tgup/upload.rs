@@ -168,6 +168,7 @@ pub async fn upload_thumb(client: &Client, bytes: Vec<u8>, name: &str) -> anyhow
 pub struct RawBigFile {
     pub file_id: i64,
     pub parts: i32,
+    #[allow(dead_code)]
     pub size: u64,
 }
 
