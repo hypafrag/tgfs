@@ -22,7 +22,7 @@ use tgfs::config::{self, Config};
 use tgfs::login::connect_and_authorize_with_session;
 
 use args::{default_config_path, default_session_path, parse_args, DirMode};
-use ffmpeg::{ffmpeg_in_path, run_encoded_video, split_shell_args};
+use ffmpeg::{build_encode_args, ffmpeg_in_path, run_encoded_video, thumbnail_args};
 use plan::{collect_path, find_channel, print_plan, UploadItem};
 use progress::{set_bar_style, set_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
@@ -67,10 +67,8 @@ async fn run() -> anyhow::Result<()> {
             .with_context(|| format!("creating '{}'", parent.display()))?;
     }
 
-    let encode_args = split_shell_args(&config.ffmpeg.encode_args)
-        .context("parsing ffmpeg.encode_args")?;
-    let thumbnail_args = split_shell_args(&config.ffmpeg.thumbnail_args)
-        .context("parsing ffmpeg.thumbnail_args")?;
+    let encode_args = build_encode_args(&config.ffmpeg.encode_args);
+    let thumb_args = thumbnail_args();
 
     let cwd = std::env::current_dir()
         .context("can't determine current working directory")?
@@ -131,7 +129,7 @@ async fn run() -> anyhow::Result<()> {
             UploadItem::EncodedVideo { .. } => {
                 run_encoded_video(
                     &client, peer,
-                    &encode_args, &thumbnail_args,
+                    &encode_args, &thumb_args,
                     item, &file_pb, &total_pb,
                 ).await?;
             }

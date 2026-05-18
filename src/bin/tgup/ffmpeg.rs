@@ -14,7 +14,7 @@ use indicatif::ProgressBar;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use tgfs::config::MultipartPolicy;
+use tgfs::config::{EncodeArgs, MultipartPolicy, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
 use super::progress::{set_label, set_spinner_style};
@@ -22,39 +22,102 @@ use super::upload::{
     finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, VideoInfo,
 };
 
-/// Split a config string into argv-style tokens. Honors double and single
-/// quotes; backslash escapes the next character (outside single quotes). The
-/// surrounding quote characters are stripped from the produced tokens.
-pub fn split_shell_args(s: &str) -> anyhow::Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_dq = false;
-    let mut in_sq = false;
-    let mut escape = false;
-    let mut had_token = false;
-    for c in s.chars() {
-        if escape {
-            cur.push(c);
-            escape = false;
-            had_token = true;
-            continue;
+/// Telegram rejects `InputFileBig` (the only API the streaming pipeline uses)
+/// for files at or below 10 MB with `FILE_PART_LENGTH_INVALID` at send time.
+/// We bail before send so the user gets a clear message instead.
+const MIN_BIG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Build the ffmpeg argv list (everything between `-i <input>` and `pipe:1`)
+/// from the structured config. Tuned for streaming and seekability:
+///
+/// * Fragmented MP4 (`+frag_keyframe+empty_moov+default_base_moof`) — moov
+///   atom up front, no seek-back required, works over `pipe:1`.
+/// * 24 fps with a 2-second GOP (`-g 48`) — coarse enough to keep size
+///   sensible, fine enough for usable seeking.
+/// * libx264: `-sc_threshold 0` disables scene-change keyframe insertion so
+///   the GOP cadence stays predictable. CRF 23 / profile main / level 4.1
+///   are baseline H.264 settings widely playable in browsers.
+/// * Width: `scale=-2:H:force_original_aspect_ratio=decrease` aims for an
+///   even width via the `-2` hint, but `force_original_aspect_ratio=decrease`
+///   can override that and produce odd widths (e.g. 1088x1080 → 725x720)
+///   which libx264 rejects. The trailing
+///   `scale=trunc(iw/2)*2:trunc(ih/2)*2` re-evens both dimensions.
+pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+
+    let threads = match cfg.threads {
+        Threads::Auto => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2),
+        Threads::Count(n) => n as usize,
+    };
+    a.extend(["-threads".into(), threads.to_string()]);
+
+    let codec = if cfg.video.codec == "auto" {
+        if cfg!(target_os = "macos") { "h264_videotoolbox" } else { "libx264" }.to_string()
+    } else {
+        cfg.video.codec.clone()
+    };
+    a.extend(["-c:v".into(), codec.clone()]);
+
+    match codec.as_str() {
+        "libx264" => {
+            a.extend(["-preset".into(), cfg.video.libx264preset.clone()]);
+            a.extend(["-profile:v".into(), "main".into()]);
+            a.extend(["-level".into(), "4.1".into()]);
+            a.extend(["-crf".into(), "23".into()]);
+            // Keep keyframes only at the regular GOP boundary so seeking
+            // lands on predictable offsets.
+            a.extend(["-sc_threshold".into(), "0".into()]);
         }
-        match c {
-            '\\' if !in_sq => { escape = true; }
-            '"' if !in_sq => { in_dq = !in_dq; had_token = true; }
-            '\'' if !in_dq => { in_sq = !in_sq; had_token = true; }
-            c if c.is_whitespace() && !in_dq && !in_sq => {
-                if had_token {
-                    out.push(std::mem::take(&mut cur));
-                    had_token = false;
-                }
-            }
-            c => { cur.push(c); had_token = true; }
+        "h264_videotoolbox" => {
+            // videotoolbox has no CRF; -q:v 50 is a reasonable mid-quality
+            // VBR target. Profile main keeps it browser-friendly.
+            a.extend(["-profile:v".into(), "main".into()]);
+            a.extend(["-q:v".into(), "50".into()]);
         }
+        _ => {}
     }
-    if in_dq || in_sq { bail!("unbalanced quote in ffmpeg args: '{}'", s); }
-    if had_token { out.push(cur); }
-    Ok(out)
+
+    a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    a.extend([
+        "-movflags".into(),
+        "+frag_keyframe+empty_moov+default_base_moof".into(),
+    ]);
+
+    a.extend([
+        "-vf".into(),
+        format!(
+            "scale=-2:{vres}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            vres = cfg.video.vres,
+        ),
+    ]);
+
+    a.extend(["-r".into(), "24".into()]);
+    a.extend(["-g".into(), "48".into()]);
+
+    a.extend(["-c:a".into(), cfg.audio.codec.clone()]);
+    a.extend(["-b:a".into(), cfg.audio.bitrate.clone()]);
+    a.extend(["-ar".into(), cfg.audio.sample_rate.to_string()]);
+
+    a
+}
+
+/// Hardcoded thumbnail-extraction args. Picks a representative frame
+/// (`thumbnail=100` evaluates 100 frames and keeps the most distinctive)
+/// then downscales to fit a 320x320 box without upscaling.
+pub fn thumbnail_args() -> Vec<String> {
+    [
+        "-vf",
+        "thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "5",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 pub fn ffmpeg_in_path() -> bool {
@@ -244,6 +307,26 @@ pub async fn run_encoded_video(
 
     if files.is_empty() {
         bail!("ffmpeg produced no output for '{}'", source.display());
+    }
+
+    // Every part went through saveBigFilePart, which requires InputFileBig at
+    // send time — and Telegram rejects InputFileBig for files <= 10 MB. The
+    // streaming pipeline can't fall back to the small-file API mid-upload, so
+    // bail clearly if the encode (or its trailing multipart part) landed below
+    // the threshold.
+    for (idx, raw) in files.iter().enumerate() {
+        if raw.size <= MIN_BIG_FILE_BYTES {
+            let where_ = if files.len() == 1 {
+                format!("encoded '{}'", doc_filename)
+            } else {
+                format!("multipart part .{:02} of '{}'", idx, doc_filename)
+            };
+            bail!(
+                "{} is {} bytes (<= 10 MiB); small encoded videos are not yet \
+                 supported by the streaming uploader",
+                where_, raw.size,
+            );
+        }
     }
 
     // Single-message case.

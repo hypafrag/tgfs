@@ -103,47 +103,122 @@ impl LogConfig {
     }
 }
 
-/// ffmpeg invocation parameters used by `tgup --encode-video`. `encode_args`
-/// is appended to `ffmpeg -y -loglevel error -i <input>` (with the output
-/// container forced to mp4 piped to stdout). `thumbnail_args` is the same but
-/// for the per-video JPEG thumbnail attached to uploaded video messages.
-#[derive(Deserialize, Clone)]
+/// ffmpeg invocation parameters used by `tgup --encode-video`. The actual
+/// ffmpeg argv list is built in `src/bin/tgup/ffmpeg.rs::build_encode_args`
+/// from the structured fields below; thumbnail args are hardcoded.
+#[derive(Deserialize, Clone, Default)]
 pub struct FfmpegConfig {
-    #[serde(default = "default_ffmpeg_encode_args")]
-    pub encode_args: String,
-    #[serde(default = "default_ffmpeg_thumbnail_args")]
-    pub thumbnail_args: String,
+    #[serde(default)]
+    pub encode_args: EncodeArgs,
 }
 
-impl Default for FfmpegConfig {
-    fn default() -> Self {
-        Self {
-            encode_args: default_ffmpeg_encode_args(),
-            thumbnail_args: default_ffmpeg_thumbnail_args(),
+#[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EncodeArgs {
+    #[serde(default)]
+    pub threads: Threads,
+    #[serde(default)]
+    pub video: VideoArgs,
+    #[serde(default)]
+    pub audio: AudioArgs,
+}
+
+/// ffmpeg `-threads`. `auto` (default) resolves to
+/// `std::thread::available_parallelism()` at run time; an integer is passed
+/// through verbatim.
+#[derive(Clone, Debug)]
+pub enum Threads {
+    Auto,
+    Count(u32),
+}
+
+impl Default for Threads {
+    fn default() -> Self { Threads::Auto }
+}
+
+impl<'de> Deserialize<'de> for Threads {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_yaml::Value::deserialize(d)?;
+        if let Some(s) = v.as_str() {
+            if s == "auto" {
+                Ok(Threads::Auto)
+            } else {
+                Err(D::Error::custom(format!(
+                    "ffmpeg.encode_args.threads: expected integer or \"auto\", got \"{}\"",
+                    s
+                )))
+            }
+        } else if let Some(n) = v.as_u64() {
+            if n == 0 {
+                Err(D::Error::custom("ffmpeg.encode_args.threads: must be > 0"))
+            } else {
+                Ok(Threads::Count(n as u32))
+            }
+        } else {
+            Err(D::Error::custom(
+                "ffmpeg.encode_args.threads: expected integer or \"auto\"",
+            ))
         }
     }
 }
 
-fn default_ffmpeg_encode_args() -> String {
-    // `-movflags +frag_keyframe+empty_moov+default_base_moof` produces a
-    // fragmented MP4 with the moov atom up front — the streaming equivalent
-    // of `+faststart`, but unlike `+faststart` it doesn't require seekable
-    // output, so it works with `pipe:1`.
-    //
-    // The trailing `scale=trunc(iw/2)*2:trunc(ih/2)*2` forces even
-    // width/height: `force_original_aspect_ratio=decrease` overrides the
-    // `-2` divisibility hint of the first scale and can produce odd
-    // dimensions (e.g. 1088x1080 → 725x720), which libx264 rejects.
-    "-threads 2 -c:v libx264 -preset veryslow -profile:v main -level 4.1 -crf 23 \
-     -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov+default_base_moof \
-     -vf \"scale=-2:720:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2\" \
-     -r 24 -g 48 -sc_threshold 0 -c:a aac -b:a 128k -ar 48000".to_string()
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VideoArgs {
+    /// `auto` (default) picks `h264_videotoolbox` on macOS and `libx264`
+    /// elsewhere. Any other value is passed straight to `-c:v`.
+    #[serde(default = "default_video_codec")]
+    pub codec: String,
+    /// libx264 `-preset` value. Ignored when `codec` is not libx264.
+    #[serde(default = "default_libx264_preset")]
+    pub libx264preset: String,
+    /// Target vertical resolution in lines. Width is computed by the scale
+    /// filter to preserve aspect ratio (and then forced to an even value
+    /// because `force_original_aspect_ratio=decrease` overrides the `-2`
+    /// divisibility hint and can produce odd widths libx264 rejects).
+    #[serde(default = "default_vres")]
+    pub vres: u32,
 }
 
-fn default_ffmpeg_thumbnail_args() -> String {
-    "-vf \"thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease\" \
-     -frames:v 1 -q:v 5".to_string()
+impl Default for VideoArgs {
+    fn default() -> Self {
+        Self {
+            codec: default_video_codec(),
+            libx264preset: default_libx264_preset(),
+            vres: default_vres(),
+        }
+    }
 }
+
+fn default_video_codec() -> String { "auto".into() }
+fn default_libx264_preset() -> String { "slow".into() }
+fn default_vres() -> u32 { 720 }
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AudioArgs {
+    #[serde(default = "default_audio_codec")]
+    pub codec: String,
+    #[serde(default = "default_audio_bitrate")]
+    pub bitrate: String,
+    #[serde(default = "default_audio_sample_rate")]
+    pub sample_rate: u32,
+}
+
+impl Default for AudioArgs {
+    fn default() -> Self {
+        Self {
+            codec: default_audio_codec(),
+            bitrate: default_audio_bitrate(),
+            sample_rate: default_audio_sample_rate(),
+        }
+    }
+}
+
+fn default_audio_codec() -> String { "aac".into() }
+fn default_audio_bitrate() -> String { "128k".into() }
+fn default_audio_sample_rate() -> u32 { 48000 }
 
 #[derive(Deserialize)]
 pub struct Config {

@@ -82,9 +82,20 @@ For the production binary, the same `log:` config knob in `tgfs.yml` (or `RUST_L
 
 `tgup` is the upload-side CLI under `src/bin/tgup/`. Plan construction, ffmpeg encoding, and the Telegram upload primitives live in `plan.rs`, `ffmpeg.rs`, and `upload.rs`.
 
+**ffmpeg config (`ffmpeg.encode_args` in `tgfs.yml`)** is a structured dict, not a shell string. The schema and defaults live in `src/config.rs` (`EncodeArgs`/`VideoArgs`/`AudioArgs`/`Threads`); the actual ffmpeg argv list is assembled by `build_encode_args()` in `src/bin/tgup/ffmpeg.rs`. Knobs:
+- `threads` — integer or `auto` (default; resolves to `std::thread::available_parallelism()`).
+- `video.codec` — `auto` (default; `h264_videotoolbox` on macOS, `libx264` elsewhere) or any explicit `-c:v` value. libx264-specific knobs (`-preset`, `-crf 23`, `-sc_threshold 0`, profile main / level 4.1) only emit when codec is libx264; h264_videotoolbox uses `-q:v 50` + profile main instead. Any other codec gets `-c:v` alone — caller's responsibility.
+- `video.libx264preset` — default `slow`. Ignored when codec is not libx264.
+- `video.vres` — target vertical resolution (default 720). Width is auto-computed by a two-stage scale filter: `scale=-2:H:force_original_aspect_ratio=decrease` aims for an even width via the `-2` hint, then `scale=trunc(iw/2)*2:trunc(ih/2)*2` forces both dims to be even — needed because `force_original_aspect_ratio=decrease` overrides the `-2` divisibility hint and can produce odd widths libx264 rejects.
+- `audio.codec` / `audio.bitrate` / `audio.sample_rate` — defaults `aac` / `128k` / `48000`.
+
+Streaming/seeking baselines are always emitted: fragmented MP4 (`-movflags +frag_keyframe+empty_moov+default_base_moof`), 24 fps with a 2-second GOP (`-r 24 -g 48`), pixel format `yuv420p`. `thumbnail_args()` is hardcoded (`thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease`, one frame, q:v 5) — no config knob.
+
 **Encoded-video upload invariants.** `run_encoded_video()` in `src/bin/tgup/ffmpeg.rs`:
 - Must not branch on encoded size — small and large videos take the same code path. Don't probe the source size or buffer the ffmpeg head to pick between upload APIs.
 - Must not buffer more than one 512 KB chunk of encoded data before pushing to Telegram. Stream ffmpeg's stdout straight into `upload_one_big_file` (`upload.saveBigFilePart` + `InputFileBig`); peak RAM stays at `TG_CHUNK`.
+
+**Small encoded files are not supported (yet).** Telegram rejects `InputFileBig` for files at or below 10 MiB with `FILE_PART_LENGTH_INVALID`, and the streaming pipeline can't fall back to the small-file API (`saveFilePart` + `InputFile`) mid-upload without buffering the first 10 MiB. After upload completes, `run_encoded_video()` checks `RawBigFile.size` for every part and bails with a clear error if any is ≤ 10 MiB (`MIN_BIG_FILE_BYTES`). Polish the large-file path first; revisit small-file support later.
 
 ## Docker
 

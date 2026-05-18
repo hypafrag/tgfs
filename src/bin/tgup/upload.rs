@@ -163,6 +163,7 @@ pub async fn upload_thumb(client: &Client, bytes: Vec<u8>, name: &str) -> anyhow
 pub struct RawBigFile {
     pub file_id: i64,
     pub parts: i32,
+    pub size: u64,
 }
 
 pub fn random_file_id() -> i64 {
@@ -253,6 +254,6 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     if part_idx == 0 {
         return Ok((None, eof));
     }
-    Ok((Some(RawBigFile { file_id, parts: part_idx }), eof))
+    Ok((Some(RawBigFile { file_id, parts: part_idx, size: uploaded }), eof))
 }
 
