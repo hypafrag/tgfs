@@ -201,8 +201,12 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     reader: &mut R,
     peek: &mut Option<u8>,
     max_bytes: u64,
-    pb: &ProgressBar,
+    file_pb: &ProgressBar,
     total_pb: &ProgressBar,
+    // When true, the uploader increments both file_pb and total_pb from
+    // uploaded bytes. When false, an external driver (e.g. the ffmpeg
+    // progress task) owns the bars and the uploader stays silent.
+    update_progress: bool,
 ) -> anyhow::Result<(Option<RawBigFile>, bool)> {
     let file_id = random_file_id();
     let mut part_idx: i32 = 0;
@@ -210,50 +214,242 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     let mut eof = false;
     let mut scratch = [0u8; 64 * 1024];
 
-    while uploaded < max_bytes {
-        let remaining = max_bytes - uploaded;
-        let target = std::cmp::min(TG_CHUNK as u64, remaining) as usize;
-        let mut buf: Vec<u8> = Vec::with_capacity(target);
-        if let Some(b) = peek.take() { buf.push(b); }
-        while buf.len() < target {
-            let want = std::cmp::min(scratch.len(), target - buf.len());
-            let n = reader
-                .read(&mut scratch[..want])
-                .await
-                .context("reading ffmpeg stdout")?;
-            if n == 0 { eof = true; break; }
-            buf.extend_from_slice(&scratch[..n]);
+    // Use double-buffering: while one part is being uploaded we fill the
+    // next buffer. We spawn upload tasks for each part and await them at
+    // the end of the function to preserve ordering and error propagation.
+    let mut pending: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+    // Two alternating buffers: `cur_buf` holds the part we're about to send,
+    // `next_buf` is filled while `cur_buf` is uploading.
+    let mut cur_buf: Option<Vec<u8>> = None;
+
+    loop {
+        // Ensure cur_buf is filled.
+        if cur_buf.is_none() {
+            if uploaded >= max_bytes { break; }
+            let remaining = max_bytes - uploaded;
+            let target = std::cmp::min(TG_CHUNK as u64, remaining) as usize;
+            let mut buf: Vec<u8> = Vec::with_capacity(target);
+            if let Some(b) = peek.take() { buf.push(b); }
+            while buf.len() < target {
+                let want = std::cmp::min(scratch.len(), target - buf.len());
+                let n = reader
+                    .read(&mut scratch[..want])
+                    .await
+                    .context("reading ffmpeg stdout")?;
+                if n == 0 { eof = true; break; }
+                buf.extend_from_slice(&scratch[..n]);
+            }
+            if buf.is_empty() { break; }
+            cur_buf = Some(buf);
         }
-        if buf.is_empty() { break; }
 
+        // Decide whether this cur_buf is the final part for the file.
+        let buf = cur_buf.take().unwrap();
         let n = buf.len() as u64;
-        client
-            .invoke(&tl::functions::upload::SaveBigFilePart {
-                file_id,
-                file_part: part_idx,
-                file_total_parts: part_idx + 1,
-                bytes: buf,
-            })
-            .await
-            .with_context(|| format!("saveBigFilePart {}", part_idx))?;
+        let file_total_parts_param: i32;
+
+        if eof {
+            file_total_parts_param = part_idx + 1;
+        } else if uploaded + n >= max_bytes {
+            // At the per-file cap: peek one byte to determine if there's
+            // more data (another file) or this is the final part.
+            let mut one = [0u8; 1];
+            let m = reader.read(&mut one).await.context("peeking ffmpeg stdout")?;
+            if m == 0 {
+                file_total_parts_param = part_idx + 1;
+                eof = true;
+            } else {
+                // There's more data for the next file; stash the byte for
+                // the caller and mark this part non-final.
+                *peek = Some(one[0]);
+                file_total_parts_param = -1;
+            }
+        } else {
+            // Not at file cap: this cannot be the final part for the file.
+            file_total_parts_param = -1;
+        }
+
+        // Spawn upload for this part. Move `buf` into the task so we can
+        // continue filling `next_buf` concurrently.
+        let client_clone = client.clone();
+        let file_id_c = file_id;
+        let part_idx_c = part_idx;
+        let tparam = file_total_parts_param;
+        let handle = tokio::spawn(async move {
+            client_clone
+                .invoke(&tl::functions::upload::SaveBigFilePart {
+                    file_id: file_id_c,
+                    file_part: part_idx_c,
+                    file_total_parts: tparam,
+                    bytes: buf,
+                })
+                .await
+                .with_context(|| format!("saveBigFilePart {}", part_idx_c))
+                .map(|_v| ())
+        });
+        pending.push(handle);
+
         uploaded += n;
-        pb.inc(n);
-        total_pb.inc(n);
+        if update_progress {
+            total_pb.inc(n);
+            if let Some(cur_len) = file_pb.length() {
+                if uploaded > cur_len {
+                    // Extend by 10 % headroom so the bar stays below 100 %
+                    // for the simple-file fallback path.
+                    file_pb.set_length(uploaded * 11 / 10);
+                }
+            }
+            file_pb.set_position(uploaded);
+        }
         part_idx += 1;
+
         if eof { break; }
+
+        // Fill next_buf while the previous part is being uploaded to
+        // overlap IO and network. Only read up to the remaining bytes for
+        // this file to avoid stealing bytes from the next file.
+        if uploaded < max_bytes {
+            let remaining = max_bytes - uploaded;
+            let target = std::cmp::min(TG_CHUNK as u64, remaining) as usize;
+            let mut buf: Vec<u8> = Vec::with_capacity(target);
+            while buf.len() < target {
+                let want = std::cmp::min(scratch.len(), target - buf.len());
+                let m = reader
+                    .read(&mut scratch[..want])
+                    .await
+                    .context("reading ffmpeg stdout")?;
+                if m == 0 { eof = true; break; }
+                buf.extend_from_slice(&scratch[..m]);
+            }
+            if buf.is_empty() {
+                // No data for next part; continue loop which will see EOF.
+                cur_buf = None;
+            } else {
+                // Place the freshly-read buffer into `cur_buf` for the next
+                // iteration instead of using an intermediate `next_buf`.
+                cur_buf = Some(buf);
+            }
+        }
     }
 
-    // Filled the file without seeing EOF — peek one byte so the caller can
-    // tell whether there's another file coming.
-    if !eof && uploaded >= max_bytes {
-        let mut one = [0u8; 1];
-        let n = reader.read(&mut one).await.context("peeking ffmpeg stdout")?;
-        if n == 0 { eof = true; } else { *peek = Some(one[0]); }
+    // Await any pending upload tasks and propagate their errors.
+    for h in pending {
+        let res = h.await.context("join upload task")?;
+        res?;
     }
+
+    
 
     if part_idx == 0 {
         return Ok((None, eof));
     }
     Ok((Some(RawBigFile { file_id, parts: part_idx, size: uploaded }), eof))
+}
+
+// Testable helper: read parts from `reader` up to `max_bytes`, applying the
+// same peek & last-part detection semantics used by the uploader. Returns
+// a vector of (part_len, file_total_parts_param) and whether EOF was seen.
+#[cfg(test)]
+pub async fn collect_parts_for_test<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    peek: &mut Option<u8>,
+    max_bytes: u64,
+) -> anyhow::Result<(Vec<(u64, i32)>, bool)> {
+    let mut part_idx: i32 = 0;
+    let mut uploaded: u64 = 0;
+    let mut eof = false;
+    let mut scratch = [0u8; 64 * 1024];
+    let mut parts: Vec<(u64, i32)> = Vec::new();
+
+    while uploaded < max_bytes {
+        let remaining = max_bytes - uploaded;
+        let target = std::cmp::min(TG_CHUNK as u64, remaining) as usize;
+        let mut buf_len: usize = 0;
+        if let Some(_) = peek.take() { buf_len = 1; }
+        while buf_len < target {
+            let want = std::cmp::min(scratch.len(), target - buf_len);
+            let n = reader.read(&mut scratch[..want]).await.context("reading test input")?;
+            if n == 0 { eof = true; break; }
+            buf_len += n;
+        }
+        if buf_len == 0 { break; }
+        let n = buf_len as u64;
+
+        let mut file_total_parts_param: i32 = -1;
+        if eof {
+            file_total_parts_param = part_idx + 1;
+        } else if uploaded + n >= max_bytes {
+            let mut one = [0u8; 1];
+            let m = reader.read(&mut one).await.context("peeking test input")?;
+            if m == 0 {
+                file_total_parts_param = part_idx + 1;
+                eof = true;
+            } else {
+                *peek = Some(one[0]);
+                file_total_parts_param = -1;
+            }
+        }
+
+        parts.push((n, file_total_parts_param));
+        uploaded += n;
+        part_idx += 1;
+        if eof { break; }
+    }
+
+    Ok((parts, eof))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_collect_single_exact_chunk() {
+        let data = vec![0u8; TG_CHUNK];
+        let mut cur = Cursor::new(data);
+        let mut peek = None;
+        let (parts, eof) = collect_parts_for_test(&mut cur, &mut peek, TG_CHUNK as u64).await.unwrap();
+        assert!(eof);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, TG_CHUNK as u64);
+        assert_eq!(parts[0].1, 1); // final part index = 1
+        assert!(peek.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_collect_multiple_parts() {
+        let total = TG_CHUNK * 3 + 1234;
+        let data = vec![0u8; total];
+        let mut cur = Cursor::new(data);
+        let mut peek = None;
+        let (parts, eof) = collect_parts_for_test(&mut cur, &mut peek, total as u64).await.unwrap();
+        assert!(eof);
+        assert_eq!(parts.len(), 4);
+        for i in 0..3 {
+            assert_eq!(parts[i].0, TG_CHUNK as u64);
+            assert_eq!(parts[i].1, -1);
+        }
+        assert_eq!(parts[3].0, 1234);
+        assert_eq!(parts[3].1, 4);
+        assert!(peek.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_across_file_cap() {
+        // Create data longer than max_bytes to trigger peek at cap boundary.
+        let max_bytes = TG_CHUNK as u64 * 2;
+        let data = vec![0u8; (max_bytes + 10) as usize];
+        let mut cur = Cursor::new(data);
+        let mut peek = None;
+        let (parts, eof) = collect_parts_for_test(&mut cur, &mut peek, max_bytes).await.unwrap();
+        assert!(!eof);
+        // Should have filled exactly max_bytes across parts.
+        let sum: u64 = parts.iter().map(|p| p.0).sum();
+        assert_eq!(sum, max_bytes);
+        // The last part should have file_total_parts = -1 because more data exists
+        assert_eq!(parts.last().unwrap().1, -1);
+        assert!(peek.is_some());
+    }
 }
 
