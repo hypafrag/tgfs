@@ -78,6 +78,14 @@ When the integration runner (`cargo run --example integration_test`) misbehaves,
 
 For the production binary, the same `log:` config knob in `tgfs.yml` (or `RUST_LOG=debug`) routes the same instrumentation to stderr. Key targets when narrowing down: `tgfs::indexer` (channel walk + ZIP indexing), `tgfs::fuse` (FUSE callbacks + deflate prefetch), `tgfs::realtime` (update dispatcher), `tgfs::server` (HTTP), `grammers_mtsender` / `grammers_mtproto` (raw RPC).
 
+## tgup (uploader)
+
+`tgup` is the upload-side CLI under `src/bin/tgup/`. Plan construction, ffmpeg encoding, and the Telegram upload primitives live in `plan.rs`, `ffmpeg.rs`, and `upload.rs`.
+
+**Encoded-video upload invariants.** `run_encoded_video()` in `src/bin/tgup/ffmpeg.rs`:
+- Must not branch on encoded size — small and large videos take the same code path. Don't probe the source size or buffer the ffmpeg head to pick between upload APIs.
+- Must not buffer more than one 512 KB chunk of encoded data before pushing to Telegram. Stream ffmpeg's stdout straight into `upload_one_big_file` (`upload.saveBigFilePart` + `InputFileBig`); peak RAM stays at `TG_CHUNK`.
+
 ## Docker
 
 Multi-stage `Dockerfile`: `rust:bookworm` builder (needs `pkg-config` + `libfuse-dev` to link `fuser`), `debian:bookworm-slim` runtime with only `ca-certificates` and `fuse` (libfuse2 + `fusermount`). Binary is stripped. Container reads config and persistent state from `/data`. FUSE inside the container needs `--cap-add SYS_ADMIN`, `--device /dev/fuse`, and an `rshared` bind-mount on the target directory. See `README.md` for full run commands.

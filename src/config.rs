@@ -125,9 +125,18 @@ impl Default for FfmpegConfig {
 }
 
 fn default_ffmpeg_encode_args() -> String {
+    // `-movflags +frag_keyframe+empty_moov+default_base_moof` produces a
+    // fragmented MP4 with the moov atom up front — the streaming equivalent
+    // of `+faststart`, but unlike `+faststart` it doesn't require seekable
+    // output, so it works with `pipe:1`.
+    //
+    // The trailing `scale=trunc(iw/2)*2:trunc(ih/2)*2` forces even
+    // width/height: `force_original_aspect_ratio=decrease` overrides the
+    // `-2` divisibility hint of the first scale and can produce odd
+    // dimensions (e.g. 1088x1080 → 725x720), which libx264 rejects.
     "-threads 2 -c:v libx264 -preset veryslow -profile:v main -level 4.1 -crf 23 \
-     -pix_fmt yuv420p -movflags +faststart \
-     -vf \"scale=-2:720:force_original_aspect_ratio=decrease\" \
+     -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov+default_base_moof \
+     -vf \"scale=-2:720:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2\" \
      -r 24 -g 48 -sc_threshold 0 -c:a aac -b:a 128k -ar 48000".to_string()
 }
 

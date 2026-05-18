@@ -44,7 +44,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "tgup"
-path = "src/bin/tgup.rs"
+path = "src/bin/tgup/main.rs"
 
 # Until upstream grammers ships a fix for `channels.deleteMessages` not carrying
 # the deleted message IDs through to `UpdateDeleteChannelMessages.messages`,
