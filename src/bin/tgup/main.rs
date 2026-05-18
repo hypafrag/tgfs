@@ -110,10 +110,9 @@ async fn run() -> anyhow::Result<()> {
         .unwrap()
         .progress_chars("=>-"),
     );
-    total_pb.set_message(format!("TOTAL {}/{}", 0, plan.len()));
+    total_pb.set_message(format!("TOTAL 0/{}", plan.len()));
 
     for (i, item) in plan.iter().enumerate() {
-        total_pb.set_message(format!("TOTAL {}/{}", i, plan.len()));
         match item {
             UploadItem::Single(p) => {
                 upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
@@ -129,12 +128,14 @@ async fn run() -> anyhow::Result<()> {
             UploadItem::EncodedVideo { .. } => {
                 run_encoded_video(
                     &client, peer,
-                    &encode_args, &thumb_args,
+                    &encode_args, config.ffmpeg.encode_args.video.vres,
+                    &thumb_args,
                     item, &mp, &file_pb, &total_pb,
                 ).await?;
             }
         }
         set_label(&file_pb, format!("done: {}", item.display_name()));
+        total_pb.set_message(format!("TOTAL {}/{}", i + 1, plan.len()));
     }
     file_pb.finish_with_message("done");
     total_pb.finish();

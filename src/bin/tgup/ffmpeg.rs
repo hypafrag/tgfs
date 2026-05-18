@@ -36,11 +36,6 @@ use super::upload::{
 /// * libx264: `-sc_threshold 0` disables scene-change keyframe insertion so
 ///   the GOP cadence stays predictable. CRF 23 / profile main / level 4.1
 ///   are baseline H.264 settings widely playable in browsers.
-/// * Width: `scale=-2:H:force_original_aspect_ratio=decrease` aims for an
-///   even width via the `-2` hint, but `force_original_aspect_ratio=decrease`
-///   can override that and produce odd widths (e.g. 1088x1080 → 725x720)
-///   which libx264 rejects. The trailing
-///   `scale=trunc(iw/2)*2:trunc(ih/2)*2` re-evens both dimensions.
 pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
 
@@ -87,14 +82,6 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
             "+frag_keyframe+empty_moov+default_base_moof".into(),
         ]);
     }
-
-    a.extend([
-        "-vf".into(),
-        format!(
-            "scale=-2:{vres}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            vres = cfg.video.vres,
-        ),
-    ]);
 
     a.extend(["-r".into(), "24".into()]);
     if cfg.video.streamable {
@@ -242,6 +229,7 @@ pub async fn run_encoded_video(
     client: &Client,
     peer: PeerRef,
     encode_args: &[String],
+    vres: u32,
     thumbnail_args: &[String],
     item: &UploadItem,
     mp: &MultiProgress,
@@ -268,6 +256,19 @@ pub async fn run_encoded_video(
         v
     });
 
+    // Compute scale filter from probed dimensions. Only downscale; if the
+    // source height is already ≤ vres, pass no -vf filter at all.
+    let scale_args: Vec<String> = match &video_info {
+        Some(vi) if vi.height > vres as i32 => {
+            // Maintain aspect ratio with even-aligned dimensions.
+            let new_h = (vres / 2) * 2;
+            let new_w = (vi.width as u64 * vres as u64 / vi.height as u64) as u32;
+            let new_w = (new_w / 2) * 2;
+            vec!["-vf".into(), format!("scale={new_w}:{new_h}")]
+        }
+        _ => vec![],
+    };
+
     // Thumbnail.
     let thumb_bytes = make_thumbnail_to_buffer(&source, thumbnail_args, file_pb).await?;
     let thumb = upload_thumb(client, thumb_bytes, &doc_filename).await?;
@@ -277,7 +278,7 @@ pub async fn run_encoded_video(
     cmd.arg("-y").arg("-nostdin")
         .arg("-loglevel").arg("error")
         .arg("-i").arg(&source);
-    for a in encode_args { cmd.arg(a); }
+    for a in encode_args.iter().chain(scale_args.iter()) { cmd.arg(a); }
     cmd.args(["-f", "mp4"]).arg("pipe:1");
     // -progress pipe:2 makes ffmpeg emit key=value progress lines on stderr
     // so we can map encoding time to source-file position without touching
