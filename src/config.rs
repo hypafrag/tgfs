@@ -163,6 +163,25 @@ impl<'de> Deserialize<'de> for Threads {
     }
 }
 
+/// Controls how the encoded MP4 output is made streamable/seekable.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Streamification {
+    /// No streaming flags — plain MP4, moov at end. Use for archival encodes
+    /// where streaming is not required.
+    None,
+    /// Fragmented MP4: `-movflags +frag_keyframe+empty_moov+default_base_moof`.
+    /// moov atoms are spread across fragments so playback can start from the
+    /// first byte. Works over a pipe — no scratch file needed.
+    #[default]
+    Fmp4,
+    /// Plain MP4 with `+faststart`: ffmpeg writes a regular MP4 then shuffles
+    /// the moov atom to the front. Requires a seekable output, so the encode
+    /// goes to a scratch file under `/tmp/tgup/` first; tgup uploads that file
+    /// and deletes it on completion.
+    LeadingMoov,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct VideoArgs {
@@ -179,12 +198,10 @@ pub struct VideoArgs {
     /// divisibility hint and can produce odd widths libx264 rejects).
     #[serde(default = "default_vres")]
     pub vres: u32,
-    /// When true (default), emit `-movflags +frag_keyframe+empty_moov+default_base_moof`,
-    /// `-sc_threshold 0` (libx264 only), and `-g 48` so the output is seekable
-    /// as a fragmented MP4 stream. Set to false to let ffmpeg use its defaults
-    /// (e.g. for archival encodes where streaming is not required).
-    #[serde(default = "default_streamable")]
-    pub streamable: bool,
+    /// How to make the output seekable/streamable. Default is `fmp4`.
+    /// See [`Streamification`] for details on each mode.
+    #[serde(default)]
+    pub streamification: Streamification,
 }
 
 impl Default for VideoArgs {
@@ -193,7 +210,7 @@ impl Default for VideoArgs {
             codec: default_video_codec(),
             libx264preset: default_libx264_preset(),
             vres: default_vres(),
-            streamable: default_streamable(),
+            streamification: Streamification::default(),
         }
     }
 }
@@ -201,7 +218,6 @@ impl Default for VideoArgs {
 fn default_video_codec() -> String { "auto".into() }
 fn default_libx264_preset() -> String { "slow".into() }
 fn default_vres() -> u32 { 720 }
-fn default_streamable() -> bool { true }
 
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]

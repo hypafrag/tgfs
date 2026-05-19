@@ -1,7 +1,7 @@
 //! ffmpeg/ffprobe integration: argv parsing, PATH lookup, single-shot encodes
 //! (thumbnails), and the streaming encode-then-upload pipeline for videos.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -13,11 +13,11 @@ use grammers_client::media::InputMedia;
 use grammers_client::message::InputMessage;
 use grammers_session::types::PeerRef;
 use indicatif::{MultiProgress, ProgressBar};
-use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::process::Command;
 
-use tgfs::config::{EncodeArgs, MultipartPolicy, Threads};
+use tgfs::config::{EncodeArgs, MultipartPolicy, Streamification, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
 use super::progress::{fmt_mib, set_label, set_bar_style, set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style, SpeedReader};
@@ -54,13 +54,14 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     };
     a.extend(["-c:v".into(), codec.clone()]);
 
+    let streamification = cfg.video.streamification;
     match codec.as_str() {
         "libx264" => {
             a.extend(["-preset".into(), cfg.video.libx264preset.clone()]);
             a.extend(["-profile:v".into(), "main".into()]);
             a.extend(["-level".into(), "4.1".into()]);
             a.extend(["-crf".into(), "23".into()]);
-            if cfg.video.streamable {
+            if streamification != Streamification::None {
                 // Keep keyframes only at the regular GOP boundary so seeking
                 // lands on predictable offsets.
                 a.extend(["-sc_threshold".into(), "0".into()]);
@@ -76,15 +77,20 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     }
 
     a.extend(["-pix_fmt".into(), "yuv420p".into()]);
-    if cfg.video.streamable {
-        a.extend([
+    match streamification {
+        Streamification::Fmp4 => a.extend([
             "-movflags".into(),
             "+frag_keyframe+empty_moov+default_base_moof".into(),
-        ]);
+        ]),
+        Streamification::LeadingMoov => a.extend([
+            "-movflags".into(),
+            "+faststart".into(),
+        ]),
+        Streamification::None => {}
     }
 
     a.extend(["-r".into(), "24".into()]);
-    if cfg.video.streamable {
+    if streamification != Streamification::None {
         a.extend(["-g".into(), "48".into()]);
     }
 
@@ -122,6 +128,15 @@ pub fn ffmpeg_in_path() -> bool {
     }
     false
 }
+
+// fn shell_escape(s: &std::ffi::OsStr) -> String {
+//     let s = s.to_string_lossy();
+//     if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:+,@%".contains(c)) {
+//         s.into_owned()
+//     } else {
+//         format!("'{}'", s.replace('\'', "'\\''"))
+//     }
+// }
 
 /// Run ffmpeg with the given args, capturing all of stdout into memory. The
 /// `progress_pb` is updated as bytes arrive on stdout. ffmpeg's stderr is
@@ -222,12 +237,116 @@ async fn probe_video_file(path: &Path) -> Option<VideoInfo> {
     })
 }
 
-/// Run an `EncodedVideo` item: probe source, generate thumbnail, spawn ffmpeg,
-/// then stream encoded bytes directly into `upload.saveBigFilePart` calls so
-/// uploading begins as soon as the first 512 KB has been encoded.
+
+/// Directory under which `LeadingMoov` encodes drop their scratch file before
+/// uploading. Created on demand; the scratch file is deleted after upload.
+const SCRATCH_DIR: &str = "/tmp/tgup";
+
+fn scratch_path(name: &str) -> PathBuf {
+    PathBuf::from(SCRATCH_DIR).join(name)
+}
+
+/// Spawn `ffmpeg` to encode `source` into the given output (file path or
+/// `pipe:1`), parsing `-progress pipe:2` lines on stderr to drive `file_pb`
+/// and `total_pb`. Returns the spawned child (with `stdout` already taken if
+/// piped) plus a handle to the progress-task and shared stderr buffer for
+/// error reporting after `child.wait()`.
+struct FfmpegRun {
+    child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    progress: Option<tokio::task::JoinHandle<()>>,
+    stderr_buf: Arc<AsyncMutex<String>>,
+    total_advanced: Arc<AtomicU64>,
+}
+
+fn spawn_ffmpeg(
+    source: &Path,
+    encode_args: &[String],
+    scale_args: &[String],
+    output_arg: &str,
+    pipe_stdout: bool,
+    file_pb: &ProgressBar,
+    total_pb: &ProgressBar,
+    source_size: u64,
+    duration_us: Option<u64>,
+) -> anyhow::Result<FfmpegRun> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-nostdin")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(source);
+    for a in encode_args.iter().chain(scale_args.iter()) { cmd.arg(a); }
+    cmd.args(["-f", "mp4"]).arg(output_arg);
+    cmd.arg("-progress").arg("pipe:2");
+    if pipe_stdout { cmd.stdout(Stdio::piped()); } else { cmd.stdout(Stdio::null()); }
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
+    let stdout = if pipe_stdout { Some(child.stdout.take().expect("piped stdout")) } else { None };
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let stderr_buf = Arc::new(AsyncMutex::new(String::new()));
+    let total_advanced = Arc::new(AtomicU64::new(0));
+
+    let progress = if let Some(dur_us) = duration_us {
+        let file_pb_c = file_pb.clone();
+        let total_pb_c = total_pb.clone();
+        let stderr_buf_c = stderr_buf.clone();
+        let total_adv_c = total_advanced.clone();
+        let ss = source_size;
+        Some(tokio::spawn(async move {
+            let mut last_t: u64 = 0;
+            let mut collected = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                collected.push_str(&line);
+                collected.push('\n');
+                if let Some(v) = line.strip_prefix("out_time_us=") {
+                    if let Ok(t) = v.trim().parse::<u64>() {
+                        if t > last_t {
+                            let delta_us = t - last_t;
+                            let pos = ((t as f64 / dur_us as f64) * ss as f64) as u64;
+                            let delta_bytes =
+                                (delta_us as f64 / dur_us as f64 * ss as f64) as u64;
+                            file_pb_c.set_position(pos.min(ss));
+                            total_pb_c.inc(delta_bytes);
+                            total_adv_c.fetch_add(
+                                delta_bytes,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            last_t = t;
+                        }
+                    }
+                }
+            }
+            *stderr_buf_c.lock().await = collected;
+        }))
+    } else {
+        // Duration unknown: just drain stderr for error reporting.
+        let stderr_buf_c = stderr_buf.clone();
+        tokio::spawn(async move {
+            let mut s = String::new();
+            let mut r = stderr;
+            let _ = r.read_to_string(&mut s).await;
+            *stderr_buf_c.lock().await = s;
+        });
+        None
+    };
+
+    Ok(FfmpegRun { child, stdout, progress, stderr_buf, total_advanced })
+}
+
+/// Run an `EncodedVideo` item: probe source, generate thumbnail, encode with
+/// ffmpeg, then upload.
+///
+/// - `Fmp4` / `None`: ffmpeg writes to `pipe:1` and the uploader streams bytes
+///   concurrently with encoding.
+/// - `LeadingMoov`: ffmpeg needs a seekable output for the `+faststart`
+///   shuffle, so it writes to a scratch file under [`SCRATCH_DIR`]; once
+///   ffmpeg exits, tgup opens that file and uploads, then deletes it.
 pub async fn run_encoded_video(
     client: &Client,
     peer: PeerRef,
+    streamification: Streamification,
     encode_args: &[String],
     vres: u32,
     thumbnail_args: &[String],
@@ -250,9 +369,8 @@ pub async fn run_encoded_video(
         _ => unreachable!(),
     };
 
-    // Probe source for duration/dimensions.
     let video_info = probe_video_file(&source).await.map(|mut v| {
-        v.streamable = encode_args.iter().any(|a| a.contains("frag_keyframe"));
+        v.streamable = streamification != Streamification::None;
         v
     });
 
@@ -260,7 +378,6 @@ pub async fn run_encoded_video(
     // source height is already ≤ vres, pass no -vf filter at all.
     let scale_args: Vec<String> = match &video_info {
         Some(vi) if vi.height > vres as i32 => {
-            // Maintain aspect ratio with even-aligned dimensions.
             let new_h = (vres / 2) * 2;
             let new_w = (vi.width as u64 * vres as u64 / vi.height as u64) as u32;
             let new_w = (new_w / 2) * 2;
@@ -269,42 +386,20 @@ pub async fn run_encoded_video(
         _ => vec![],
     };
 
-    // Thumbnail.
     let thumb_bytes = make_thumbnail_to_buffer(&source, thumbnail_args, file_pb).await?;
     let thumb = upload_thumb(client, thumb_bytes, &doc_filename).await?;
 
-    // Spawn ffmpeg; stdout = fragmented MP4 stream.
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-nostdin")
-        .arg("-loglevel").arg("error")
-        .arg("-i").arg(&source);
-    for a in encode_args.iter().chain(scale_args.iter()) { cmd.arg(a); }
-    cmd.args(["-f", "mp4"]).arg("pipe:1");
-    // -progress pipe:2 makes ffmpeg emit key=value progress lines on stderr
-    // so we can map encoding time to source-file position without touching
-    // the encoded output stream.
-    cmd.arg("-progress").arg("pipe:2");
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
-    let raw_stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    // Duration in microseconds — denominator for mapping out_time_us to a
-    // fraction of the source file. Note: despite the _ms suffix, ffmpeg's
-    // out_time_ms carries the same microsecond value as out_time_us.
-    let duration_us = video_info.as_ref()
+    let duration_us: Option<u64> = video_info.as_ref()
         .map(|v| v.duration.as_micros() as u64)
         .filter(|&d| d > 0);
 
-    // file_pb length = source_size; position = (out_time_us / duration_us)
-    // * source_size, giving "how far through the source file ffmpeg has read".
+    // Prepare the file_pb for the encode/upload phase.
     set_bar_style(file_pb);
-    set_label(file_pb, format!("uploading {}", doc_filename));
+    set_label(file_pb, format!("encoding {}", doc_filename));
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(0);
 
-    // Sub-bars inserted between file_pb and total_pb for the duration of the
-    // encode+upload: buffer fill level, encode throughput, upload throughput.
+    // Sub-bars for encode-buffer fill, encode throughput, upload throughput.
     let buf_pb = mp.insert_after(file_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));
     set_buffer_bar_style(&buf_pb);
     let encode_pb = mp.insert_after(&buf_pb, ProgressBar::new(0));
@@ -318,8 +413,6 @@ pub async fn run_encoded_video(
         partial_fill: Arc::new(AtomicU64::new(0)),
         total_uploaded: Arc::new(AtomicU64::new(0)),
     };
-    // Periodically refresh the buffer-fill bar so it updates at ~1 Hz even
-    // when no fill/drain events fire (e.g. encoder is slower than uploader).
     let buf_tick_fill     = video_bars.buf_fill.clone();
     let buf_tick_partial  = video_bars.partial_fill.clone();
     let buf_tick_uploaded = video_bars.total_uploaded.clone();
@@ -342,111 +435,107 @@ pub async fn run_encoded_video(
             ));
         }
     });
-    // Wrap raw_stdout so each byte read from ffmpeg also increments encode_pb.
-    let mut tracked_stdout = SpeedReader { inner: raw_stdout, pb: encode_pb.clone() };
 
-    // Shared stderr buffer for error reporting after child.wait().
-    let stderr_buf = Arc::new(AsyncMutex::new(String::new()));
-    // Bytes credited to total_pb by the progress task; used to top up the
-    // remainder so this file always contributes exactly source_size.
-    let total_advanced = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Branch on streamification to build the upload reader.
+    // - Pipe stream (Fmp4 / None): encode and upload concurrently — ffmpeg
+    //   writes to pipe:1, the uploader reads it as bytes arrive.
+    // - Scratch file (LeadingMoov): faststart needs a seekable output, so
+    //   ffmpeg writes to a scratch file under SCRATCH_DIR; once it exits we
+    //   open that file and stream it to the uploader, then delete it.
+    let scratch: Option<PathBuf> = match streamification {
+        Streamification::LeadingMoov => {
+            std::fs::create_dir_all(SCRATCH_DIR)
+                .with_context(|| format!("create_dir_all {SCRATCH_DIR}"))?;
+            Some(scratch_path(&doc_filename))
+        }
+        _ => None,
+    };
 
-    let progress_handle: Option<tokio::task::JoinHandle<()>> =
-        if let Some(dur_us) = duration_us {
-            let file_pb_c = file_pb.clone();
-            let total_pb_c = total_pb.clone();
-            let stderr_buf_c = stderr_buf.clone();
-            let total_adv_c = total_advanced.clone();
-            let ss = source_size;
-            Some(tokio::spawn(async move {
-                let mut last_t: u64 = 0;
-                let mut collected = String::new();
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                    if let Some(v) = line.strip_prefix("out_time_us=") {
-                        if let Ok(t) = v.trim().parse::<u64>() {
-                            if t > last_t {
-                                let delta_us = t - last_t;
-                                // Absolute position avoids fp drift.
-                                let pos = ((t as f64 / dur_us as f64) * ss as f64) as u64;
-                                let delta_bytes =
-                                    (delta_us as f64 / dur_us as f64 * ss as f64) as u64;
-                                file_pb_c.set_position(pos.min(ss));
-                                total_pb_c.inc(delta_bytes);
-                                total_adv_c.fetch_add(
-                                    delta_bytes,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                last_t = t;
-                            }
-                        }
-                    }
-                }
-                *stderr_buf_c.lock().await = collected;
-            }))
-        } else {
-            // Duration unknown: drain stderr for error reporting; uploader
-            // drives the bars as a best-effort fallback.
-            let stderr_buf_c = stderr_buf.clone();
-            tokio::spawn(async move {
-                let mut s = String::new();
-                let mut r = stderr;
-                let _ = r.read_to_string(&mut s).await;
-                *stderr_buf_c.lock().await = s;
-            });
-            None
-        };
+    let (output_arg, pipe_stdout) = match &scratch {
+        Some(p) => (p.to_string_lossy().into_owned(), false),
+        None    => ("pipe:1".to_string(), true),
+    };
 
-    // When the progress task owns the bars, tell the uploader not to touch
-    // them. When duration is unknown, the uploader drives them as fallback.
-    let uploader_drives = progress_handle.is_none();
+    let mut run = spawn_ffmpeg(
+        &source, encode_args, &scale_args, &output_arg, pipe_stdout,
+        file_pb, total_pb, source_size, duration_us,
+    )?;
 
     let mut files: Vec<RawBigFile> = Vec::new();
-    let mut peek: Option<u8> = None;
-    loop {
-        let (raw, eof) = upload_one_big_file(
-            client, &mut tracked_stdout, &mut peek, PART_MAX,
-            file_pb, total_pb, uploader_drives, Some(&video_bars),
-        ).await?;
-        if let Some(r) = raw { files.push(r); }
-        if eof { break; }
-        if files.len() > 1 && policy == MultipartPolicy::None {
-            let _ = child.kill().await;
-            bail!(
-                "encoded '{}' exceeded 4 GiB but multipart_policy is `none`",
-                doc_filename
-            );
+
+    if pipe_stdout {
+        // Streamed path: upload concurrently with encoding.
+        let upload_reader: Box<dyn AsyncRead + Unpin + Send> =
+            Box::new(run.stdout.take().expect("pipe:1 stdout"));
+        let mut tracked = SpeedReader { inner: upload_reader, pb: encode_pb.clone() };
+
+        let uploader_drives = run.progress.is_none();
+        let mut peek: Option<u8> = None;
+        loop {
+            let (raw, eof) = upload_one_big_file(
+                client, &mut tracked, &mut peek, PART_MAX,
+                file_pb, total_pb, uploader_drives, Some(&video_bars),
+            ).await?;
+            if let Some(r) = raw { files.push(r); }
+            if eof { break; }
+            if files.len() > 1 && policy == MultipartPolicy::None {
+                let _ = run.child.kill().await;
+                bail!("encoded '{}' exceeded 4 GiB but multipart_policy is `none`", doc_filename);
+            }
         }
+    }
+
+    let status = run.child.wait().await.context("waiting for ffmpeg")?;
+    if let Some(h) = run.progress {
+        let _ = h.await;
+        let advanced = run.total_advanced.load(std::sync::atomic::Ordering::Relaxed);
+        total_pb.inc(source_size.saturating_sub(advanced));
+    }
+    if !status.success() {
+        buf_tick_handle.abort();
+        let _ = buf_tick_handle.await;
+        encode_pb.finish_and_clear();
+        buf_pb.finish_and_clear();
+        upload_pb.finish_and_clear();
+        if let Some(p) = scratch.as_ref() { let _ = tokio::fs::remove_file(p).await; }
+        let err = run.stderr_buf.lock().await.clone();
+        bail!("ffmpeg exited with {}: {}", status, err.trim());
+    }
+
+    // Scratch-file path: encode is done, now open the file and upload it.
+    if let Some(ref path) = scratch {
+        set_label(file_pb, format!("uploading {}", doc_filename));
+        file_pb.set_position(0);
+        let f = tokio::fs::File::open(path).await
+            .with_context(|| format!("opening scratch file {}", path.display()))?;
+        let upload_reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(f);
+        let mut tracked = SpeedReader { inner: upload_reader, pb: encode_pb.clone() };
+        // Uploader drives file_pb (encode phase already credited total_pb).
+        let mut peek: Option<u8> = None;
+        loop {
+            let (raw, eof) = upload_one_big_file(
+                client, &mut tracked, &mut peek, PART_MAX,
+                file_pb, total_pb, true, Some(&video_bars),
+            ).await?;
+            if let Some(r) = raw { files.push(r); }
+            if eof { break; }
+            if files.len() > 1 && policy == MultipartPolicy::None {
+                let _ = tokio::fs::remove_file(path).await;
+                bail!("encoded '{}' exceeded 4 GiB but multipart_policy is `none`", doc_filename);
+            }
+        }
+        // Cleanup scratch regardless of further outcomes.
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     buf_tick_handle.abort();
     let _ = buf_tick_handle.await;
 
-    // Reap ffmpeg. After it exits its stderr pipe closes, so the progress
-    // task drains to completion.
-    let status = child.wait().await.context("waiting for ffmpeg")?;
-
-    if let Some(h) = progress_handle {
-        // Consume any final progress lines (e.g. the progress=end block).
-        let _ = h.await;
-        // Top up total_pb so this file contributes exactly source_size bytes,
-        // regardless of fp rounding or out_time_us not reaching duration_us.
-        let advanced = total_advanced.load(std::sync::atomic::Ordering::Relaxed);
-        total_pb.inc(source_size.saturating_sub(advanced));
-    }
-    // Snap file bar to 100 %.
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(source_size);
     encode_pb.finish_and_clear();
     buf_pb.finish_and_clear();
     upload_pb.finish_and_clear();
-
-    if !status.success() {
-        let err = stderr_buf.lock().await.clone();
-        bail!("ffmpeg exited with {}: {}", status, err.trim());
-    }
 
     if files.is_empty() {
         bail!("ffmpeg produced no output for '{}'", source.display());

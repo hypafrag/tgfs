@@ -128,6 +128,7 @@ async fn run() -> anyhow::Result<()> {
             UploadItem::EncodedVideo { .. } => {
                 run_encoded_video(
                     &client, peer,
+                    config.ffmpeg.encode_args.video.streamification,
                     &encode_args, config.ffmpeg.encode_args.video.vres,
                     &thumb_args,
                     item, &mp, &file_pb, &total_pb,
