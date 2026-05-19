@@ -104,7 +104,7 @@ async fn run() -> anyhow::Result<()> {
     // LABEL_WIDTH).
     total_pb.set_style(
         ProgressStyle::with_template(&format!(
-            "{{msg:<{w}.{w}}} [{{bar:50.green/blue}}] {{bytes}}/{{total_bytes}} ({{eta}})",
+            "{{msg:<{w}.{w}}} [{{bar:50.green/blue}}] {{percent:>3}}% ({{eta}})",
             w = LABEL_WIDTH,
         ))
         .unwrap()

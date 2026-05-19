@@ -20,7 +20,10 @@ use tokio::process::Command;
 use tgfs::config::{EncodeArgs, MultipartPolicy, Streamification, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
-use super::progress::{fmt_mib, set_label, set_bar_style, set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style, SpeedReader};
+use super::progress::{
+    fmt_mib, set_label, set_bar_style, set_buffer_bar_style, set_spinner_style,
+    set_throughput_style, set_manual_speed_style, ScaledProgressReader, SpeedReader,
+};
 use super::upload::{
     finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, TG_CHUNK,
     UPLOAD_CONCURRENCY, VideoInfo, VideoUploadBars,
@@ -267,7 +270,7 @@ fn spawn_ffmpeg(
     pipe_stdout: bool,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
-    source_size: u64,
+    encode_budget: u64,
     duration_us: Option<u64>,
 ) -> anyhow::Result<FfmpegRun> {
     let mut cmd = Command::new("ffmpeg");
@@ -292,7 +295,7 @@ fn spawn_ffmpeg(
         let total_pb_c = total_pb.clone();
         let stderr_buf_c = stderr_buf.clone();
         let total_adv_c = total_advanced.clone();
-        let ss = source_size;
+        let ss = encode_budget;
         Some(tokio::spawn(async move {
             let mut last_t: u64 = 0;
             let mut collected = String::new();
@@ -399,13 +402,25 @@ pub async fn run_encoded_video(
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(0);
 
+    // LeadingMoov is encode-then-upload (two phases). Split file_pb / total_pb
+    // 50/50: encode advances 0 → source_size/2, upload advances the rest.
+    let two_phase = matches!(streamification, Streamification::LeadingMoov);
+    let encode_budget: u64 = if two_phase { source_size / 2 } else { source_size };
+
     // Sub-bars for encode-buffer fill, encode throughput, upload throughput.
     let buf_pb = mp.insert_after(file_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));
     set_buffer_bar_style(&buf_pb);
-    let encode_pb = mp.insert_after(&buf_pb, ProgressBar::new(0));
-    set_throughput_style(&encode_pb, "encode speed");
-    let upload_pb = mp.insert_after(&encode_pb, ProgressBar::new(0));
-    set_manual_speed_style(&upload_pb, "upload speed");
+    // Encode-speed / upload-speed sub-bars only make sense when encode and
+    // upload run concurrently (Fmp4). For LeadingMoov they're hidden.
+    let (encode_pb, upload_pb) = if two_phase {
+        (ProgressBar::hidden(), ProgressBar::hidden())
+    } else {
+        let e = mp.insert_after(&buf_pb, ProgressBar::new(0));
+        set_throughput_style(&e, "encode speed");
+        let u = mp.insert_after(&e, ProgressBar::new(0));
+        set_manual_speed_style(&u, "upload speed");
+        (e, u)
+    };
     let video_bars = VideoUploadBars {
         buf_pb: buf_pb.clone(),
         upload_pb: upload_pb.clone(),
@@ -458,7 +473,7 @@ pub async fn run_encoded_video(
 
     let mut run = spawn_ffmpeg(
         &source, encode_args, &scale_args, &output_arg, pipe_stdout,
-        file_pb, total_pb, source_size, duration_us,
+        file_pb, total_pb, encode_budget, duration_us,
     )?;
 
     let mut files: Vec<RawBigFile> = Vec::new();
@@ -489,7 +504,8 @@ pub async fn run_encoded_video(
     if let Some(h) = run.progress {
         let _ = h.await;
         let advanced = run.total_advanced.load(std::sync::atomic::Ordering::Relaxed);
-        total_pb.inc(source_size.saturating_sub(advanced));
+        total_pb.inc(encode_budget.saturating_sub(advanced));
+        file_pb.set_position(encode_budget);
     }
     if !status.success() {
         buf_tick_handle.abort();
@@ -505,17 +521,31 @@ pub async fn run_encoded_video(
     // Scratch-file path: encode is done, now open the file and upload it.
     if let Some(ref path) = scratch {
         set_label(file_pb, format!("uploading {}", doc_filename));
-        file_pb.set_position(0);
+        // file_pb is already at encode_budget — upload advances it the rest of
+        // the way to source_size via ScaledProgressReader.
+        let scratch_size = tokio::fs::metadata(path).await
+            .with_context(|| format!("stat scratch file {}", path.display()))?
+            .len();
+        let upload_budget = source_size.saturating_sub(encode_budget);
         let f = tokio::fs::File::open(path).await
             .with_context(|| format!("opening scratch file {}", path.display()))?;
-        let upload_reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(f);
-        let mut tracked = SpeedReader { inner: upload_reader, pb: encode_pb.clone() };
-        // Uploader drives file_pb (encode phase already credited total_pb).
+        let mut tracked = ScaledProgressReader {
+            inner: f,
+            file_pb: file_pb.clone(),
+            total_pb: total_pb.clone(),
+            inner_size: scratch_size,
+            budget: upload_budget,
+            base: encode_budget,
+            bytes_read: 0,
+            credited: 0,
+        };
+        // ScaledProgressReader is driving file_pb / total_pb; tell the
+        // uploader to keep its hands off them.
         let mut peek: Option<u8> = None;
         loop {
             let (raw, eof) = upload_one_big_file(
                 client, &mut tracked, &mut peek, PART_MAX,
-                file_pb, total_pb, true, Some(&video_bars),
+                file_pb, total_pb, false, Some(&video_bars),
             ).await?;
             if let Some(r) = raw { files.push(r); }
             if eof { break; }
@@ -524,6 +554,10 @@ pub async fn run_encoded_video(
                 bail!("encoded '{}' exceeded 4 GiB but multipart_policy is `none`", doc_filename);
             }
         }
+        // Top up any rounding remainder so the file contributes exactly
+        // source_size in total.
+        let credited = tracked.credited;
+        total_pb.inc(upload_budget.saturating_sub(credited));
         // Cleanup scratch regardless of further outcomes.
         let _ = tokio::fs::remove_file(path).await;
     }

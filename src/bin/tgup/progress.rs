@@ -88,7 +88,7 @@ pub fn set_bar_style(pb: &ProgressBar) {
     pb.disable_steady_tick();
     pb.set_style(
         ProgressStyle::with_template(&format!(
-            "{{msg:<{w}.{w}}} [{{bar:30.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{bytes_per_sec}}, {{eta}})",
+            "{{msg:<{w}.{w}}} [{{bar:30.cyan/blue}}] {{percent:>3}}% ({{eta}})",
             w = LABEL_WIDTH,
         ))
         .unwrap()
@@ -105,6 +105,44 @@ pub fn set_spinner_style(pb: &ProgressBar) {
         .unwrap(),
     );
     pb.enable_steady_tick(Duration::from_millis(120));
+}
+
+/// Reader wrapper that scales bytes read into a fixed `budget` credited to
+/// `file_pb` (absolute position, offset by `base`) and `total_pb` (delta).
+/// Used by the LeadingMoov upload phase: scratch file is `inner_size` bytes,
+/// but the bars are calibrated against the source file's `budget`.
+pub struct ScaledProgressReader<R> {
+    pub inner: R,
+    pub file_pb: ProgressBar,
+    pub total_pb: ProgressBar,
+    pub inner_size: u64,
+    pub budget: u64,
+    pub base: u64,
+    pub bytes_read: u64,
+    pub credited: u64,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ScaledProgressReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let after = buf.filled().len();
+        let delta = (after - before) as u64;
+        if delta > 0 && self.inner_size > 0 {
+            self.bytes_read += delta;
+            let cumulative = ((self.bytes_read as u128) * (self.budget as u128)
+                / (self.inner_size as u128)) as u64;
+            let delta_credit = cumulative.saturating_sub(self.credited);
+            self.credited = cumulative;
+            self.file_pb.set_position(self.base + cumulative);
+            self.total_pb.inc(delta_credit);
+        }
+        r
+    }
 }
 
 /// Wraps a reader and increments a single `ProgressBar` by bytes read.
@@ -178,7 +216,7 @@ pub fn set_buffer_bar_style(pb: &ProgressBar) {
         .unwrap()
         .progress_chars("=>-"),
     );
-    pb.set_prefix("encode buffer");
+    pb.set_prefix("upload buffer");
     pb.set_message("0.00 MiB / 0.00 MiB  (processed: 0.00 MiB)");
 }
 
