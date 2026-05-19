@@ -339,7 +339,7 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                     let processed = tu.fetch_add(part_len, Ordering::Relaxed) + part_len;
                     bp.set_position(new_fill);
                     bp.set_message(format!(
-                        "{} / {}  (processed: {})",
+                        "{} / {}  (Σ {})",
                         fmt_mib(new_fill),
                         fmt_mib(buf_max),
                         fmt_mib(processed),

@@ -22,7 +22,11 @@ use tgfs::config::{self, Config};
 use tgfs::login::connect_and_authorize_with_session;
 
 use args::{default_config_path, default_session_path, parse_args, DirMode};
-use ffmpeg::{build_encode_args, ffmpeg_in_path, run_encoded_video, thumbnail_args};
+use ffmpeg::{
+    build_encode_args, ffmpeg_in_path, run_encoded_video, run_leading_moov_pipeline,
+    thumbnail_args,
+};
+use tgfs::config::Streamification;
 use plan::{collect_path, find_channel, print_plan, UploadItem};
 use progress::{set_bar_style, set_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
@@ -54,6 +58,10 @@ impl std::io::Write for MpLogWriter {
 }
 
 async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
+    // Wipe leftover scratch files from any prior crashed run before we start.
+    // remove_dir_all errors when the dir doesn't exist — fine, ignore.
+    let _ = std::fs::remove_dir_all(ffmpeg::SCRATCH_DIR);
+
     let args = parse_args()?;
 
     if args.encode_video && args.dir_mode == DirMode::Zip {
@@ -121,15 +129,24 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     let peer = resolve_channel_peer(&client, &args.channel).await?;
 
     let total_bytes: u64 = plan.iter().map(|i| i.planned_bytes()).sum();
+    let streamification = config.ffmpeg.encode_args.video.streamification;
+    let pipeline_eligible = streamification == Streamification::LeadingMoov
+        && plan.iter().all(|i| matches!(i, UploadItem::EncodedVideo { .. }));
+
+    // For the LeadingMoov pipeline we want TWO file-level bars (encode +
+    // upload). For everything else, one is enough.
     let file_pb = mp.add(ProgressBar::new(0));
     set_bar_style(&file_pb);
+    let upload_pb: Option<ProgressBar> = if pipeline_eligible {
+        let pb = mp.add(ProgressBar::new(1));
+        set_bar_style(&pb);
+        set_label(&pb, "pending upload");
+        Some(pb)
+    } else { None };
     let total_pb = mp.add(ProgressBar::new(total_bytes));
-    // Compose a single fixed-width "TOTAL i/N" label so the bar column
-    // lines up with the file_pb above it (which left-pads `{msg}` to
-    // LABEL_WIDTH).
     total_pb.set_style(
         ProgressStyle::with_template(&format!(
-            "{{msg:<{w}.{w}}} [{{bar:50.green/blue}}] {{percent:>3}}% ({{eta}})",
+            "{{msg:<{w}.{w}}} [{{bar:20.green/blue}}] {{percent:>3}}% ({{eta}})",
             w = LABEL_WIDTH,
         ))
         .unwrap()
@@ -137,33 +154,41 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     );
     total_pb.set_message(format!("TOTAL 0/{}", plan.len()));
 
-    for (i, item) in plan.iter().enumerate() {
-        match item {
-            UploadItem::Single(p) => {
-                upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
-            }
-            UploadItem::SuffixParts { parts, .. } => {
-                for p in parts {
+    if let Some(ref upload_pb) = upload_pb {
+        run_leading_moov_pipeline(
+            &client, peer, &encode_args, config.ffmpeg.encode_args.video.vres,
+            &thumb_args, &plan, &mp, &file_pb, upload_pb, &total_pb,
+        ).await?;
+    } else {
+        for (i, item) in plan.iter().enumerate() {
+            match item {
+                UploadItem::Single(p) => {
                     upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
                 }
+                UploadItem::SuffixParts { parts, .. } => {
+                    for p in parts {
+                        upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
+                    }
+                }
+                UploadItem::AlbumParts { parts, .. } => {
+                    upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
+                }
+                UploadItem::EncodedVideo { .. } => {
+                    run_encoded_video(
+                        &client, peer,
+                        streamification,
+                        &encode_args, config.ffmpeg.encode_args.video.vres,
+                        &thumb_args,
+                        item, &mp, &file_pb, &total_pb,
+                    ).await?;
+                }
             }
-            UploadItem::AlbumParts { parts, .. } => {
-                upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
-            }
-            UploadItem::EncodedVideo { .. } => {
-                run_encoded_video(
-                    &client, peer,
-                    config.ffmpeg.encode_args.video.streamification,
-                    &encode_args, config.ffmpeg.encode_args.video.vres,
-                    &thumb_args,
-                    item, &mp, &file_pb, &total_pb,
-                ).await?;
-            }
+            set_label(&file_pb, format!("done: {}", item.display_name()));
+            total_pb.set_message(format!("TOTAL {}/{}", i + 1, plan.len()));
         }
-        set_label(&file_pb, format!("done: {}", item.display_name()));
-        total_pb.set_message(format!("TOTAL {}/{}", i + 1, plan.len()));
     }
     file_pb.finish_with_message("done");
+    if let Some(pb) = upload_pb { pb.finish_with_message("done"); }
     total_pb.finish();
     println!("All uploads complete.");
     Ok(())
@@ -176,9 +201,28 @@ async fn main() -> ExitCode {
     // interleave with the bar redraws and desync the cursor-up arithmetic.
     let mp = Arc::new(MultiProgress::new());
     let log_writer = MpLogWriter { mp: mp.clone(), buf: Vec::new() };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,grammers_mtsender=error"),
+    )
         .target(env_logger::Target::Pipe(Box::new(log_writer)))
         .init();
+
+    // SIGINT / SIGTERM / SIGHUP: wipe the scratch directory and exit so a
+    // mid-encode Ctrl-C doesn't leak GB-scale temp files.
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint  = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sighup  = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        let signo = tokio::select! {
+            _ = sigint.recv()  => 2,
+            _ = sigterm.recv() => 15,
+            _ = sighup.recv()  => 1,
+        };
+        let _ = std::fs::remove_dir_all(ffmpeg::SCRATCH_DIR);
+        std::process::exit(128 + signo);
+    });
+
     match run(mp).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
