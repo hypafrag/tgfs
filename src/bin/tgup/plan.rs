@@ -56,6 +56,11 @@ pub enum UploadItem {
     /// File > 4 GiB, channel policy = `album`. One Telegram album of N parts
     /// that share `multipart:` + `path:` directives in the caption.
     AlbumParts { display: String, parts: Vec<UploadPart> },
+    /// Multiple distinct files grouped into a single Telegram album (max 10).
+    /// Produced by post-processing when `--album` is passed. All parts share
+    /// the same caption so the indexer's `extract_group_caption` applies one
+    /// `path:` directive uniformly to every part.
+    FileAlbum { parts: Vec<UploadPart> },
     /// Video that must be re-encoded by ffmpeg before upload. The encoded
     /// stream's size is unknown at plan time — multipart-splitting is deferred
     /// until the encode finishes at upload time.
@@ -84,6 +89,7 @@ impl UploadItem {
             UploadItem::Single(p) => &p.doc_filename,
             UploadItem::SuffixParts { display, .. }
             | UploadItem::AlbumParts { display, .. } => display.as_str(),
+            UploadItem::FileAlbum { parts } => parts.first().map(|p| p.doc_filename.as_str()).unwrap_or("album"),
             UploadItem::EncodedVideo { doc_filename, .. } => doc_filename.as_str(),
         }
     }
@@ -94,7 +100,8 @@ impl UploadItem {
         match self {
             UploadItem::Single(p) => p.size,
             UploadItem::SuffixParts { parts, .. }
-            | UploadItem::AlbumParts { parts, .. } => parts.iter().map(|p| p.size).sum(),
+            | UploadItem::AlbumParts { parts, .. }
+            | UploadItem::FileAlbum { parts } => parts.iter().map(|p| p.size).sum(),
             UploadItem::EncodedVideo { source_size, .. } => *source_size,
         }
     }
@@ -306,6 +313,49 @@ fn relative_dir_from_cwd(parent: &Path, cwd: &Path) -> anyhow::Result<String> {
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
+/// Telegram allows at most 10 media in one album.
+pub const ALBUM_MAX: usize = 10;
+
+/// Post-process a plan to merge runs of `Single` items into `FileAlbum`s.
+///
+/// Only consecutive `Single`s that share the same `caption` are merged so the
+/// indexer-side `extract_group_caption` (which applies one `path:` directive
+/// uniformly to every part of an album) yields the same virtual paths as the
+/// ungrouped upload would have. Non-`Single` items are passed through and act
+/// as boundaries that flush any in-progress group.
+pub fn group_into_albums(plan: Vec<UploadItem>) -> Vec<UploadItem> {
+    let mut out: Vec<UploadItem> = Vec::new();
+    let mut buf: Vec<UploadPart> = Vec::new();
+    let mut buf_caption: Option<String> = None;
+    for item in plan {
+        match item {
+            UploadItem::Single(part) => {
+                let cap_changed = buf_caption.as_ref().map_or(false, |c| c != &part.caption);
+                if buf.len() >= ALBUM_MAX || cap_changed {
+                    flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+                }
+                if buf.is_empty() { buf_caption = Some(part.caption.clone()); }
+                buf.push(part);
+            }
+            other => {
+                flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+                out.push(other);
+            }
+        }
+    }
+    flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+    out
+}
+
+fn flush_album_buf(buf: &mut Vec<UploadPart>, caption: &mut Option<String>, out: &mut Vec<UploadItem>) {
+    match buf.len() {
+        0 => {}
+        1 => out.push(UploadItem::Single(buf.pop().unwrap())),
+        _ => out.push(UploadItem::FileAlbum { parts: std::mem::take(buf) }),
+    }
+    *caption = None;
+}
+
 pub fn find_channel<'a>(config: &'a Config, name: &str) -> Option<&'a ChannelEntry> {
     config.channels.iter().find(|c| c.name == name)
 }
@@ -352,6 +402,22 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                 }
                 for (j, p) in parts.iter().enumerate() {
                     println!("        part .{:02}: {} bytes (offset {})", j, p.size, p.offset);
+                }
+            }
+            UploadItem::FileAlbum { parts } => {
+                let total: u64 = parts.iter().map(|p| p.size).sum();
+                println!("  [{}] album of {} files — {} bytes", i, parts.len(), total);
+                if let Some(c) = parts.first() {
+                    if !c.caption.is_empty() {
+                        for line in c.caption.lines() {
+                            println!("        album caption: {}", line);
+                        }
+                    }
+                }
+                for (j, p) in parts.iter().enumerate() {
+                    let PartSource::File(pb) = &p.src;
+                    println!("        [{}] {} — {} bytes (from '{}')",
+                        j, p.doc_filename, p.size, pb.display());
                 }
             }
             UploadItem::EncodedVideo { source, doc_filename, virtual_path, rel_dir, source_size, .. } => {

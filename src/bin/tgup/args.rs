@@ -20,6 +20,7 @@ pub struct Args {
     pub dir_mode: DirMode,
     pub dry_run: bool,
     pub encode_video: bool,
+    pub album: bool,
     pub paths: Vec<PathBuf>,
 }
 
@@ -57,7 +58,7 @@ fn print_usage() {
     eprintln!(
         "tgup — upload files to a tgfs-indexed Telegram channel\n\n\
          Usage:\n  \
-           tgup [--config <path>] -c <channel> [-d <mode>] [--encode-video] [--dry-run] <path>...\n\n\
+           tgup [--config <path>] -c <channel> [-d <mode>] [-a] [--encode-video] [--dry-run] <path>...\n\n\
          Options:\n  \
            -c, --channel <name>   Target channel name (must exist in config).\n  \
            -d, --dir <mode>       How to handle directory arguments:\n                            \
@@ -66,6 +67,10 @@ fn print_usage() {
              caption    — like recursive, but each file's caption sets\n                                         \
              `path: <relative dir>/` so the tree is recreated\n                            \
              zip        — not implemented (exits with error)\n  \
+           -a, --album            Group consecutive uploadable files into Telegram\n                          \
+             albums (up to 10 items each). Only files sharing the\n                          \
+             same caption are grouped together; multipart and\n                          \
+             encoded-video items are passed through unchanged.\n  \
            --encode-video         Re-encode video files with ffmpeg (using\n                          \
              ffmpeg.encode_args from the config) and attach\n                          \
              an ffmpeg-generated thumbnail to each uploaded\n                          \
@@ -87,6 +92,7 @@ pub fn parse_args() -> anyhow::Result<Args> {
     let mut dir_mode = DirMode::Skip;
     let mut dry_run = false;
     let mut encode_video = false;
+    let mut album = false;
     let mut paths: Vec<PathBuf> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -103,6 +109,7 @@ pub fn parse_args() -> anyhow::Result<Args> {
             }
             "--dry-run" => dry_run = true,
             "--encode-video" => encode_video = true,
+            "-a" | "--album" => album = true,
             other if other.starts_with("--channel=") => {
                 channel = Some(other.trim_start_matches("--channel=").to_string());
             }
@@ -118,5 +125,5 @@ pub fn parse_args() -> anyhow::Result<Args> {
     }
     let channel = channel.ok_or_else(|| anyhow!("-c/--channel is required"))?;
     if paths.is_empty() { bail!("at least one file or directory path is required"); }
-    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, paths })
+    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, album, paths })
 }

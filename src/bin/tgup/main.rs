@@ -27,7 +27,7 @@ use ffmpeg::{
     thumbnail_args,
 };
 use tgfs::config::Streamification;
-use plan::{collect_path, find_channel, print_plan, UploadItem};
+use plan::{collect_path, find_channel, group_into_albums, print_plan, UploadItem};
 use progress::{set_bar_style, set_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
@@ -115,6 +115,10 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     }
     if plan.is_empty() { bail!("nothing to upload"); }
 
+    if args.album {
+        plan = group_into_albums(plan);
+    }
+
     if args.dry_run {
         print_plan(&plan, &args.channel, args.encode_video);
         return Ok(());
@@ -171,6 +175,9 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                     }
                 }
                 UploadItem::AlbumParts { parts, .. } => {
+                    upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
+                }
+                UploadItem::FileAlbum { parts } => {
                     upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
                 }
                 UploadItem::EncodedVideo { .. } => {
