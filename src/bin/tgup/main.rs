@@ -27,7 +27,33 @@ use plan::{collect_path, find_channel, print_plan, UploadItem};
 use progress::{set_bar_style, set_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
-async fn run() -> anyhow::Result<()> {
+/// A `Write` adapter that routes log lines through `MultiProgress::println` so
+/// they appear above the progress bars without corrupting the cursor-up redraw
+/// arithmetic indicatif uses to overwrite them in place.
+struct MpLogWriter {
+    mp: Arc<MultiProgress>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for MpLogWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let s = String::from_utf8_lossy(&self.buf).into_owned();
+        for line in s.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches('\n');
+            if !trimmed.is_empty() {
+                let _ = self.mp.println(trimmed);
+            }
+        }
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     let args = parse_args()?;
 
     if args.encode_video && args.dir_mode == DirMode::Zip {
@@ -95,7 +121,6 @@ async fn run() -> anyhow::Result<()> {
     let peer = resolve_channel_peer(&client, &args.channel).await?;
 
     let total_bytes: u64 = plan.iter().map(|i| i.planned_bytes()).sum();
-    let mp = Arc::new(MultiProgress::new());
     let file_pb = mp.add(ProgressBar::new(0));
     set_bar_style(&file_pb);
     let total_pb = mp.add(ProgressBar::new(total_bytes));
@@ -146,8 +171,15 @@ async fn run() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    match run().await {
+    // Create the MultiProgress first so log output can be routed through its
+    // `println` — that way `grammers` (or any other `log::warn!`) writes don't
+    // interleave with the bar redraws and desync the cursor-up arithmetic.
+    let mp = Arc::new(MultiProgress::new());
+    let log_writer = MpLogWriter { mp: mp.clone(), buf: Vec::new() };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .target(env_logger::Target::Pipe(Box::new(log_writer)))
+        .init();
+    match run(mp).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {:#}", e);
