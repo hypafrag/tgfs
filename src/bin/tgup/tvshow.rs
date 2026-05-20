@@ -11,9 +11,28 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _};
+use log::debug;
 
 use super::args::DirMode;
 use super::plan::{PartSource, UploadItem, UploadPart, ALBUM_MAX, PART_MAX};
+use super::tvmaze::Tvmaze;
+
+/// Extensions tgup will accept as TV-show episodes in `--tvshow` mode.
+/// Anything else (incomplete downloads like `.part`/`.crdownload`, subtitle
+/// sidecars, thumbnails, NFOs, etc.) is silently skipped during the walk.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "m4v", "mkv", "avi", "mov", "webm", "wmv", "flv",
+    "mpg", "mpeg", "m2ts", "ts", "mts", "vob", "3gp", "ogv",
+    "divx", "asf", "rm", "rmvb",
+];
+
+fn is_video_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        .map(|s| VIDEO_EXTS.iter().any(|v| *v == s))
+        .unwrap_or(false)
+}
 
 #[derive(Debug)]
 struct Episode {
@@ -108,6 +127,10 @@ fn collect_files(
     let meta = std::fs::metadata(arg)
         .with_context(|| format!("can't stat '{}'", arg.display()))?;
     if meta.is_file() {
+        if !is_video_file(arg) {
+            debug!("--tvshow: skipping non-video file arg '{}'", arg.display());
+            return Ok(());
+        }
         let abs = arg.canonicalize()
             .with_context(|| format!("can't canonicalize '{}'", arg.display()))?;
         let rel = abs.file_name()
@@ -143,6 +166,10 @@ fn collect_files(
                 if m.is_dir() {
                     stack.push(p);
                 } else if m.is_file() {
+                    if !is_video_file(&p) {
+                        debug!("--tvshow: skipping non-video file '{}'", p.display());
+                        continue;
+                    }
                     let under = p.strip_prefix(&arg_canon)
                         .with_context(|| format!(
                             "walked path '{}' is not under arg root '{}'",
@@ -167,13 +194,21 @@ fn collect_files(
 /// emit `UploadItem`s. Multi-episode seasons become `FileAlbum`s split across
 /// chunks of ≤ALBUM_MAX as evenly as possible; single-episode seasons become a
 /// lone `Single`.
-pub fn build_tvshow_plan(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result<Vec<UploadItem>> {
+pub async fn build_tvshow_plan(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result<Vec<UploadItem>> {
+    let mut episodes = collect_and_parse(paths, dir_mode)?;
+    if episodes.is_empty() { return Ok(Vec::new()); }
+    enrich_missing_titles_from_tvmaze(&mut episodes).await;
+    Ok(assemble_plan(episodes))
+}
+
+/// Pure I/O + parse phase. Split out from `build_tvshow_plan` so unit tests
+/// can exercise file discovery and hunch parsing without triggering the
+/// network-bound TVmaze enrichment step.
+fn collect_and_parse(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result<Vec<Episode>> {
     let mut files: Vec<(PathBuf, u64, String)> = Vec::new();
     for p in paths {
         collect_files(p, dir_mode, &mut files)?;
     }
-    if files.is_empty() { return Ok(Vec::new()); }
-
     let mut episodes: Vec<Episode> = Vec::with_capacity(files.len());
     for (abs, size, rel) in files {
         if size > PART_MAX {
@@ -184,7 +219,32 @@ pub fn build_tvshow_plan(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result
         }
         episodes.push(parse_episode(abs, size, &rel)?);
     }
-    Ok(assemble_plan(episodes))
+    Ok(episodes)
+}
+
+/// For every episode whose `episode_title` is still `None`, ask TVmaze.
+/// Failures (network, missing show, missing episode) are logged but never
+/// fatal — the upload plan still proceeds with the bare `S##E##` filename.
+async fn enrich_missing_titles_from_tvmaze(episodes: &mut [Episode]) {
+    let needs_lookup = episodes.iter().any(|e| e.episode_title.is_none());
+    if !needs_lookup { return; }
+    let mut tvmaze = match Tvmaze::new() {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("TVmaze client init failed: {e:#} — proceeding without enrichment");
+            return;
+        }
+    };
+    for e in episodes.iter_mut() {
+        if e.episode_title.is_some() { continue; }
+        if let Some(t) = tvmaze.episode_title(&e.title, e.season, e.episode).await {
+            log::info!(
+                "TVmaze filled episode title for {} S{:02}E{:02}: {:?}",
+                e.title, e.season, e.episode, t,
+            );
+            e.episode_title = Some(t);
+        }
+    }
 }
 
 /// Pure plan-assembly: sort episodes by (title, season, episode) and partition
@@ -476,6 +536,13 @@ mod tests {
         p
     }
 
+    /// Helper that exercises everything `build_tvshow_plan` does except the
+    /// TVmaze enrichment step. Keeps unit tests offline and deterministic.
+    fn build_plan_offline(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result<Vec<UploadItem>> {
+        let episodes = collect_and_parse(paths, dir_mode)?;
+        Ok(assemble_plan(episodes))
+    }
+
     #[test]
     fn build_plan_end_to_end_groups_by_season() {
         let dir = tempdir("e2e-groups");
@@ -488,7 +555,7 @@ mod tests {
         }
         paths.push(touch(&dir, "The.Walking.Dead.S01E01.720p.x264.mkv"));
 
-        let plan = build_tvshow_plan(&paths, DirMode::Skip).unwrap();
+        let plan = build_plan_offline(&paths, DirMode::Skip).unwrap();
         // S04 (1 album of 3) + S05 (split 6+5 = 2 albums) + TWD S01 (1 Single).
         assert_eq!(plan.len(), 4);
         assert_eq!(captions(&plan[0])[0], "Breaking Bad S04 E01-E03");
@@ -509,7 +576,7 @@ mod tests {
             touch(&nested, &format!("Breaking.Bad.S05E{:02}.x264.mkv", n));
         }
 
-        let plan = build_tvshow_plan(&[dir.clone()], DirMode::Recursive).unwrap();
+        let plan = build_plan_offline(&[dir.clone()], DirMode::Recursive).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(names(&plan[0]).len(), 3);
         assert_eq!(captions(&plan[0])[0], "Breaking Bad S05 E01-E03");
@@ -518,10 +585,48 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_skips_non_video_files_during_walk() {
+        // Mix episodes with realistic clutter: partial downloads, sidecars,
+        // and nfos. Only the .mkv files should make it into the plan.
+        let dir = tempdir("e2e-nonvideo");
+        for n in 1..=3 {
+            touch(&dir, &format!("Breaking.Bad.S05E{:02}.x264.mkv", n));
+        }
+        touch(&dir, "Breaking.Bad.S05E04.x264.avi.part");
+        touch(&dir, "Breaking.Bad.S05E01.x264.srt");
+        touch(&dir, "tvshow.nfo");
+        touch(&dir, "thumb.jpg");
+
+        let plan = build_plan_offline(&[dir.clone()], DirMode::Recursive).unwrap();
+        // Only the three .mkv episodes survive the video-extension filter.
+        assert_eq!(plan.len(), 1);
+        assert_eq!(names(&plan[0]).len(), 3);
+        assert_eq!(captions(&plan[0])[0], "Breaking Bad S05 E01-E03");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_plan_skips_non_video_file_args() {
+        // Even when a non-video file is passed explicitly, it's filtered.
+        let dir = tempdir("e2e-nonvideo-arg");
+        let vid = touch(&dir, "Breaking.Bad.S01E01.mkv");
+        let part = touch(&dir, "Breaking.Bad.S01E02.mkv.part");
+
+        let plan = build_plan_offline(&[vid, part], DirMode::Skip).unwrap();
+        // The .part file was silently dropped; only the .mkv made it in.
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(plan[0], UploadItem::Single(_)));
+        assert_eq!(names(&plan[0]), vec!["Breaking Bad S01E01.mkv"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn build_plan_rejects_directory_under_skip() {
         let dir = tempdir("e2e-skip");
         touch(&dir, "Breaking.Bad.S01E01.mkv");
-        let err = match build_tvshow_plan(&[dir.clone()], DirMode::Skip) {
+        let err = match build_plan_offline(&[dir.clone()], DirMode::Skip) {
             Err(e) => e,
             Ok(_) => panic!("expected error for directory under DirMode::Skip"),
         };
@@ -532,7 +637,7 @@ mod tests {
 
     #[test]
     fn build_plan_empty_input_yields_empty_plan() {
-        let plan = build_tvshow_plan(&[], DirMode::Skip).unwrap();
+        let plan = build_plan_offline(&[], DirMode::Skip).unwrap();
         assert!(plan.is_empty());
     }
 }

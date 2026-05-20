@@ -10,6 +10,7 @@ mod ffmpeg;
 mod picker;
 mod plan;
 mod progress;
+mod tvmaze;
 mod tvshow;
 mod upload;
 
@@ -143,7 +144,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
 
     let mut plan: Vec<UploadItem> = Vec::new();
     if args.tvshow {
-        plan = tvshow::build_tvshow_plan(&args.paths, args.dir_mode)?;
+        plan = tvshow::build_tvshow_plan(&args.paths, args.dir_mode).await?;
     } else {
         for p in &args.paths {
             collect_path(p, &cwd, policy, args.dir_mode, args.encode_video, &mut plan)?;

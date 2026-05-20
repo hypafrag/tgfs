@@ -287,11 +287,15 @@ Most flags compose: `-d recursive` works alongside `-a`, `--encode-video`, etc. 
 
 ### `--tvshow`
 
-For libraries of named episodes. Each input file is parsed with [hunch](https://crates.io/crates/hunch) from its **path relative to the arg** (so ancestor directories contribute to the parse), renamed to `<Title> S##E## - <Episode Title>.<ext>` (or the bare `<Title> S##E##.<ext>` when no episode title is recovered), sorted by `(title, season, episode)`, and grouped into per-season Telegram albums of up to 10 items each. Larger seasons split evenly: 11 episodes → albums of 6+5; 21 → 7+7+7. The album caption is `<Title> S## E##-E##` (range) or `<Title> S##E##` (single).
+For libraries of named episodes. Each input file is parsed with [hunch](https://crates.io/crates/hunch) from its **path relative to the arg** (so ancestor directories contribute to the parse), renamed to `<Title> S##E## - <Episode Title>.<ext>` (or the bare `<Title> S##E##.<ext>` when no episode title is available), sorted by `(title, season, episode)`, and grouped into per-season Telegram albums of up to 10 items each. Larger seasons split evenly: 11 episodes → albums of 6+5; 21 → 7+7+7. The album caption is `<Title> S## E##-E##` (range) or `<Title> S##E##` (single).
 
 ```bash
 tgup -c "TV Shows" --tvshow -d recursive "The.Walking.Dead.bdrip_[teko]"
 ```
+
+Episode titles hunch can't recover (e.g. `s01e06_TS-19.avi`, where the hyphenated code defeats hunch's heuristics) are filled in via the public [TVmaze API](https://www.tvmaze.com/api): one `/search/shows` call resolves the show ID from the hunched title, one `/shows/{id}/episodes` call enumerates every episode, and the per-show result is cached for the rest of the run. Failures (offline, show not found, episode missing) are logged at `warn` level and the bare `S##E##.<ext>` form is used instead — TVmaze is never required to upload.
+
+Non-video files are skipped silently during the walk: incomplete downloads (`.part`, `.crdownload`), subtitle sidecars (`.srt`, `.ass`), thumbnails, `.nfo` metadata, etc. don't need to be filtered out by hand. The allow-list covers common containers (`mp4`, `m4v`, `mkv`, `avi`, `mov`, `webm`, `wmv`, `flv`, `mpg`, `mpeg`, `ts`, `m2ts`, `mts`, `vob`, `3gp`, `ogv`, `divx`, `asf`, `rm`, `rmvb`).
 
 Pair with the tgfs [`tvshow_pattern`](#tvshow_pattern) channel option to expose these uploads as a Plex-style tree. Constraints: non-empty extensions only, files >4 GiB rejected, mutually exclusive with `-a`, `--encode-video`, `-d caption`, and `-d zip`.
 

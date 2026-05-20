@@ -1,32 +1,46 @@
-//! Throwaway probe: feed example relative paths to hunch and dump every
-//! field we care about so we can see what the parser can and can't extract
-//! from the full-path form. Delete once the tvshow recursive-mode design
-//! lands.
+//! Throwaway probe: see what coaxes hunch into recognizing `TS-19` as an
+//! episode title. Delete once we've picked a strategy.
 
 fn dump(label: &str, input: &str) {
     let r = hunch::hunch(input);
-    println!("== {label} ==");
-    println!("  input         : {input}");
-    println!("  title         : {:?}", r.title());
-    println!("  season        : {:?}", r.season());
-    println!("  episode       : {:?}", r.episode());
-    println!("  episode_title : {:?}", r.episode_title());
-    println!("  year          : {:?}", r.year());
-    println!("  is_episode    : {}", r.is_episode());
-    println!("  confidence    : {:?}", r.confidence());
-    println!();
+    println!("{label:50} → title={:?}  episode_title={:?}",
+        r.title().unwrap_or("-"),
+        r.episode_title());
 }
 
 fn main() {
-    let paths = [
-        ("full path",       "The.Walking.Dead.bdrip_[teko]/Season_01/s01e01_Days.Gone.Bye.avi"),
-        ("filename only",   "s01e01_Days.Gone.Bye.avi"),
-        ("path no group",   "The.Walking.Dead/Season_01/s01e01_Days.Gone.Bye.avi"),
-        ("flattened",       "The.Walking.Dead.Season_01.s01e01_Days.Gone.Bye.avi"),
-        ("ep02",            "The.Walking.Dead.bdrip_[teko]/Season_01/s01e02_Guts.avi"),
-        ("ep05",            "The.Walking.Dead.bdrip_[teko]/Season_01/s01e05_Wildfire.avi"),
-        ("ep06",            "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS-19.avi"),
-        ("dir+file dotted", "The.Walking.Dead.bdrip_[teko].Season_01.s01e01.Days.Gone.Bye.avi"),
+    let cases = [
+        "as-is",                   "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS-19.avi",
+        "dash → dot",              "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS.19.avi",
+        "dash → space",            "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS 19.avi",
+        "dash → underscore",       "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS_19.avi",
+        "_ → space, dash kept",    "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06 TS-19.avi",
+        "_ before title → dash",   "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06-TS-19.avi",
+        "no dir",                  "s01e06_TS-19.avi",
+        "ep01 baseline (works)",   "The.Walking.Dead.bdrip_[teko]/Season_01/s01e01_Days.Gone.Bye.avi",
+        "TS-19 surrounded by dots","The.Walking.Dead.S01E06.TS-19.avi",
+        "TS19 (no dash)",          "The.Walking.Dead.S01E06.TS19.avi",
+        "dotted title kept dash",  "The.Walking.Dead.S01E06.TS-19.bdrip.avi",
+        "as-is with siblings",     "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS-19.avi",
     ];
-    for (label, p) in paths { dump(label, p); }
+
+    let mut i = 0;
+    while i + 1 < cases.len() {
+        dump(cases[i], cases[i + 1]);
+        i += 2;
+    }
+
+    println!();
+    println!("With hunch_with_context (siblings from the same season):");
+    let target = "The.Walking.Dead.bdrip_[teko]/Season_01/s01e06_TS-19.avi";
+    let siblings = [
+        "The.Walking.Dead.bdrip_[teko]/Season_01/s01e01_Days.Gone.Bye.avi",
+        "The.Walking.Dead.bdrip_[teko]/Season_01/s01e02_Guts.avi",
+        "The.Walking.Dead.bdrip_[teko]/Season_01/s01e03_Tell.It.to.the.Frogs.avi",
+        "The.Walking.Dead.bdrip_[teko]/Season_01/s01e04_Vatos.avi",
+        "The.Walking.Dead.bdrip_[teko]/Season_01/s01e05_Wildfire.avi",
+    ];
+    let r = hunch::hunch_with_context(target, &siblings);
+    println!("  title={:?}  season={:?}  episode={:?}  episode_title={:?}",
+        r.title(), r.season(), r.episode(), r.episode_title());
 }
