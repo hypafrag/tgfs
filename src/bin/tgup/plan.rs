@@ -69,6 +69,54 @@ pub fn plan_has_video(plan: &[UploadItem]) -> bool {
     })
 }
 
+/// When `--tvshow` and `--encode-video` are combined, convert every video
+/// `Single` or `FileAlbum` part into an encoded upload:
+///   - `Single` (video)    → `EncodedVideo`  (individual encoded message)
+///   - `FileAlbum` (video) → `EncodedAlbum`  (encode-then-album, grouping preserved)
+/// Non-video parts are left unchanged.
+pub fn apply_encode_video_to_tvshow_plan(
+    plan: Vec<UploadItem>,
+    policy: MultipartPolicy,
+) -> Vec<UploadItem> {
+    let mut out: Vec<UploadItem> = Vec::with_capacity(plan.len());
+    for item in plan {
+        match item {
+            UploadItem::Single(part) => {
+                let PartSource::File(ref src) = part.src;
+                if is_video_path(src) {
+                    let doc_filename = replace_ext(&part.doc_filename, "mp4");
+                    out.push(UploadItem::EncodedVideo {
+                        source: src.clone(),
+                        doc_filename: doc_filename.clone(),
+                        virtual_path: doc_filename,
+                        rel_dir: String::new(),
+                        policy,
+                        source_size: part.size,
+                    });
+                } else {
+                    out.push(UploadItem::Single(part));
+                }
+            }
+            UploadItem::FileAlbum { parts } => {
+                let renamed: Vec<UploadPart> = parts
+                    .into_iter()
+                    .map(|p| {
+                        let PartSource::File(ref src) = p.src;
+                        if is_video_path(src) {
+                            UploadPart { doc_filename: replace_ext(&p.doc_filename, "mp4"), ..p }
+                        } else {
+                            p
+                        }
+                    })
+                    .collect();
+                out.push(UploadItem::EncodedAlbum { parts: renamed });
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn replace_ext(name: &str, new_ext: &str) -> String {
     let stem = match name.rfind('.') {
         Some(i) => &name[..i],
