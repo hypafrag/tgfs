@@ -70,3 +70,7 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 [[example]]
 name = "integration_test"
 path = "examples/integration_test.rs"
+
+[[example]]
+name = "tgup_integration_test"
+path = "examples/tgup_integration_test.rs"

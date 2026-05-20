@@ -3,3 +3,4 @@ set -e
 
 cargo test
 cargo run --example integration_test -- --log-level info
+cargo run --example tgup_integration_test -- --log-level info

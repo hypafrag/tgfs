@@ -423,6 +423,7 @@ fn variant_config(
         mount_at: Some(MOUNT_PATH.to_string()),
         saved_messages: None,
         proxy: base.proxy.clone(),
+        ffmpeg: base.ffmpeg.clone(),
         max_fetches_per_pid: None,
         max_fetches_total: None,
         realtime: false,
