@@ -17,8 +17,71 @@ use indicatif::ProgressBar;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
-use super::plan::{PartSource, UploadPart};
-use super::progress::{fmt_mib, fmt_speed, set_bar_style, set_label, ProgressReader, SliceReader, LABEL_WIDTH};
+use super::ffmpeg::{ffmpeg_in_path, ffprobe_in_path, make_thumbnail_silent, probe_video_file};
+use super::plan::{media_type_from_path, PartSource, UploadPart};
+
+/// What kind of message a whole-file upload should be sent as. Per-chunk
+/// uploads (multipart files split into 4 GiB pieces) always use
+/// `Document` since a single chunk isn't a self-contained media file.
+enum MediaKind {
+    Document,
+    Video(VideoInfo),
+    Photo,
+}
+
+/// Best-effort thumbnail for a video file. Returns `None` when ffmpeg
+/// isn't installed (we already warned about ffprobe earlier — silently
+/// skip here) or when extraction failed for any other reason. Telegram
+/// is happy without a thumbnail; we just won't get a preview frame.
+async fn make_and_upload_thumb(
+    client: &Client,
+    path: &std::path::Path,
+    doc_filename: &str,
+) -> Option<Uploaded> {
+    if !ffmpeg_in_path() { return None; }
+    let bytes = make_thumbnail_silent(path).await.ok()?;
+    if bytes.is_empty() { return None; }
+    upload_thumb(client, bytes, doc_filename).await.ok()
+}
+
+/// Decide how to upload `part`. Returns `Document` when the part isn't a
+/// whole-file upload (multipart chunk), when the MIME/extension isn't a
+/// recognized image/video, or — for videos — when ffprobe isn't installed
+/// and we have no way to render an inline preview safely.
+async fn classify_whole_file(part: &UploadPart) -> MediaKind {
+    let PartSource::File(path) = &part.src;
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(_) => return MediaKind::Document,
+    };
+    if part.offset != 0 || part.size != meta.len() {
+        return MediaKind::Document;
+    }
+    match media_type_from_path(path) {
+        Some("image") => MediaKind::Photo,
+        Some("video") => {
+            // Prefer ffprobe-derived duration / width / height for inline
+            // previews. When ffprobe isn't on PATH (or it fails on this
+            // file), fall back to a zero-metadata VideoInfo derived from the
+            // extension — Telegram still gets the `video` attribute and will
+            // route it through the video player UI, just without a known
+            // duration or aspect ratio.
+            if ffprobe_in_path() {
+                if let Some(info) = probe_video_file(path).await {
+                    return MediaKind::Video(info);
+                }
+            }
+            MediaKind::Video(VideoInfo {
+                duration: std::time::Duration::ZERO,
+                width: 0,
+                height: 0,
+                streamable: false,
+            })
+        }
+        _ => MediaKind::Document,
+    }
+}
+use super::progress::{fmt_mib, fmt_speed, set_bar_style, set_prefix_label, spawn_speed_ticker, ProgressReader, SliceReader, LABEL_WIDTH};
 
 pub const TG_CHUNK: usize = 512 * 1024; // MTProto SaveBigFilePart chunk size
 /// Maximum number of `SaveBigFilePart` tasks allowed in flight at once.
@@ -69,7 +132,10 @@ pub async fn upload_part_as_message(
     set_bar_style(file_pb);
     file_pb.set_length(part.size);
     file_pb.set_position(0);
-    set_label(file_pb, part.doc_filename.clone());
+    set_prefix_label(file_pb, part.doc_filename.clone());
+    file_pb.set_message(String::new());
+    file_pb.reset_elapsed();
+    let speed = spawn_speed_ticker(file_pb.clone());
 
     let stream = open_part_stream(part).await?;
     let mut reader = ProgressReader {
@@ -81,13 +147,35 @@ pub async fn upload_part_as_message(
         .upload_stream(&mut reader, part.size as usize, part.doc_filename.clone())
         .await
         .with_context(|| format!("uploading '{}'", part.doc_filename))?;
+    speed.abort();
 
-    let mut msg = InputMessage::new().text(part.caption.clone());
-    msg = match video {
-        Some(info) => msg.document(uploaded).attribute(video_attribute(info)),
-        None => msg.file(uploaded),
+    // Caller-supplied `video` (re-encode path) wins; otherwise auto-classify
+    // the source as video/photo/document based on MIME + ffprobe so users
+    // get inline previews instead of generic attachments.
+    let auto = if video.is_none() {
+        Some(classify_whole_file(part).await)
+    } else {
+        None
     };
-    if let Some(t) = thumb {
+    // For auto-classified videos, also generate a thumbnail with ffmpeg so
+    // the Telegram client can show a preview frame. Caller-supplied `thumb`
+    // wins (re-encode path already produced one); for everything else we
+    // try to make one, silently degrading on failure.
+    let auto_thumb = match (video, &auto) {
+        (None, Some(MediaKind::Video(_))) => {
+            let PartSource::File(path) = &part.src;
+            make_and_upload_thumb(client, path, &part.doc_filename).await
+        }
+        _ => None,
+    };
+    let mut msg = InputMessage::new().text(part.caption.clone());
+    msg = match (video, &auto) {
+        (Some(info), _) => msg.document(uploaded).attribute(video_attribute(info)),
+        (None, Some(MediaKind::Video(info))) => msg.document(uploaded).attribute(video_attribute(info)),
+        (None, Some(MediaKind::Photo)) => msg.photo(uploaded),
+        (None, _) => msg.file(uploaded),
+    };
+    if let Some(t) = thumb.or(auto_thumb.as_ref()) {
         msg = msg.thumbnail(t.clone());
     }
     client
@@ -106,12 +194,32 @@ pub async fn upload_album(
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
 ) -> anyhow::Result<()> {
+    // Album-level pre-classification: probe every part up front. When the
+    // caller didn't already pin the kind (re-encode path), and *all* parts
+    // are videos or *all* parts are photos, render the whole album as that
+    // single media type. Anything mixed (or other content) keeps the legacy
+    // document-album behavior — Telegram rejects albums that mix documents
+    // with photos/videos, so the "uniform or nothing" rule is the safe one.
+    let auto_kinds: Option<Vec<MediaKind>> = if video.is_none() {
+        let mut v = Vec::with_capacity(parts.len());
+        for part in parts { v.push(classify_whole_file(part).await); }
+        Some(v)
+    } else { None };
+    let album_mode = match &auto_kinds {
+        Some(kinds) if kinds.iter().all(|k| matches!(k, MediaKind::Photo)) => AlbumMode::Photos,
+        Some(kinds) if kinds.iter().all(|k| matches!(k, MediaKind::Video(_))) => AlbumMode::Videos,
+        _ => AlbumMode::Documents,
+    };
+
     let mut medias: Vec<InputMedia> = Vec::with_capacity(parts.len());
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
         set_bar_style(file_pb);
         file_pb.set_length(part.size);
         file_pb.set_position(0);
-        set_label(file_pb, part.doc_filename.clone());
+        set_prefix_label(file_pb, part.doc_filename.clone());
+        file_pb.set_message(String::new());
+        file_pb.reset_elapsed();
+        let speed = spawn_speed_ticker(file_pb.clone());
 
         let stream = open_part_stream(part).await?;
         let mut reader = ProgressReader {
@@ -123,12 +231,25 @@ pub async fn upload_album(
             .upload_stream(&mut reader, part.size as usize, part.doc_filename.clone())
             .await
             .with_context(|| format!("uploading album part '{}'", part.doc_filename))?;
+        speed.abort();
         let mut media = InputMedia::new().caption(part.caption.clone());
-        media = match video {
-            Some(info) => media.document(uploaded).attribute(video_attribute(info)),
-            None => media.file(uploaded),
+        let per_part_thumb = if matches!(album_mode, AlbumMode::Videos) && video.is_none() {
+            let PartSource::File(p) = &part.src;
+            make_and_upload_thumb(client, p, &part.doc_filename).await
+        } else { None };
+        media = match (video, album_mode) {
+            (Some(info), _) => media.document(uploaded).attribute(video_attribute(info)),
+            (None, AlbumMode::Photos) => media.photo(uploaded),
+            (None, AlbumMode::Videos) => {
+                let info = match &auto_kinds.as_ref().unwrap()[i] {
+                    MediaKind::Video(v) => v,
+                    _ => unreachable!("AlbumMode::Videos implies every kind is Video"),
+                };
+                media.document(uploaded).attribute(video_attribute(info))
+            }
+            (None, AlbumMode::Documents) => media.file(uploaded),
         };
-        if let Some(t) = thumb {
+        if let Some(t) = thumb.or(per_part_thumb.as_ref()) {
             media = media.thumbnail(t.clone());
         }
         medias.push(media);
@@ -136,6 +257,9 @@ pub async fn upload_album(
     client.send_album(peer, medias).await.context("sending album")?;
     Ok(())
 }
+
+#[derive(Clone, Copy)]
+enum AlbumMode { Photos, Videos, Documents }
 
 pub async fn resolve_channel_peer(client: &Client, channel_name: &str) -> anyhow::Result<PeerRef> {
     let mut dialogs = client.iter_dialogs();

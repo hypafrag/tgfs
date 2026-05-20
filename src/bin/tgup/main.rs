@@ -25,12 +25,12 @@ use tgfs::login::connect_and_authorize_with_session;
 
 use args::{default_config_path, default_session_path, parse_args, DirMode};
 use ffmpeg::{
-    build_encode_args, ffmpeg_in_path, run_encoded_video, run_leading_moov_pipeline,
-    thumbnail_args,
+    build_encode_args, ffmpeg_in_path, ffprobe_in_path, run_encoded_video,
+    run_leading_moov_pipeline, thumbnail_args,
 };
 use tgfs::config::Streamification;
-use plan::{collect_path, find_channel, group_into_albums, print_plan, UploadItem};
-use progress::{set_bar_style, set_label, LABEL_WIDTH};
+use plan::{collect_path, find_channel, group_into_albums, plan_has_video, print_plan, UploadItem};
+use progress::{set_bar_style, set_prefix_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
 /// A `Write` adapter that routes log lines through `MultiProgress::println` so
@@ -155,6 +155,21 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         plan = group_into_albums(plan);
     }
 
+    // Warn once before the plan: when the plan contains video files but
+    // ffprobe isn't on PATH, those videos will be uploaded as videos but
+    // without duration / width / height — Telegram clients can't render an
+    // inline preview without those, so they'll appear as generic
+    // attachments. Suppress for the re-encode path: ffmpeg/ffprobe was
+    // already validated up top.
+    if !args.encode_video && plan_has_video(&plan) && !ffprobe_in_path() {
+        eprintln!(
+            "warning: ffprobe not found on PATH — video files will be uploaded \
+             without duration/dimensions, so Telegram clients won't show inline \
+             previews. Install ffmpeg (which ships ffprobe) to enable previews."
+        );
+        eprintln!();
+    }
+
     if args.dry_run {
         print_plan(&plan, &channel_name, args.encode_video);
         return Ok(());
@@ -188,7 +203,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     let upload_pb: Option<ProgressBar> = if pipeline_eligible {
         let pb = mp.add(ProgressBar::new(1));
         set_bar_style(&pb);
-        set_label(&pb, "pending upload");
+        set_prefix_label(&pb, "pending upload");
         Some(pb)
     } else { None };
     let total_pb = mp.add(ProgressBar::new(total_bytes));
@@ -234,7 +249,8 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                     ).await?;
                 }
             }
-            set_label(&file_pb, format!("done: {}", item.display_name()));
+            set_prefix_label(&file_pb, format!("done: {}", item.display_name()));
+            file_pb.set_message(String::new());
             total_pb.set_message(format!("TOTAL {}/{}", i + 1, plan.len()));
         }
     }

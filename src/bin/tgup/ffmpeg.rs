@@ -21,7 +21,7 @@ use tgfs::config::{EncodeArgs, MultipartPolicy, Streamification, Threads};
 
 use super::plan::{UploadItem, PART_MAX};
 use super::progress::{
-    fmt_mib, fmt_speed, set_label, set_prefix_label, set_bar_style, set_bar_with_speed_style,
+    fmt_mib, fmt_speed, set_label, set_prefix_label, set_bar_style, spawn_speed_ticker,
     set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style,
     ScaledProgressReader, SpeedReader,
 };
@@ -122,13 +122,14 @@ pub fn thumbnail_args() -> Vec<String> {
     .collect()
 }
 
-pub fn ffmpeg_in_path() -> bool {
+pub fn ffmpeg_in_path() -> bool { tool_in_path("ffmpeg") }
+pub fn ffprobe_in_path() -> bool { tool_in_path("ffprobe") }
+
+fn tool_in_path(name: &str) -> bool {
     let path = match std::env::var_os("PATH") { Some(v) => v, None => return false };
+    let exe = format!("{name}.exe");
     for p in std::env::split_paths(&path) {
-        for name in ["ffmpeg", "ffmpeg.exe"] {
-            let cand = p.join(name);
-            if cand.is_file() { return true; }
-        }
+        if p.join(name).is_file() || p.join(&exe).is_file() { return true; }
     }
     false
 }
@@ -202,13 +203,47 @@ async fn make_thumbnail_to_buffer(
     run_ffmpeg_to_buffer(input, thumbnail_args, &["-f", "mjpeg"], progress_pb, &label).await
 }
 
+/// Headless thumbnail extraction — same `-f mjpeg pipe:1` invocation as the
+/// re-encode path but without touching any progress bar. Used by the plain
+/// upload path to attach a thumbnail to videos that weren't going through
+/// ffmpeg in the first place. Returns the raw JPEG bytes (suitable for
+/// `upload_thumb`).
+pub async fn make_thumbnail_silent(input: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-nostdin")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(input);
+    for a in thumbnail_args() { cmd.arg(a); }
+    cmd.arg("-f").arg("mjpeg").arg("pipe:1");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn ffmpeg for thumbnail")?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = stdout.read(&mut chunk).await.context("reading ffmpeg thumbnail stdout")?;
+        if n == 0 { break; }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let status = child.wait().await.context("waiting for ffmpeg thumbnail")?;
+    if !status.success() {
+        let mut err = String::new();
+        stderr.read_to_string(&mut err).await.ok();
+        bail!("ffmpeg thumbnail exited with status {}: {}", status, err.trim());
+    }
+    Ok(buf)
+}
+
 /// Run `ffprobe` against a source video file and extract `(duration, width,
 /// height)`. We deliberately probe the source rather than the encoded buffer:
 /// fragmented MP4 over a pipe doesn't carry the total duration (ffprobe only
 /// sees the first fragment), and our encoder preserves duration anyway.
 /// Dimensions are sent purely as a preview hint — Telegram re-derives the
 /// authoritative values from the uploaded bytes server-side.
-async fn probe_video_file(path: &Path) -> Option<VideoInfo> {
+pub async fn probe_video_file(path: &Path) -> Option<VideoInfo> {
     let out = Command::new("ffprobe")
         .args([
             "-v", "error",
@@ -423,7 +458,10 @@ pub async fn run_encoded_video(
 
     // Prepare the file_pb for the encode/upload phase.
     set_bar_style(file_pb);
-    set_label(file_pb, format!("encoding {}", doc_filename));
+    set_prefix_label(file_pb, format!("encoding {}", doc_filename));
+    file_pb.set_message(String::new());
+    file_pb.reset_elapsed();
+    let file_speed_h = spawn_speed_ticker(file_pb.clone());
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(0);
 
@@ -539,6 +577,7 @@ pub async fn run_encoded_video(
     if !status.success() {
         buf_tick_handle.abort();
         let _ = buf_tick_handle.await;
+        file_speed_h.abort();
         encode_pb.finish_and_clear();
         buf_pb.finish_and_clear();
         upload_pb.finish_and_clear();
@@ -555,9 +594,12 @@ pub async fn run_encoded_video(
         let scratch_size = tokio::fs::metadata(path).await
             .with_context(|| format!("stat scratch file {}", path.display()))?
             .len();
-        set_label(file_pb, format!("uploading {}", doc_filename));
+        set_prefix_label(file_pb, format!("uploading {}", doc_filename));
         file_pb.set_length(scratch_size.max(1));
         file_pb.set_position(0);
+        // Restart the speed window so upload throughput doesn't get diluted
+        // by the (much-slower) preceding encode phase.
+        file_pb.reset_elapsed();
         let upload_total_budget = source_size.saturating_sub(total_budget_encode);
         let f = tokio::fs::File::open(path).await
             .with_context(|| format!("opening scratch file {}", path.display()))?;
@@ -591,6 +633,7 @@ pub async fn run_encoded_video(
 
     buf_tick_handle.abort();
     let _ = buf_tick_handle.await;
+    file_speed_h.abort();
 
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(source_size);
@@ -734,7 +777,7 @@ pub async fn encode_to_scratch(
         .filter(|&d| d > 0);
 
     // Pipeline-style bar: {prefix} = label, {msg} = speed (updated by tick).
-    set_bar_with_speed_style(encode_pb);
+    set_bar_style(encode_pb);
     set_prefix_label(encode_pb, format!("encoding {}", doc_filename));
     encode_pb.set_length(source_size.max(1));
     encode_pb.set_position(0);
@@ -810,7 +853,7 @@ pub async fn upload_scratch(
         thumb,
     } = job;
 
-    set_bar_with_speed_style(upload_pb);
+    set_bar_style(upload_pb);
     set_prefix_label(upload_pb, format!("uploading {}", doc_filename));
     upload_pb.set_length(scratch_size.max(1));
     upload_pb.set_position(0);
@@ -925,8 +968,8 @@ pub async fn run_leading_moov_pipeline(
     // the order — we just insert it after upload_pb).
     // Pipeline bars use the with-speed style: speed is rendered inline on the
     // same line as the progress bar (via {msg}), so no separate speed bars.
-    set_bar_with_speed_style(encode_pb);
-    set_bar_with_speed_style(upload_pb);
+    set_bar_style(encode_pb);
+    set_bar_style(upload_pb);
     set_prefix_label(upload_pb, "pending upload");
 
     let buf_pb = mp.insert_after(upload_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));

@@ -19,6 +19,56 @@ pub fn is_video_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Hardcoded extension fallbacks used when `mime_guess` can't classify a
+/// file (obscure containers, sparse system MIME tables). Mirrors what the
+/// uploader uses at send time so the dry-run preview matches reality.
+const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v", "ts", "mpg", "mpeg", "wmv"];
+const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif", "gif", "bmp"];
+
+/// Classify a path as `"image"`, `"video"`, or `None` using MIME first and
+/// extension as fallback. Used by both the dry-run plan printer and the
+/// runtime upload classifier so the displayed label can't drift from the
+/// actual send behavior.
+pub fn media_type_from_path(path: &Path) -> Option<&'static str> {
+    if let Some(m) = mime_guess::from_path(path).first() {
+        match m.type_().as_str() {
+            "image" => return Some("image"),
+            "video" => return Some("video"),
+            _ => {}
+        }
+    }
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    if VIDEO_EXTS.iter().any(|v| *v == ext) { return Some("video"); }
+    if PHOTO_EXTS.iter().any(|p| *p == ext) { return Some("image"); }
+    None
+}
+
+/// One-word upload-kind tag printed in the plan listing.
+fn part_kind_label(part: &UploadPart) -> &'static str {
+    let PartSource::File(p) = &part.src;
+    match media_type_from_path(p) {
+        Some("video") => "video",
+        Some("image") => "photo",
+        _ => "file",
+    }
+}
+
+/// Returns true when any item in `plan` would benefit from ffprobe metadata
+/// (i.e. would be sent as a video). Drives the "ffprobe not on PATH"
+/// warning printed before the plan.
+pub fn plan_has_video(plan: &[UploadItem]) -> bool {
+    plan.iter().any(|item| match item {
+        UploadItem::Single(p) => part_kind_label(p) == "video",
+        UploadItem::FileAlbum { parts } => parts.iter().all(|p| part_kind_label(p) == "video"),
+        UploadItem::EncodedVideo { .. } => true,
+        // Multipart suffix/album splits are never sent as videos — they go
+        // out as documents per chunk.
+        UploadItem::SuffixParts { .. } | UploadItem::AlbumParts { .. } => false,
+    })
+}
+
 pub fn replace_ext(name: &str, new_ext: &str) -> String {
     let stem = match name.rfind('.') {
         Some(i) => &name[..i],
@@ -372,8 +422,8 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
             UploadItem::Single(p) => {
                 let PartSource::File(pb) = &p.src;
                 let from = pb.display().to_string();
-                println!("  [{}] {} — {} bytes (from '{}' offset {})",
-                    i, p.doc_filename, p.size, from, p.offset);
+                println!("  [{}] [{}] {} — {} bytes (from '{}' offset {})",
+                    i, part_kind_label(p), p.doc_filename, p.size, from, p.offset);
                 if !p.caption.is_empty() {
                     for line in p.caption.lines() {
                         println!("        caption: {}", line);
@@ -381,7 +431,7 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                 }
             }
             UploadItem::SuffixParts { display, parts } => {
-                println!("  [{}] {} — suffix multipart, {} parts, {} bytes",
+                println!("  [{}] [file] {} — suffix multipart, {} parts, {} bytes",
                     i, display, parts.len(), parts.iter().map(|p| p.size).sum::<u64>());
                 for (j, p) in parts.iter().enumerate() {
                     println!("        part .{:02}: {} bytes (offset {})", j, p.size, p.offset);
@@ -393,7 +443,7 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                 }
             }
             UploadItem::AlbumParts { display, parts } => {
-                println!("  [{}] {} — album multipart, {} parts, {} bytes",
+                println!("  [{}] [file] {} — album multipart, {} parts, {} bytes",
                     i, display, parts.len(), parts.iter().map(|p| p.size).sum::<u64>());
                 if let Some(c) = parts.first() {
                     for line in c.caption.lines() {
@@ -406,7 +456,13 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
             }
             UploadItem::FileAlbum { parts } => {
                 let total: u64 = parts.iter().map(|p| p.size).sum();
-                println!("  [{}] album of {} files — {} bytes", i, parts.len(), total);
+                // Mirror the runtime album-mode decision so the dry-run shows
+                // photo album vs. video album vs. file album.
+                let kinds: Vec<&'static str> = parts.iter().map(part_kind_label).collect();
+                let album_kind = if kinds.iter().all(|k| *k == "photo") { "photo" }
+                    else if kinds.iter().all(|k| *k == "video") { "video" }
+                    else { "file" };
+                println!("  [{}] [{} album] {} items — {} bytes", i, album_kind, parts.len(), total);
                 if let Some(c) = parts.first() {
                     if !c.caption.is_empty() {
                         for line in c.caption.lines() {
@@ -416,12 +472,12 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                 }
                 for (j, p) in parts.iter().enumerate() {
                     let PartSource::File(pb) = &p.src;
-                    println!("        [{}] {} — {} bytes (from '{}')",
-                        j, p.doc_filename, p.size, pb.display());
+                    println!("        [{}] [{}] {} — {} bytes (from '{}')",
+                        j, part_kind_label(p), p.doc_filename, p.size, pb.display());
                 }
             }
             UploadItem::EncodedVideo { source, doc_filename, virtual_path, rel_dir, source_size, .. } => {
-                println!("  [{}] {} — re-encode from '{}' ({} source bytes); thumbnail generated",
+                println!("  [{}] [video] {} — re-encode from '{}' ({} source bytes); thumbnail generated",
                     i, doc_filename, source.display(), source_size);
                 if !rel_dir.is_empty() {
                     println!("        target virtual path: {}", virtual_path);

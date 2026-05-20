@@ -90,22 +90,12 @@ pub fn set_prefix_label(pb: &ProgressBar, label: impl Into<String>) {
     pb.set_prefix(truncate_middle(&label.into(), LABEL_WIDTH));
 }
 
+/// Unified progress-bar template used by every per-file bar in tgup:
+/// `{prefix}` carries the filename label, `{msg}` carries a free-form speed
+/// readout. Plain uploads, default-pipeline encodes, and LeadingMoov bars
+/// all share this style so layout is identical regardless of the data
+/// source; the speed value is filled by [`spawn_speed_ticker`].
 pub fn set_bar_style(pb: &ProgressBar) {
-    pb.disable_steady_tick();
-    pb.set_style(
-        ProgressStyle::with_template(&format!(
-            "{{msg:<{w}.{w}}} [{{bar:30.cyan/blue}}] {{percent:>3}}% ({{eta}})",
-            w = LABEL_WIDTH,
-        ))
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-}
-
-/// Bar style that reserves `{prefix}` for the filename label and `{msg}` for
-/// a trailing speed string. Used by the LeadingMoov pipeline so encode /
-/// upload rates render on the same line as the progress bar.
-pub fn set_bar_with_speed_style(pb: &ProgressBar) {
     pb.disable_steady_tick();
     pb.set_style(
         ProgressStyle::with_template(&format!(
@@ -115,6 +105,25 @@ pub fn set_bar_with_speed_style(pb: &ProgressBar) {
         .unwrap()
         .progress_chars("=>-"),
     );
+}
+
+/// Background task that periodically derives a smoothed throughput from the
+/// bar's own `position()` / `elapsed()` and writes it to `{msg}`. Works for
+/// any bar whose position increases monotonically — raw bytes (plain upload),
+/// scaled source-bytes proxies (encode), whatever. The task exits when the
+/// bar is finished; the returned handle can also be aborted by the caller.
+pub fn spawn_speed_ticker(pb: ProgressBar) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if pb.is_finished() { break; }
+            let elapsed = pb.elapsed().as_secs_f64();
+            let pos = pb.position();
+            if elapsed > 0.0 && pos > 0 {
+                pb.set_message(fmt_speed(pos as f64 / elapsed));
+            }
+        }
+    })
 }
 
 pub fn set_spinner_style(pb: &ProgressBar) {
