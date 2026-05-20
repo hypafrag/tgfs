@@ -803,6 +803,7 @@ pub async fn assemble_channel_files(
     archive_view: ArchiveView,
     collapse_by_prefix: Option<usize>,
     multipart_policy: MultipartPolicy,
+    tvshow_pattern: Option<&str>,
     zip_cache: &Mutex<ZipCache>,
 ) -> Vec<FileEntry> {
     let mut files: Vec<FileEntry> = raw_entries
@@ -832,6 +833,17 @@ pub async fn assemble_channel_files(
         if removed.contains(&i) { continue; }
         if f.name.trim().is_empty() || f.name == "<unnamed>" { continue; }
         new_files.push(f);
+    }
+
+    if let Some(pattern) = tvshow_pattern {
+        for f in &mut new_files {
+            if let Some((new_name, new_path)) =
+                crate::tvshow::rewrite_name_and_path(pattern, &f.name)
+            {
+                f.name = new_name;
+                f.path = new_path;
+            }
+        }
     }
 
     new_files.sort_by_key(|f| f.name.to_lowercase());
@@ -1062,7 +1074,7 @@ pub async fn build_index(
         info!("Finished indexing messages for '{}', processed {} messages", name, processed_msgs);
         debug!("{} raw entries, {} group captions", raw_entries.len(), group_captions.len());
 
-        let files = assemble_channel_files(&client, &raw_entries, &group_captions, entry.archive_view, entry.collapse_by_prefix, entry.multipart_policy, zip_cache).await;
+        let files = assemble_channel_files(&client, &raw_entries, &group_captions, entry.archive_view, entry.collapse_by_prefix, entry.multipart_policy, entry.tvshow_pattern.as_deref(), zip_cache).await;
         info!("{} files (post-assembly)", files.len());
 
         let tchan = TelegramChannel {
@@ -1070,6 +1082,7 @@ pub async fn build_index(
             skip_deflated_id3v1: entry.skip_deflated_id3v1,
             collapse_by_prefix: entry.collapse_by_prefix,
             multipart_policy: entry.multipart_policy,
+            tvshow_pattern: entry.tvshow_pattern.clone(),
             files: Arc::new(files),
             raw_entries,
             group_captions,
@@ -1362,6 +1375,7 @@ async fn index_saved_messages(
         // this field is unused there because the saved indexer never calls
         // assemble_channel_files.
         multipart_policy: MultipartPolicy::None,
+        tvshow_pattern: None,
         files: Arc::new(new_files),
         raw_entries: HashMap::new(),
         group_captions: HashMap::new(),

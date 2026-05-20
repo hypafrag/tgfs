@@ -413,6 +413,7 @@ fn variant_config(
     channel_name: &str,
     archive_view: ArchiveView,
     multipart_policy: MultipartPolicy,
+    tvshow_pattern: Option<&str>,
 ) -> Config {
     Config {
         api_id: base.api_id,
@@ -434,6 +435,7 @@ fn variant_config(
             skip_deflated_id3v1: false,
             collapse_by_prefix: None,
             multipart_policy,
+            tvshow_pattern: tvshow_pattern.map(|s| s.to_string()),
         }],
     }
 }
@@ -835,7 +837,7 @@ async fn run_mutation_test(
     mut updates_rx: tokio_mpsc::UnboundedReceiver<UpdatesLike>,
 ) -> anyhow::Result<()> {
     // Build a normal `archive_view=file, multipart_policy=none` variant.
-    let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None);
+    let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None, None);
 
     ensure_mount_dir()?;
     let mime_pool = MimePool::new();
@@ -1104,7 +1106,7 @@ async fn main() -> anyhow::Result<()> {
     // ----- Variant A: archive_view = file -----------------------------------
     info!("== variant: archive_view=file, multipart_policy=none ==");
     let expected_files = expected_layout_file_view(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::None);
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None);
     let exp_a = expected_files.clone();
     let client_a = client.clone();
     let zc_a = Arc::clone(&zip_cache);
@@ -1135,7 +1137,7 @@ async fn main() -> anyhow::Result<()> {
     let exp_b_top: HashMap<String, Vec<u8>> = expected_files.iter()
         .filter(|(k, _)| !k.ends_with(".zip"))
         .map(|(k, v)| (k.clone(), v.clone())).collect();
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None);
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None, None);
     let client_b = client.clone();
     let zc_b = Arc::clone(&zip_cache);
     mount_variant(client_b, var_cfg, zc_b, move |root| {
@@ -1150,7 +1152,7 @@ async fn main() -> anyhow::Result<()> {
     for (k, v) in expected_inner.iter() {
         exp_c.insert(format!("{}/{}", spec.name, k), v.clone());
     }
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None);
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None);
     let client_c = client.clone();
     let zc_c = Arc::clone(&zip_cache);
     mount_variant(client_c, var_cfg, zc_c, move |root| {
@@ -1161,7 +1163,7 @@ async fn main() -> anyhow::Result<()> {
     // ----- Variant D: multipart_policy = suffix ---------------------------------
     info!("== variant: archive_view=file, multipart_policy=suffix ==");
     let expected_suffix = expected_layout_suffix_multipart(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix);
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None);
     let exp_d = expected_suffix;
     let client_d = client.clone();
     let zc_d = Arc::clone(&zip_cache);
@@ -1172,7 +1174,7 @@ async fn main() -> anyhow::Result<()> {
     // ----- Variant E: multipart_policy = album ----------------------------------
     info!("== variant: archive_view=file, multipart_policy=album ==");
     let expected_album = expected_layout_album_multipart(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album);
+    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album, None);
     let exp_e = expected_album;
     let client_e = client.clone();
     let zc_e = Arc::clone(&zip_cache);
@@ -1180,7 +1182,67 @@ async fn main() -> anyhow::Result<()> {
         assert_layout_matches(root, &exp_e)
     }).await?;
 
-    // ----- Variant F: realtime mutations + OS-native filesystem watcher ----
+    // ----- Variant F: tvshow_pattern -----------------------------------------
+    // Channel-level template that hunch-decomposable filenames get rerouted
+    // through. Files hunch can't parse (the bulk of the spec — readme.txt,
+    // image.png, suffixed multipart, the album, etc.) must keep their
+    // original locations.
+    info!("== variant: tvshow_pattern ==");
+    let pattern = "{show_title}/Season {season}/Episode {episode}.{ext}";
+    let var_cfg = variant_config(
+        &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, Some(pattern),
+    );
+    // Expected rerouted layout: just the three episodes added to the spec.
+    // We deliberately do NOT include the original-location baseline because
+    // some non-tvshow files share names hunch may interpret loosely; the
+    // per-file presence checks below cover both reroute and pass-through.
+    let channel_dir = spec.name.clone();
+    let expected_tvshow: HashMap<String, Vec<u8>> = [
+        (
+            format!("{}/Breaking Bad/Season 1/Episode 1.mkv", channel_dir),
+            b"S01E01 payload".to_vec(),
+        ),
+        (
+            format!("{}/Breaking Bad/Season 1/Episode 2.mkv", channel_dir),
+            b"S01E02 payload".to_vec(),
+        ),
+        (
+            format!("{}/The Walking Dead/Season 2/Episode 5.mkv", channel_dir),
+            b"TWD payload".to_vec(),
+        ),
+    ].into_iter().collect();
+    let exp_f = expected_tvshow;
+    let channel_dir_f = channel_dir.clone();
+    let client_f = client.clone();
+    let zc_f = Arc::clone(&zip_cache);
+    mount_variant(client_f, var_cfg, zc_f, move |root| {
+        // Rerouted episodes are present at the rendered paths.
+        assert_layout_matches(root, &exp_f)?;
+        // Pass-through: a non-tvshow file from the spec keeps its original
+        // location (the channel root). If `tvshow_pattern` had been applied
+        // indiscriminately this read would fail with ENOENT.
+        let readme = root.join(&channel_dir_f).join("readme.txt");
+        if !readme.exists() {
+            bail!(
+                "non-tvshow file '{}' should still be at the channel root \
+                 — tvshow_pattern leaked into a file hunch could not parse",
+                readme.display()
+            );
+        }
+        // Pass-through: original tvshow-named files must NOT linger at the
+        // channel root, otherwise the rerouted entries would be duplicates.
+        let stray = root.join(&channel_dir_f).join("Breaking.Bad.S01E01.mkv");
+        if stray.exists() {
+            bail!(
+                "tvshow-renamed file '{}' should have been rerouted away from \
+                 the channel root, but it's still there",
+                stray.display()
+            );
+        }
+        Ok(())
+    }).await?;
+
+    // ----- Variant G: realtime mutations + OS-native filesystem watcher ----
     info!("== variant: realtime mutations + native fs watcher ==");
     run_mutation_test(
         client.clone(),

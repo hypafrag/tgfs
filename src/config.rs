@@ -19,6 +19,13 @@ pub struct ChannelEntry {
     /// `none` (no merging). See `MultipartPolicy` for the available strategies.
     #[serde(default)]
     pub multipart_policy: MultipartPolicy,
+    /// Optional virtual-path template applied to every file whose filename
+    /// hunch can decompose into show title + season + episode. Supports the
+    /// placeholders `{show_title}`, `{season}`, `{season:0N}`, `{episode}`,
+    /// `{episode:0N}`, `{year}`, `{year:0N}`, `{ext}`. Files that don't parse
+    /// (movies, generic uploads) are unaffected.
+    #[serde(default)]
+    pub tvshow_pattern: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Default, Debug)]

@@ -122,3 +122,16 @@ channel:
           text: "foo"
         - name: album_part_b.txt
           text: "bar"
+
+    # Files whose names hunch can parse as TV-show episodes. Used by the
+    # `tvshow_pattern` variant to verify that recognized episodes get rerouted
+    # to the rendered virtual path, while non-episode files stay put.
+    - files:
+        - name: Breaking.Bad.S01E01.mkv
+          text: "S01E01 payload"
+    - files:
+        - name: Breaking.Bad.S01E02.mkv
+          text: "S01E02 payload"
+    - files:
+        - name: The.Walking.Dead.S02E05.mkv
+          text: "TWD payload"

@@ -15,4 +15,5 @@ pub mod login;
 pub mod mtproxy;
 pub mod realtime;
 pub mod server;
+pub mod tvshow;
 pub mod zip_cache;

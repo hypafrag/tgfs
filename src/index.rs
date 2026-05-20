@@ -209,6 +209,11 @@ pub struct TelegramChannel {
     pub skip_deflated_id3v1: bool,
     pub collapse_by_prefix: Option<usize>,
     pub multipart_policy: MultipartPolicy,
+    /// Per-channel `tvshow_pattern` (cloned from config). Applied by
+    /// `assemble_channel_files` after multipart fusion: filenames hunch can
+    /// decompose into (show, season, episode) are rerouted to the rendered
+    /// virtual path.
+    pub tvshow_pattern: Option<String>,
     /// Cheap-to-clone snapshot of the assembled file list. Swapped atomically
     /// when raw_entries change; readers clone the Arc and drop the lock.
     pub files: Arc<Vec<FileEntry>>,
