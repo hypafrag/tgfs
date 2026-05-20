@@ -254,6 +254,14 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     let pipeline_eligible = streamification == Streamification::LeadingMoov
         && plan.iter().all(|i| matches!(i, UploadItem::EncodedVideo { .. }));
 
+    // Count individual files for the TOTAL counter: each episode inside an
+    // EncodedAlbum is one "file" from the user's perspective.
+    let total_files: usize = plan.iter().map(|item| match item {
+        UploadItem::EncodedAlbum { parts } => parts.len(),
+        _ => 1,
+    }).sum();
+    let mut completed_files: usize = 0;
+
     // For the LeadingMoov pipeline we want TWO file-level bars (encode +
     // upload). For everything else, one is enough.
     let file_pb = mp.add(ProgressBar::new(0));
@@ -273,7 +281,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         .unwrap()
         .progress_chars("=>-"),
     );
-    total_pb.set_message(format!("TOTAL 0/{}", plan.len()));
+    total_pb.set_message(format!("TOTAL 0/{}", total_files));
 
     if let Some(ref upload_pb) = upload_pb {
         run_leading_moov_pipeline(
@@ -281,21 +289,25 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
             &thumb_args, &plan, &mp, &file_pb, upload_pb, &total_pb,
         ).await?;
     } else {
-        for (i, item) in plan.iter().enumerate() {
+        for item in plan.iter() {
             match item {
                 UploadItem::Single(p) => {
                     upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
+                    completed_files += 1;
                 }
                 UploadItem::SuffixParts { parts, .. } => {
                     for p in parts {
                         upload_part_as_message(&client, peer, p, None, None, &file_pb, &total_pb).await?;
                     }
+                    completed_files += 1;
                 }
                 UploadItem::AlbumParts { parts, .. } => {
                     upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
+                    completed_files += 1;
                 }
                 UploadItem::FileAlbum { parts } => {
                     upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
+                    completed_files += 1;
                 }
                 UploadItem::EncodedAlbum { parts } => {
                     if streamification == Streamification::LeadingMoov {
@@ -306,6 +318,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                             &encode_args, config.ffmpeg.encode_args.video.vres,
                             &thumb_args, &mp, &file_pb, &total_pb,
                         ).await?;
+                        completed_files += parts.len();
                     } else {
                         use grammers_client::media::InputMedia;
                         // Fmp4 / None: stream each part from ffmpeg pipe:1
@@ -315,7 +328,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                         for part in parts {
                             let PartSource::File(src) = &part.src;
                             let (uploaded, video_info, thumb) = encode_and_upload_for_album(
-                                &client, src, &part.doc_filename,
+                                &client, &mp, src, &part.doc_filename,
                                 &encode_args, &thumb_args,
                                 vres, &file_pb, &total_pb, part.size,
                             ).await.with_context(|| format!("encoding '{}'", src.display()))?;
@@ -327,6 +340,8 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                             }
                             media = media.thumbnail(thumb);
                             medias.push(media);
+                            completed_files += 1;
+                            total_pb.set_message(format!("TOTAL {}/{}", completed_files, total_files));
                         }
                         client.send_album(peer, medias).await
                             .context("sending encoded album")?;
@@ -340,11 +355,12 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                         &thumb_args,
                         item, &mp, &file_pb, &total_pb,
                     ).await?;
+                    completed_files += 1;
                 }
             }
             set_prefix_label(&file_pb, format!("done: {}", item.display_name()));
             file_pb.set_message(String::new());
-            total_pb.set_message(format!("TOTAL {}/{}", i + 1, plan.len()));
+            total_pb.set_message(format!("TOTAL {}/{}", completed_files, total_files));
         }
     }
     file_pb.finish_with_message("done");

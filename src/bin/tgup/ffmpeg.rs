@@ -295,6 +295,7 @@ fn scratch_path(name: &str) -> PathBuf {
 /// configures it for "encoding <name>" then updates it as bytes are piped.
 pub async fn encode_and_upload_for_album(
     client: &Client,
+    mp: &MultiProgress,
     src: &Path,
     doc_filename: &str,
     encode_args: &[String],
@@ -329,9 +330,48 @@ pub async fn encode_and_upload_for_album(
 
     set_bar_style(file_pb);
     set_prefix_label(file_pb, format!("encoding {}", doc_filename));
+    file_pb.set_message(String::new());
+    file_pb.reset_elapsed();
+    let file_speed_h = spawn_speed_ticker(file_pb.clone());
     file_pb.set_length(source_size.max(1));
     file_pb.set_position(0);
-    file_pb.reset_elapsed();
+
+    let buf_pb = mp.insert_after(file_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));
+    set_buffer_bar_style(&buf_pb);
+    let encode_pb = mp.insert_after(&buf_pb, ProgressBar::new(0));
+    set_throughput_style(&encode_pb, "encode speed");
+    let upload_pb = mp.insert_after(&encode_pb, ProgressBar::new(0));
+    set_manual_speed_style(&upload_pb, "upload speed");
+
+    let video_bars = VideoUploadBars {
+        buf_pb: buf_pb.clone(),
+        upload_pb: upload_pb.clone(),
+        buf_fill: Arc::new(AtomicU64::new(0)),
+        partial_fill: Arc::new(AtomicU64::new(0)),
+        total_uploaded: Arc::new(AtomicU64::new(0)),
+    };
+    let buf_tick_fill    = video_bars.buf_fill.clone();
+    let buf_tick_partial = video_bars.partial_fill.clone();
+    let buf_tick_uploaded = video_bars.total_uploaded.clone();
+    let buf_tick_pb      = buf_pb.clone();
+    let buf_max = (TG_CHUNK * UPLOAD_CONCURRENCY) as u64;
+    let buf_tick_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let fill = buf_tick_fill.load(std::sync::atomic::Ordering::Relaxed)
+                + buf_tick_partial.load(std::sync::atomic::Ordering::Relaxed);
+            let processed = buf_tick_uploaded.load(std::sync::atomic::Ordering::Relaxed);
+            buf_tick_pb.set_position(fill);
+            buf_tick_pb.set_message(format!(
+                "{} / {}  (Σ {})",
+                fmt_mib(fill),
+                fmt_mib(buf_max),
+                fmt_mib(processed),
+            ));
+        }
+    });
 
     let mut run = spawn_ffmpeg(
         src, encode_args, &scale_args, "pipe:1", true,
@@ -341,21 +381,34 @@ pub async fn encode_and_upload_for_album(
     )?;
 
     let stdout = run.stdout.take().expect("pipe:1 stdout");
-    let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
+    let mut tracked = SpeedReader { inner: stdout, pb: encode_pb.clone() };
     let uploader_drives = run.progress.is_none();
     let mut peek: Option<u8> = None;
     let mut files: Vec<RawBigFile> = Vec::new();
     loop {
         let (raw, eof) = upload_one_big_file(
-            client, &mut reader, &mut peek, PART_MAX,
-            file_pb, total_pb, uploader_drives, None,
+            client, &mut tracked, &mut peek, PART_MAX,
+            file_pb, total_pb, uploader_drives, Some(&video_bars),
         ).await?;
         if let Some(r) = raw { files.push(r); }
         if eof { break; }
     }
 
     let status = run.child.wait().await.context("waiting for ffmpeg")?;
-    if let Some(h) = run.progress { let _ = h.await; }
+    if let Some(h) = run.progress {
+        let _ = h.await;
+        let advanced = run.total_advanced.load(std::sync::atomic::Ordering::Relaxed);
+        total_pb.inc(source_size.saturating_sub(advanced));
+        file_pb.set_position(source_size);
+    }
+
+    buf_tick_handle.abort();
+    let _ = buf_tick_handle.await;
+    file_speed_h.abort();
+    encode_pb.finish_and_clear();
+    buf_pb.finish_and_clear();
+    upload_pb.finish_and_clear();
+
     if !status.success() {
         let err = run.stderr_buf.lock().await.clone();
         bail!("ffmpeg failed encoding '{}': {}", src.display(), err.trim());
