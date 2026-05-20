@@ -7,6 +7,7 @@
 
 mod args;
 mod ffmpeg;
+mod picker;
 mod plan;
 mod progress;
 mod tvshow;
@@ -89,10 +90,6 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         None => default_config_path(),
     };
     let config: Config = config::load_config(&config_path.to_string_lossy())?;
-    let channel_entry = find_channel(&config, &args.channel).ok_or_else(|| {
-        anyhow!("channel '{}' is not defined in {}", args.channel, config_path.display())
-    })?;
-    let policy = channel_entry.multipart_policy;
 
     // Session lives next to the default config. An explicit --config still
     // points at ~/.config/tgfs/session.sqlite3 — keep one session per host.
@@ -101,6 +98,40 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating '{}'", parent.display()))?;
     }
+
+    // Resolve the destination. When `-c/--channel` was given, look up the
+    // matching ChannelEntry in the config for its multipart_policy; we still
+    // connect lazily (after planning) so a dry-run never touches the network.
+    // When omitted, connect now and show the interactive picker — its return
+    // value gives us both the display name and the resolved PeerRef, so we
+    // skip the redundant title-walk in resolve_channel_peer afterwards.
+    let (channel_name, channel_entry, picked_peer, picked_client): (
+        String,
+        Option<&tgfs::config::ChannelEntry>,
+        Option<_>,
+        Option<_>,
+    ) = match &args.channel {
+        Some(name) => {
+            let entry = find_channel(&config, name).ok_or_else(|| {
+                anyhow!("channel '{}' is not defined in {}", name, config_path.display())
+            })?;
+            (name.clone(), Some(entry), None, None)
+        }
+        None => {
+            if args.dry_run {
+                bail!("--dry-run requires -c/--channel; the interactive picker needs a live Telegram connection");
+            }
+            println!("Connecting to Telegram to populate destination picker...");
+            let (client, _rx) =
+                connect_and_authorize_with_session(&config, &session_path.to_string_lossy()).await?;
+            let (name, peer) = picker::pick_destination(&client, &config).await?;
+            let entry = find_channel(&config, &name);
+            (name, entry, Some(peer), Some(client))
+        }
+    };
+    let policy = channel_entry
+        .map(|e| e.multipart_policy)
+        .unwrap_or_default();
 
     let encode_args = build_encode_args(&config.ffmpeg.encode_args);
     let thumb_args = thumbnail_args();
@@ -125,17 +156,25 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     }
 
     if args.dry_run {
-        print_plan(&plan, &args.channel, args.encode_video);
+        print_plan(&plan, &channel_name, args.encode_video);
         return Ok(());
     }
 
-    print_plan(&plan, &args.channel, args.encode_video);
+    print_plan(&plan, &channel_name, args.encode_video);
     println!();
-    println!("Connecting to Telegram...");
 
-    let (client, _updates_rx) =
-        connect_and_authorize_with_session(&config, &session_path.to_string_lossy()).await?;
-    let peer = resolve_channel_peer(&client, &args.channel).await?;
+    // Reuse the picker's already-authenticated client when available; only
+    // connect now if the user passed an explicit -c (skipped the picker).
+    let (client, peer) = match (picked_client, picked_peer) {
+        (Some(c), Some(p)) => (c, p),
+        _ => {
+            println!("Connecting to Telegram...");
+            let (client, _updates_rx) =
+                connect_and_authorize_with_session(&config, &session_path.to_string_lossy()).await?;
+            let peer = resolve_channel_peer(&client, &channel_name).await?;
+            (client, peer)
+        }
+    };
 
     let total_bytes: u64 = plan.iter().map(|i| i.planned_bytes()).sum();
     let streamification = config.ffmpeg.encode_args.video.streamification;

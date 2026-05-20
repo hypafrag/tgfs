@@ -2376,6 +2376,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "console",
  "crc32fast",
  "ctr",
  "env_logger",

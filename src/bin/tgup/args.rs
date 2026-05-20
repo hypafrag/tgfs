@@ -16,7 +16,9 @@ pub struct Args {
     /// Explicit `--config <path>`. When `None` we fall back to
     /// `~/.config/tgfs/tgfs.yml`.
     pub config_path: Option<String>,
-    pub channel: String,
+    /// `None` when the user omitted `-c/--channel`; in that case `tgup`
+    /// connects to Telegram and shows an interactive picker.
+    pub channel: Option<String>,
     pub dir_mode: DirMode,
     pub dry_run: bool,
     pub encode_video: bool,
@@ -59,9 +61,13 @@ fn print_usage() {
     eprintln!(
         "tgup — upload files to a tgfs-indexed Telegram channel\n\n\
          Usage:\n  \
-           tgup [--config <path>] -c <channel> [-d <mode>] [-a] [--encode-video] [--dry-run] <path>...\n\n\
+           tgup [--config <path>] [-c <channel>] [-d <mode>] [-a] [--encode-video] [--dry-run] <path>...\n\n\
          Options:\n  \
-           -c, --channel <name>   Target channel name (must exist in config).\n  \
+           -c, --channel <name>   Target channel/group/chat name. When omitted,\n                          \
+             tgup connects to Telegram and shows an interactive\n                          \
+             picker; channels declared in the config file are\n                          \
+             listed at the top, followed by every other dialog\n                          \
+             this account can send to.\n  \
            -d, --dir <mode>       How to handle directory arguments:\n                            \
              skip       — error on directories (default)\n                            \
              recursive  — upload contained files as a flat list\n                            \
@@ -133,7 +139,6 @@ pub fn parse_args() -> anyhow::Result<Args> {
             _ => paths.push(PathBuf::from(a)),
         }
     }
-    let channel = channel.ok_or_else(|| anyhow!("-c/--channel is required"))?;
     if paths.is_empty() { bail!("at least one file or directory path is required"); }
     if tvshow {
         if album { bail!("--tvshow is incompatible with --album"); }
