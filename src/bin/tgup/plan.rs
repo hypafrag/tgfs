@@ -62,7 +62,7 @@ pub fn plan_has_video(plan: &[UploadItem]) -> bool {
     plan.iter().any(|item| match item {
         UploadItem::Single(p) => part_kind_label(p) == "video",
         UploadItem::FileAlbum { parts } => parts.iter().all(|p| part_kind_label(p) == "video"),
-        UploadItem::EncodedVideo { .. } => true,
+        UploadItem::EncodedVideo { .. } | UploadItem::EncodedAlbum { .. } => true,
         // Multipart suffix/album splits are never sent as videos — they go
         // out as documents per chunk.
         UploadItem::SuffixParts { .. } | UploadItem::AlbumParts { .. } => false,
@@ -111,6 +111,11 @@ pub enum UploadItem {
     /// the same caption so the indexer's `extract_group_caption` applies one
     /// `path:` directive uniformly to every part.
     FileAlbum { parts: Vec<UploadPart> },
+    /// Multiple videos produced by `--tvshow --encode-video` that must each
+    /// be re-encoded before being grouped into a single Telegram album.
+    /// Parts hold the original source paths; `doc_filename` already has the
+    /// `.mp4` extension (renamed from the tvshow plan).
+    EncodedAlbum { parts: Vec<UploadPart> },
     /// Video that must be re-encoded by ffmpeg before upload. The encoded
     /// stream's size is unknown at plan time — multipart-splitting is deferred
     /// until the encode finishes at upload time.
@@ -139,7 +144,8 @@ impl UploadItem {
             UploadItem::Single(p) => &p.doc_filename,
             UploadItem::SuffixParts { display, .. }
             | UploadItem::AlbumParts { display, .. } => display.as_str(),
-            UploadItem::FileAlbum { parts } => parts.first().map(|p| p.doc_filename.as_str()).unwrap_or("album"),
+            UploadItem::FileAlbum { parts }
+            | UploadItem::EncodedAlbum { parts } => parts.first().map(|p| p.doc_filename.as_str()).unwrap_or("album"),
             UploadItem::EncodedVideo { doc_filename, .. } => doc_filename.as_str(),
         }
     }
@@ -151,7 +157,8 @@ impl UploadItem {
             UploadItem::Single(p) => p.size,
             UploadItem::SuffixParts { parts, .. }
             | UploadItem::AlbumParts { parts, .. }
-            | UploadItem::FileAlbum { parts } => parts.iter().map(|p| p.size).sum(),
+            | UploadItem::FileAlbum { parts }
+            | UploadItem::EncodedAlbum { parts } => parts.iter().map(|p| p.size).sum(),
             UploadItem::EncodedVideo { source_size, .. } => *source_size,
         }
     }
@@ -474,6 +481,23 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                     let PartSource::File(pb) = &p.src;
                     println!("        [{}] [{}] {} — {} bytes (from '{}')",
                         j, part_kind_label(p), p.doc_filename, p.size, pb.display());
+                }
+            }
+            UploadItem::EncodedAlbum { parts } => {
+                let total: u64 = parts.iter().map(|p| p.size).sum();
+                println!("  [{}] [video album] {} items — {} source bytes; each will be re-encoded",
+                    i, parts.len(), total);
+                if let Some(c) = parts.first() {
+                    if !c.caption.is_empty() {
+                        for line in c.caption.lines() {
+                            println!("        album caption: {}", line);
+                        }
+                    }
+                }
+                for (j, p) in parts.iter().enumerate() {
+                    let PartSource::File(pb) = &p.src;
+                    println!("        [{}] {} — {} bytes (from '{}')",
+                        j, p.doc_filename, p.size, pb.display());
                 }
             }
             UploadItem::EncodedVideo { source, doc_filename, virtual_path, rel_dir, source_size, .. } => {

@@ -84,7 +84,9 @@ fn print_usage() {
              `<title> S##E##.<ext>` and grouped per-season into\n                          \
              Telegram albums (≤10 per album, split as evenly as\n                          \
              possible). Mutually exclusive with --album,\n                          \
-             --encode-video, -d caption, and -d zip.\n  \
+             -d caption, and -d zip. Compatible with\n                          \
+             --encode-video; season albums are preserved and\n                          \
+             each episode is re-encoded before upload.\n  \
            --encode-video         Re-encode video files with ffmpeg (using\n                          \
              ffmpeg.encode_args from the config) and attach\n                          \
              an ffmpeg-generated thumbnail to each uploaded\n                          \
@@ -142,7 +144,6 @@ pub fn parse_args() -> anyhow::Result<Args> {
     if paths.is_empty() { bail!("at least one file or directory path is required"); }
     if tvshow {
         if album { bail!("--tvshow is incompatible with --album"); }
-        if encode_video { bail!("--tvshow is incompatible with --encode-video"); }
         if matches!(dir_mode, DirMode::Caption | DirMode::Zip) {
             bail!("--tvshow is incompatible with -d caption|zip");
         }

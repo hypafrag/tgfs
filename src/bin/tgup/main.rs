@@ -26,13 +26,67 @@ use tgfs::login::connect_and_authorize_with_session;
 
 use args::{default_config_path, default_session_path, parse_args, DirMode};
 use ffmpeg::{
-    build_encode_args, ffmpeg_in_path, ffprobe_in_path, run_encoded_video,
-    run_leading_moov_pipeline, thumbnail_args,
+    build_encode_args, encode_and_upload_for_album, ffmpeg_in_path, ffprobe_in_path,
+    run_encoded_video, run_leading_moov_pipeline, run_leading_moov_album_pipeline,
+    thumbnail_args,
 };
 use tgfs::config::Streamification;
-use plan::{collect_path, find_channel, group_into_albums, plan_has_video, print_plan, UploadItem};
+use plan::{collect_path, find_channel, group_into_albums, plan_has_video, print_plan, PartSource, UploadItem};
+use plan::replace_ext;
 use progress::{set_bar_style, set_prefix_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
+
+/// When `--tvshow` and `--encode-video` are combined, convert every video
+/// `Single` or `FileAlbum` part into an encoded upload:
+///   - `Single` (video)    → `EncodedVideo`  (individual encoded message)
+///   - `FileAlbum` (video) → `EncodedAlbum`  (encode-then-album, grouping preserved)
+/// Non-video parts are left unchanged.
+fn apply_encode_video_to_tvshow_plan(
+    plan: Vec<UploadItem>,
+    policy: tgfs::config::MultipartPolicy,
+) -> Vec<UploadItem> {
+    let mut out: Vec<UploadItem> = Vec::with_capacity(plan.len());
+    for item in plan {
+        match item {
+            UploadItem::Single(part) => {
+                let PartSource::File(ref src) = part.src;
+                if plan::is_video_path(src) {
+                    let doc_filename = replace_ext(&part.doc_filename, "mp4");
+                    out.push(UploadItem::EncodedVideo {
+                        source: src.clone(),
+                        doc_filename: doc_filename.clone(),
+                        virtual_path: doc_filename,
+                        rel_dir: String::new(),
+                        policy,
+                        source_size: part.size,
+                    });
+                } else {
+                    out.push(UploadItem::Single(part));
+                }
+            }
+            UploadItem::FileAlbum { parts } => {
+                // Keep the album grouping; rename video doc_filenames to .mp4.
+                let renamed: Vec<plan::UploadPart> = parts
+                    .into_iter()
+                    .map(|p| {
+                        let PartSource::File(ref src) = p.src;
+                        if plan::is_video_path(src) {
+                            plan::UploadPart {
+                                doc_filename: replace_ext(&p.doc_filename, "mp4"),
+                                ..p
+                            }
+                        } else {
+                            p
+                        }
+                    })
+                    .collect();
+                out.push(UploadItem::EncodedAlbum { parts: renamed });
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 /// A `Write` adapter that routes log lines through `MultiProgress::println` so
 /// they appear above the progress bars without corrupting the cursor-up redraw
@@ -145,6 +199,9 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     let mut plan: Vec<UploadItem> = Vec::new();
     if args.tvshow {
         plan = tvshow::build_tvshow_plan(&args.paths, args.dir_mode).await?;
+        if args.encode_video {
+            plan = apply_encode_video_to_tvshow_plan(plan, policy);
+        }
     } else {
         for p in &args.paths {
             collect_path(p, &cwd, policy, args.dir_mode, args.encode_video, &mut plan)?;
@@ -239,6 +296,41 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                 }
                 UploadItem::FileAlbum { parts } => {
                     upload_album(&client, peer, parts, None, None, &file_pb, &total_pb).await?;
+                }
+                UploadItem::EncodedAlbum { parts } => {
+                    if streamification == Streamification::LeadingMoov {
+                        // Pipeline: encode queue → upload queue, ≤2 scratch
+                        // files on disk. Collects InputMedia, then send_album.
+                        run_leading_moov_album_pipeline(
+                            &client, peer, parts,
+                            &encode_args, config.ffmpeg.encode_args.video.vres,
+                            &thumb_args, &mp, &file_pb, &total_pb,
+                        ).await?;
+                    } else {
+                        use grammers_client::media::InputMedia;
+                        // Fmp4 / None: stream each part from ffmpeg pipe:1
+                        // directly to Telegram upload — no scratch files.
+                        let vres = config.ffmpeg.encode_args.video.vres;
+                        let mut medias: Vec<InputMedia> = Vec::with_capacity(parts.len());
+                        for part in parts {
+                            let PartSource::File(src) = &part.src;
+                            let (uploaded, video_info, thumb) = encode_and_upload_for_album(
+                                &client, src, &part.doc_filename,
+                                &encode_args, &thumb_args,
+                                vres, &file_pb, &total_pb, part.size,
+                            ).await.with_context(|| format!("encoding '{}'", src.display()))?;
+                            let mut media = InputMedia::new()
+                                .caption(part.caption.clone())
+                                .document(uploaded);
+                            if let Some(ref info) = video_info {
+                                media = media.attribute(upload::video_attribute(info));
+                            }
+                            media = media.thumbnail(thumb);
+                            medias.push(media);
+                        }
+                        client.send_album(peer, medias).await
+                            .context("sending encoded album")?;
+                    }
                 }
                 UploadItem::EncodedVideo { .. } => {
                     run_encoded_video(

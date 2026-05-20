@@ -233,6 +233,32 @@ async fn find_channel(client: &Client, name: &str) -> anyhow::Result<PeerRef> {
     ))
 }
 
+/// Render a 5-second test-pattern AVI with the xvid codec (libxvid + mp3
+/// audio). Named after a TV-show episode so hunch can parse it locally.
+fn generate_avi_xvid(path: &Path, label: &str) -> anyhow::Result<()> {
+    let drawtext = format!(
+        "drawtext=text='{}':fontsize=24:fontcolor=white:x=10:y=10",
+        label.replace('\'', "")
+    );
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=duration=5:size=320x240:rate=30"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=5"])
+        .args(["-vf", &drawtext])
+        .args(["-c:v", "libxvid", "-q:v", "10"])
+        .args(["-c:a", "libmp3lame", "-b:a", "96k"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running ffmpeg for xvid")?;
+    if !status.success() {
+        bail!("ffmpeg (libxvid) failed for {} — ensure ffmpeg is built with --enable-libxvid", path.display());
+    }
+    Ok(())
+}
+
 async fn clear_about(client: &Client, peer: PeerRef) -> anyhow::Result<()> {
     // Wipe whatever `integration_test` (or a previous run) wrote to the
     // channel description — otherwise the tgfs runner will see its sentinel
@@ -391,15 +417,38 @@ async fn main() -> anyhow::Result<()> {
 
     let tvshow_dir = scratch.join("tvshow");
     fs::create_dir_all(&tvshow_dir)?;
+    // Episode titles are embedded in the filenames so hunch can extract them
+    // locally without a TVmaze network call.
+    let tv_episode_titles = ["One", "Two", "Three", "Four", "Five"];
     let mut tv_files: Vec<PathBuf> = Vec::new();
-    for ep in 1..=5 {
-        let p = tvshow_dir.join(format!("Some.Show.S01E{:02}.mp4", ep));
+    for (ep, title) in (1..=5u32).zip(tv_episode_titles.iter()) {
+        let p = tvshow_dir.join(format!("Some.Show.S01E{:02}.{}.mp4", ep, title));
         generate_video(&p, &format!("S01E{:02}", ep))?;
         tv_files.push(p);
     }
 
     let encode_source = scratch.join("encodeme.mov");
     generate_video(&encode_source, "ENCODE")?;
+
+    // Six AVI files (xvid) across two seasons, each with an embedded episode
+    // title so hunch can parse the full name locally without hitting TVmaze.
+    let tvshow_encode_dir = scratch.join("tvshow_encode");
+    fs::create_dir_all(&tvshow_encode_dir)?;
+    let tvshow_encode_files: Vec<PathBuf> = [
+        ("Some.Show.S01E01.Pilot.avi",   "S01E01"),
+        ("Some.Show.S01E02.Orbit.avi",   "S01E02"),
+        ("Some.Show.S01E03.Crater.avi",  "S01E03"),
+        ("Some.Show.S02E01.Surge.avi",   "S02E01"),
+        ("Some.Show.S02E02.Blaze.avi",   "S02E02"),
+        ("Some.Show.S02E03.Finale.avi",  "S02E03"),
+    ]
+    .iter()
+    .map(|(name, label)| {
+        let p = tvshow_encode_dir.join(name);
+        generate_avi_xvid(&p, label)?;
+        Ok::<_, anyhow::Error>(p)
+    })
+    .collect::<anyhow::Result<Vec<_>>>()?;
 
     let tgup_bin = locate_tgup_bin(args.tgup.as_deref())?;
     let tgup_config = write_tgup_config(&cfg, &channel_name)?;
@@ -480,7 +529,11 @@ async fn main() -> anyhow::Result<()> {
         }
         let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
         names.sort();
-        let expected: Vec<String> = (1..=5).map(|n| format!("Some Show S01E{:02}.mp4", n)).collect();
+        // Episode titles are in filenames so hunch fills them without a TVmaze call.
+        let mut expected: Vec<String> = [
+            ("01","One"), ("02","Two"), ("03","Three"), ("04","Four"), ("05","Five"),
+        ].iter().map(|(n, t)| format!("Some Show S01E{} - {}.mp4", n, t)).collect();
+        expected.sort();
         if names != expected { bail!("filenames not renamed as expected: {names:?}"); }
         let captions: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
         if !captions.iter().any(|t| t.contains("Some Show S01 E01-E05")) {
@@ -499,6 +552,87 @@ async fn main() -> anyhow::Result<()> {
         if msgs.len() != 1 { bail!("expected 1 message, got {}", msgs.len()); }
         if msgs[0].doc_name.as_deref() != Some("encodeme.mp4") {
             bail!("filename should be re-extensioned to .mp4, got {:?}", msgs[0].doc_name);
+        }
+        Ok(())
+    }).await;
+
+    // --tvshow + --encode-video: 3 S01 + 3 S02 AVI files → 2 albums of 3 mp4s.
+    runner.run("tgup::tvshow_encode_video", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        let mut argv: Vec<&str> = vec!["--tvshow", "--encode-video"];
+        let strs: Vec<String> = tvshow_encode_files.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        for s in &strs { argv.push(s.as_str()); }
+        run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
+        settle().await;
+
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 6 { bail!("expected 6 messages, got {}: {msgs:#?}", msgs.len()); }
+
+        // All messages must have a grouped_id (all are in albums).
+        if msgs.iter().any(|m| m.grouped_id.is_none()) {
+            bail!("every message should be in a Telegram album: {msgs:#?}");
+        }
+
+        // Exactly 2 distinct grouped_ids — one per season.
+        let mut gids: Vec<i64> = msgs.iter().filter_map(|m| m.grouped_id).collect();
+        gids.sort();
+        gids.dedup();
+        if gids.len() != 2 {
+            bail!("expected 2 distinct album grouped_ids (one per season), got {}: {msgs:#?}", gids.len());
+        }
+
+        // Filenames: extension changed to .mp4, tvshow naming with episode title.
+        let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
+        names.sort();
+        let mut expected: Vec<String> = vec![
+            "Some Show S01E01 - Pilot.mp4".to_string(),
+            "Some Show S01E02 - Orbit.mp4".to_string(),
+            "Some Show S01E03 - Crater.mp4".to_string(),
+            "Some Show S02E01 - Surge.mp4".to_string(),
+            "Some Show S02E02 - Blaze.mp4".to_string(),
+            "Some Show S02E03 - Finale.mp4".to_string(),
+        ];
+        expected.sort();
+        if names != expected {
+            bail!("unexpected filenames.\n  got:      {names:?}\n  expected: {expected:?}");
+        }
+
+        // Each season forms exactly one album: the 3 S01 messages share one
+        // grouped_id, and the 3 S02 messages share the other.
+        let s1_gid = {
+            let m = msgs.iter().find(|m| {
+                m.doc_name.as_deref().map_or(false, |n| n.starts_with("Some Show S01"))
+            }).unwrap();
+            m.grouped_id.unwrap()
+        };
+        let s2_gid = {
+            let m = msgs.iter().find(|m| {
+                m.doc_name.as_deref().map_or(false, |n| n.starts_with("Some Show S02"))
+            }).unwrap();
+            m.grouped_id.unwrap()
+        };
+        if s1_gid == s2_gid {
+            bail!("S01 and S02 should be in different albums but share grouped_id {s1_gid}");
+        }
+        let s1_count = msgs.iter().filter(|m| m.grouped_id == Some(s1_gid)).count();
+        let s2_count = msgs.iter().filter(|m| m.grouped_id == Some(s2_gid)).count();
+        if s1_count != 3 {
+            bail!("expected 3 messages in the S01 album, got {s1_count}");
+        }
+        if s2_count != 3 {
+            bail!("expected 3 messages in the S02 album, got {s2_count}");
+        }
+
+        // Album captions: first message of each album carries the season caption.
+        let captions: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+        if !captions.iter().any(|t| t.contains("Some Show S01 E01-E03")) {
+            bail!("missing S01 album caption; captions were {captions:?}");
+        }
+        if !captions.iter().any(|t| t.contains("Some Show S02 E01-E03")) {
+            bail!("missing S02 album caption; captions were {captions:?}");
         }
         Ok(())
     }).await;

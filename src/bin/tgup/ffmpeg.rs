@@ -19,7 +19,7 @@ use tokio::process::Command;
 
 use tgfs::config::{EncodeArgs, MultipartPolicy, Streamification, Threads};
 
-use super::plan::{UploadItem, PART_MAX};
+use super::plan::{PartSource, UploadItem, UploadPart, PART_MAX};
 use super::progress::{
     fmt_mib, fmt_speed, set_label, set_prefix_label, set_bar_style, spawn_speed_ticker,
     set_buffer_bar_style, set_spinner_style, set_throughput_style, set_manual_speed_style,
@@ -285,11 +285,94 @@ fn scratch_path(name: &str) -> PathBuf {
     PathBuf::from(SCRATCH_DIR).join(name)
 }
 
-/// Spawn `ffmpeg` to encode `source` into the given output (file path or
-/// `pipe:1`), parsing `-progress pipe:2` lines on stderr to drive `file_pb`
-/// and `total_pb`. Returns the spawned child (with `stdout` already taken if
-/// piped) plus a handle to the progress-task and shared stderr buffer for
-/// error reporting after `child.wait()`.
+/// Encode one source video via `pipe:1` (Fmp4 fragmented MP4, no scratch
+/// file), stream it directly to Telegram via `upload.saveBigFilePart`, and
+/// return the resulting `Uploaded` handle, probed `VideoInfo`, and a
+/// pre-uploaded thumbnail. Used by `EncodedAlbum` so all encoded files can
+/// be gathered before the single `sendMultiMedia` call.
+///
+/// The `file_pb` is reused across calls by the caller; this function
+/// configures it for "encoding <name>" then updates it as bytes are piped.
+pub async fn encode_and_upload_for_album(
+    client: &Client,
+    src: &Path,
+    doc_filename: &str,
+    encode_args: &[String],
+    thumbnail_args: &[String],
+    vres: u32,
+    file_pb: &ProgressBar,
+    total_pb: &ProgressBar,
+    source_size: u64,
+) -> anyhow::Result<(grammers_client::media::Uploaded, Option<VideoInfo>, grammers_client::media::Uploaded)> {
+    let video_info = probe_video_file(src).await.map(|mut v| {
+        v.streamable = true;
+        v
+    });
+
+    let scale_args: Vec<String> = match &video_info {
+        Some(vi) if vi.height > vres as i32 => {
+            let new_h = (vres / 2) * 2;
+            let new_w = (vi.width as u64 * vres as u64 / vi.height as u64) as u32;
+            let new_w = (new_w / 2) * 2;
+            vec!["-vf".into(), format!("scale={new_w}:{new_h}")]
+        }
+        _ => vec![],
+    };
+
+    // Thumbnail first — small, cheap, and we want it before the encode bar.
+    let thumb_bytes = make_thumbnail_to_buffer(src, thumbnail_args, file_pb).await?;
+    let thumb = upload_thumb(client, thumb_bytes, doc_filename).await?;
+
+    let duration_us: Option<u64> = video_info.as_ref()
+        .map(|v| v.duration.as_micros() as u64)
+        .filter(|&d| d > 0);
+
+    set_bar_style(file_pb);
+    set_prefix_label(file_pb, format!("encoding {}", doc_filename));
+    file_pb.set_length(source_size.max(1));
+    file_pb.set_position(0);
+    file_pb.reset_elapsed();
+
+    let mut run = spawn_ffmpeg(
+        src, encode_args, &scale_args, "pipe:1", true,
+        file_pb, total_pb,
+        source_size, source_size, duration_us,
+        None,
+    )?;
+
+    let stdout = run.stdout.take().expect("pipe:1 stdout");
+    let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
+    let uploader_drives = run.progress.is_none();
+    let mut peek: Option<u8> = None;
+    let mut files: Vec<RawBigFile> = Vec::new();
+    loop {
+        let (raw, eof) = upload_one_big_file(
+            client, &mut reader, &mut peek, PART_MAX,
+            file_pb, total_pb, uploader_drives, None,
+        ).await?;
+        if let Some(r) = raw { files.push(r); }
+        if eof { break; }
+    }
+
+    let status = run.child.wait().await.context("waiting for ffmpeg")?;
+    if let Some(h) = run.progress { let _ = h.await; }
+    if !status.success() {
+        let err = run.stderr_buf.lock().await.clone();
+        bail!("ffmpeg failed encoding '{}': {}", src.display(), err.trim());
+    }
+    if files.len() != 1 {
+        bail!(
+            "encoded '{}' produced {} parts (>4 GiB); multipart not supported in EncodedAlbum",
+            src.display(), files.len()
+        );
+    }
+    let raw = files.into_iter().next().unwrap();
+    let uploaded = finalize_big_file(&raw, doc_filename.to_string());
+    file_pb.set_position(source_size);
+    Ok((uploaded, video_info, thumb))
+}
+
+
 struct FfmpegRun {
     child: tokio::process::Child,
     stdout: Option<tokio::process::ChildStdout>,
@@ -1098,5 +1181,322 @@ pub async fn run_leading_moov_pipeline(
 
     if let Some(e) = encoder_err { return Err(e); }
     uploader_res.context("uploader join")??;
+    Ok(())
+}
+
+// ─── LeadingMoov album pipeline ─────────────────────────────────────────────
+//
+// Same encode/upload two-queue design as above, but for `EncodedAlbum` items
+// (tvshow + encode-video). The uploader doesn't send messages as it goes —
+// it collects `InputMedia` handles instead, then fires a single
+// `sendMultiMedia` call once all parts are uploaded. The channel(1) cap still
+// guarantees ≤2 scratch files on disk at once.
+
+/// An encoded album part waiting to be uploaded.
+struct EncodedAlbumPart {
+    scratch_path: PathBuf,
+    scratch_size: u64,
+    doc_filename: String,
+    caption: String,
+    source_size: u64,
+    video_info: Option<VideoInfo>,
+    thumb: grammers_client::media::Uploaded,
+}
+
+/// Encode one `UploadPart` to a scratch file for the album pipeline.
+async fn encode_album_part_to_scratch(
+    client: &Client,
+    part: &UploadPart,
+    encode_args: &[String],
+    vres: u32,
+    thumbnail_args: &[String],
+    encode_pb: &ProgressBar,
+    total_pb: &ProgressBar,
+    encoded_bytes: Arc<AtomicU64>,
+) -> anyhow::Result<EncodedAlbumPart> {
+    let PartSource::File(src) = &part.src;
+    let source_size = part.size;
+    let doc_filename = part.doc_filename.clone();
+
+    let video_info = probe_video_file(src).await.map(|mut v| {
+        v.streamable = true;
+        v
+    });
+
+    let scale_args: Vec<String> = match &video_info {
+        Some(vi) if vi.height > vres as i32 => {
+            let new_h = (vres / 2) * 2;
+            let new_w = (vi.width as u64 * vres as u64 / vi.height as u64) as u32;
+            let new_w = (new_w / 2) * 2;
+            vec!["-vf".into(), format!("scale={new_w}:{new_h}")]
+        }
+        _ => vec![],
+    };
+
+    let thumb_bytes = make_thumbnail_to_buffer(src, thumbnail_args, encode_pb).await?;
+    let thumb = upload_thumb(client, thumb_bytes, &doc_filename).await?;
+
+    let duration_us: Option<u64> = video_info.as_ref()
+        .map(|v| v.duration.as_micros() as u64)
+        .filter(|&d| d > 0);
+
+    set_bar_style(encode_pb);
+    set_prefix_label(encode_pb, format!("encoding {}", doc_filename));
+    encode_pb.set_length(source_size.max(1));
+    encode_pb.set_position(0);
+
+    std::fs::create_dir_all(SCRATCH_DIR)
+        .with_context(|| format!("create_dir_all {SCRATCH_DIR}"))?;
+    let scratch_path_buf = scratch_path(&doc_filename);
+    let output_arg = scratch_path_buf.to_string_lossy().into_owned();
+
+    let total_budget_encode = source_size / 2;
+
+    let mut run = spawn_ffmpeg(
+        src, encode_args, &scale_args, &output_arg, false,
+        encode_pb, total_pb,
+        source_size, total_budget_encode, duration_us,
+        Some(encoded_bytes),
+    )?;
+    let status = run.child.wait().await.context("waiting for ffmpeg")?;
+    if let Some(h) = run.progress {
+        let _ = h.await;
+        let advanced = run.total_advanced.load(std::sync::atomic::Ordering::Relaxed);
+        total_pb.inc(total_budget_encode.saturating_sub(advanced));
+        encode_pb.set_position(source_size);
+    }
+    if !status.success() {
+        let _ = tokio::fs::remove_file(&scratch_path_buf).await;
+        let err = run.stderr_buf.lock().await.clone();
+        bail!("ffmpeg exited with {}: {}", status, err.trim());
+    }
+
+    let scratch_size = tokio::fs::metadata(&scratch_path_buf).await
+        .with_context(|| format!("stat scratch file {}", scratch_path_buf.display()))?
+        .len();
+
+    Ok(EncodedAlbumPart {
+        scratch_path: scratch_path_buf,
+        scratch_size,
+        doc_filename,
+        caption: part.caption.clone(),
+        source_size,
+        video_info,
+        thumb,
+    })
+}
+
+/// Upload a pre-encoded album part from its scratch file, delete the scratch,
+/// and return an `InputMedia` ready for `send_album`.
+async fn upload_album_part_scratch(
+    client: &Client,
+    part: EncodedAlbumPart,
+    upload_pb: &ProgressBar,
+    total_pb: &ProgressBar,
+    video_bars: &VideoUploadBars,
+    uploaded_bytes: Arc<AtomicU64>,
+) -> anyhow::Result<InputMedia> {
+    let EncodedAlbumPart {
+        scratch_path,
+        scratch_size,
+        doc_filename,
+        caption,
+        source_size,
+        video_info,
+        thumb,
+    } = part;
+
+    set_bar_style(upload_pb);
+    set_prefix_label(upload_pb, format!("uploading {}", doc_filename));
+    upload_pb.set_length(scratch_size.max(1));
+    upload_pb.set_position(0);
+
+    let upload_total_budget = source_size.saturating_sub(source_size / 2);
+    let f = tokio::fs::File::open(&scratch_path).await
+        .with_context(|| format!("opening scratch file {}", scratch_path.display()))?;
+    let mut tracked = ScaledProgressReader {
+        inner: f,
+        file_pb: upload_pb.clone(),
+        total_pb: total_pb.clone(),
+        inner_size: scratch_size,
+        total_budget: upload_total_budget,
+        bytes_read: 0,
+        total_credited: 0,
+        shared_total: Some(uploaded_bytes),
+    };
+    let mut files: Vec<RawBigFile> = Vec::new();
+    let mut peek: Option<u8> = None;
+    loop {
+        let (raw, eof) = upload_one_big_file(
+            client, &mut tracked, &mut peek, PART_MAX,
+            upload_pb, total_pb, false, Some(video_bars),
+        ).await?;
+        if let Some(r) = raw { files.push(r); }
+        if eof { break; }
+        if files.len() > 1 {
+            let _ = tokio::fs::remove_file(&scratch_path).await;
+            bail!(
+                "encoded album part '{}' exceeded 4 GiB; multipart not supported in EncodedAlbum",
+                doc_filename
+            );
+        }
+    }
+    let credited = tracked.total_credited;
+    total_pb.inc(upload_total_budget.saturating_sub(credited));
+    let _ = tokio::fs::remove_file(&scratch_path).await;
+    upload_pb.set_position(scratch_size);
+
+    if files.is_empty() {
+        bail!("no upload parts produced for album part '{}'", doc_filename);
+    }
+
+    let raw = files.into_iter().next().unwrap();
+    let uploaded = finalize_big_file(&raw, doc_filename.clone());
+    let mut media = InputMedia::new().caption(caption).document(uploaded);
+    if let Some(ref info) = video_info {
+        media = media.attribute(video_attribute(info));
+    }
+    media = media.thumbnail(thumb);
+    Ok(media)
+}
+
+/// Run the LeadingMoov pipeline for an `EncodedAlbum` item. Mirrors
+/// `run_leading_moov_pipeline` — two tasks bridged by `channel(1)` so at
+/// most 2 scratch files exist at once — but the uploader collects
+/// `InputMedia` handles instead of sending individual messages, then issues
+/// a single `sendMultiMedia` call at the end.
+///
+/// `file_pb` is reused as the encode bar; an upload bar is inserted after it.
+pub async fn run_leading_moov_album_pipeline(
+    client: &Client,
+    peer: PeerRef,
+    parts: &[UploadPart],
+    encode_args: &[String],
+    vres: u32,
+    thumbnail_args: &[String],
+    mp: &MultiProgress,
+    file_pb: &ProgressBar,
+    total_pb: &ProgressBar,
+) -> anyhow::Result<()> {
+    set_bar_style(file_pb);
+
+    let upload_pb = mp.insert_after(file_pb, ProgressBar::new(1));
+    set_bar_style(&upload_pb);
+    set_prefix_label(&upload_pb, "pending upload");
+
+    let buf_pb = mp.insert_after(&upload_pb, ProgressBar::new((TG_CHUNK * UPLOAD_CONCURRENCY) as u64));
+    set_buffer_bar_style(&buf_pb);
+
+    let video_bars = VideoUploadBars {
+        buf_pb: buf_pb.clone(),
+        upload_pb: ProgressBar::hidden(),
+        buf_fill: Arc::new(AtomicU64::new(0)),
+        partial_fill: Arc::new(AtomicU64::new(0)),
+        total_uploaded: Arc::new(AtomicU64::new(0)),
+    };
+
+    let encoded_bytes = Arc::new(AtomicU64::new(0));
+    let uploaded_bytes = Arc::new(AtomicU64::new(0));
+
+    let buf_tick_fill     = video_bars.buf_fill.clone();
+    let buf_tick_partial  = video_bars.partial_fill.clone();
+    let buf_tick_uploaded = video_bars.total_uploaded.clone();
+    let buf_tick_pb       = buf_pb.clone();
+    let enc_b_tick        = encoded_bytes.clone();
+    let up_b_tick         = uploaded_bytes.clone();
+    let encode_pb_tick    = file_pb.clone();
+    let upload_pb_tick    = upload_pb.clone();
+    let buf_tick_handle = tokio::spawn(async move {
+        use std::collections::VecDeque;
+        const WINDOW_SECS: usize = 5;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut enc_history: VecDeque<u64> = VecDeque::with_capacity(WINDOW_SECS + 1);
+        let mut up_history:  VecDeque<u64> = VecDeque::with_capacity(WINDOW_SECS + 1);
+        let speed = |hist: &VecDeque<u64>| -> u64 {
+            if hist.len() < 2 { return 0; }
+            let oldest = *hist.front().unwrap();
+            let newest = *hist.back().unwrap();
+            let span   = (hist.len() - 1) as u64;
+            newest.saturating_sub(oldest) / span
+        };
+        loop {
+            interval.tick().await;
+            let fill = buf_tick_fill.load(std::sync::atomic::Ordering::Relaxed)
+                + buf_tick_partial.load(std::sync::atomic::Ordering::Relaxed);
+            let processed = buf_tick_uploaded.load(std::sync::atomic::Ordering::Relaxed);
+            buf_tick_pb.set_position(fill);
+            buf_tick_pb.set_message(format!("Σ {}", fmt_mib(processed)));
+
+            let enc = enc_b_tick.load(std::sync::atomic::Ordering::Relaxed);
+            let up = up_b_tick.load(std::sync::atomic::Ordering::Relaxed);
+            enc_history.push_back(enc);
+            up_history.push_back(up);
+            while enc_history.len() > WINDOW_SECS + 1 { enc_history.pop_front(); }
+            while up_history.len()  > WINDOW_SECS + 1 { up_history.pop_front();  }
+            encode_pb_tick.set_message(fmt_speed(speed(&enc_history) as f64));
+            upload_pb_tick.set_message(fmt_speed(speed(&up_history)  as f64));
+        }
+    });
+
+    let n = parts.len();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedAlbumPart>(1);
+
+    // Uploader: collect InputMedia items, return them when done.
+    let uploader = {
+        let client = client.clone();
+        let upload_pb = upload_pb.clone();
+        let total_pb = total_pb.clone();
+        let uploaded_bytes = uploaded_bytes.clone();
+        tokio::spawn(async move {
+            let mut medias: Vec<InputMedia> = Vec::with_capacity(n);
+            while let Some(job) = rx.recv().await {
+                let media = upload_album_part_scratch(
+                    &client, job, &upload_pb, &total_pb, &video_bars,
+                    uploaded_bytes.clone(),
+                ).await?;
+                medias.push(media);
+                set_prefix_label(&upload_pb, "pending upload");
+                upload_pb.set_length(1);
+                upload_pb.set_position(0);
+            }
+            set_prefix_label(&upload_pb, "no more uploads");
+            upload_pb.set_length(1);
+            upload_pb.set_position(1);
+            anyhow::Ok(medias)
+        })
+    };
+
+    // Encoder loop.
+    let mut encoder_err: Option<anyhow::Error> = None;
+    for part in parts.iter() {
+        match encode_album_part_to_scratch(
+            client, part, encode_args, vres, thumbnail_args,
+            file_pb, total_pb, encoded_bytes.clone(),
+        ).await {
+            Ok(job) => {
+                if tx.send(job).await.is_err() {
+                    encoder_err = Some(anyhow::anyhow!("uploader closed unexpectedly"));
+                    break;
+                }
+            }
+            Err(e) => { encoder_err = Some(e); break; }
+        }
+    }
+    set_prefix_label(file_pb, "done encoding");
+    file_pb.set_position(file_pb.length().unwrap_or(0));
+
+    drop(tx);
+    let uploader_res = uploader.await;
+    buf_tick_handle.abort();
+    let _ = buf_tick_handle.await;
+    buf_pb.finish_and_clear();
+    file_pb.set_message("");
+    upload_pb.set_message("");
+
+    if let Some(e) = encoder_err { return Err(e); }
+    let medias = uploader_res.context("uploader join")??;
+
+    client.send_album(peer, medias).await.context("sending encoded album")?;
     Ok(())
 }
