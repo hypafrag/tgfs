@@ -21,6 +21,7 @@ pub struct Args {
     pub dry_run: bool,
     pub encode_video: bool,
     pub album: bool,
+    pub tvshow: bool,
     pub paths: Vec<PathBuf>,
 }
 
@@ -71,6 +72,13 @@ fn print_usage() {
              albums (up to 10 items each). Only files sharing the\n                          \
              same caption are grouped together; multipart and\n                          \
              encoded-video items are passed through unchanged.\n  \
+           --tvshow               Treat inputs as TV-show episodes. Filenames are\n                          \
+             parsed via hunch to extract show title, season, and\n                          \
+             episode; files are renamed to\n                          \
+             `<title> S##E##.<ext>` and grouped per-season into\n                          \
+             Telegram albums (≤10 per album, split as evenly as\n                          \
+             possible). Mutually exclusive with --album,\n                          \
+             --encode-video, -d caption, and -d zip.\n  \
            --encode-video         Re-encode video files with ffmpeg (using\n                          \
              ffmpeg.encode_args from the config) and attach\n                          \
              an ffmpeg-generated thumbnail to each uploaded\n                          \
@@ -93,6 +101,7 @@ pub fn parse_args() -> anyhow::Result<Args> {
     let mut dry_run = false;
     let mut encode_video = false;
     let mut album = false;
+    let mut tvshow = false;
     let mut paths: Vec<PathBuf> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -110,6 +119,7 @@ pub fn parse_args() -> anyhow::Result<Args> {
             "--dry-run" => dry_run = true,
             "--encode-video" => encode_video = true,
             "-a" | "--album" => album = true,
+            "--tvshow" => tvshow = true,
             other if other.starts_with("--channel=") => {
                 channel = Some(other.trim_start_matches("--channel=").to_string());
             }
@@ -125,5 +135,12 @@ pub fn parse_args() -> anyhow::Result<Args> {
     }
     let channel = channel.ok_or_else(|| anyhow!("-c/--channel is required"))?;
     if paths.is_empty() { bail!("at least one file or directory path is required"); }
-    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, album, paths })
+    if tvshow {
+        if album { bail!("--tvshow is incompatible with --album"); }
+        if encode_video { bail!("--tvshow is incompatible with --encode-video"); }
+        if matches!(dir_mode, DirMode::Caption | DirMode::Zip) {
+            bail!("--tvshow is incompatible with -d caption|zip");
+        }
+    }
+    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, album, tvshow, paths })
 }

@@ -9,6 +9,7 @@ mod args;
 mod ffmpeg;
 mod plan;
 mod progress;
+mod tvshow;
 mod upload;
 
 use std::path::PathBuf;
@@ -110,8 +111,12 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         .context("can't canonicalize current working directory")?;
 
     let mut plan: Vec<UploadItem> = Vec::new();
-    for p in &args.paths {
-        collect_path(p, &cwd, policy, args.dir_mode, args.encode_video, &mut plan)?;
+    if args.tvshow {
+        plan = tvshow::build_tvshow_plan(&args.paths, args.dir_mode)?;
+    } else {
+        for p in &args.paths {
+            collect_path(p, &cwd, policy, args.dir_mode, args.encode_video, &mut plan)?;
+        }
     }
     if plan.is_empty() { bail!("nothing to upload"); }
 

@@ -37,6 +37,7 @@ ctr = "0.9"
 crc32fast = "1"
 getrandom = "0.2"
 indicatif = "0.17"
+hunch = { version = "2", default-features = false }
 
 [[bin]]
 name = "tgfs"
