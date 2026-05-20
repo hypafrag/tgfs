@@ -1,9 +1,14 @@
-//! `--tvshow` plan builder. Parses input filenames with `hunch`, renames each
-//! file to `<Title> S##E##.<ext>`, sorts by (title, season, episode), and
-//! splits each season's episodes into Telegram albums (≤10 per album, balanced
-//! as evenly as possible).
+//! `--tvshow` plan builder. Parses input file paths with `hunch`, renames each
+//! file to `<Title> S##E##[ - <Episode Title>].<ext>`, sorts by (title, season,
+//! episode), and splits each season's episodes into Telegram albums (≤10 per
+//! album, balanced as evenly as possible).
+//!
+//! Hunch sees the **full path relative to the arg** (e.g.
+//! `The.Walking.Dead.bdrip_[teko]/Season_01/s01e01_Days.Gone.Bye.avi`), not
+//! just the filename, so the show title and episode title can be recovered
+//! from directory components when they're missing from the leaf name.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _};
 
@@ -17,31 +22,32 @@ struct Episode {
     title: String,
     season: i32,
     episode: i32,
+    episode_title: Option<String>,
     ext: String,
 }
 
-fn parse_episode(abs: PathBuf, size: u64) -> anyhow::Result<Episode> {
-    let name = abs
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("filename of '{}' is not valid UTF-8", abs.display()))?;
-    let result = hunch::hunch(name);
+fn parse_episode(abs: PathBuf, size: u64, hunch_input: &str) -> anyhow::Result<Episode> {
+    let result = hunch::hunch(hunch_input);
     let title = result
         .title()
-        .ok_or_else(|| anyhow!("hunch: could not extract show title from '{}'", name))?
+        .ok_or_else(|| anyhow!("hunch: could not extract show title from '{}'", hunch_input))?
         .to_string();
     let season = result
         .season()
-        .ok_or_else(|| anyhow!("hunch: could not extract season from '{}'", name))?;
+        .ok_or_else(|| anyhow!("hunch: could not extract season from '{}'", hunch_input))?;
     let episode = result
         .episode()
-        .ok_or_else(|| anyhow!("hunch: could not extract episode number from '{}'", name))?;
-    let ext = Path::new(name)
+        .ok_or_else(|| anyhow!("hunch: could not extract episode number from '{}'", hunch_input))?;
+    let episode_title = result.episode_title().map(|s| s.to_string());
+    let ext = Path::new(hunch_input)
         .extension()
         .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    Ok(Episode { abs_path: abs, size, title, season, episode, ext })
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("file '{}' has no extension", abs.display()))?;
+    if ext.is_empty() {
+        bail!("file '{}' has an empty extension", abs.display());
+    }
+    Ok(Episode { abs_path: abs, size, title, season, episode, episode_title, ext })
 }
 
 /// Distribute `n` items across `ceil(n / ALBUM_MAX)` albums as evenly as
@@ -54,11 +60,16 @@ pub fn split_album_sizes(n: usize) -> Vec<usize> {
     (0..k).map(|i| if i < extra { base + 1 } else { base }).collect()
 }
 
-fn tv_filename(title: &str, season: i32, episode: i32, ext: &str) -> String {
-    if ext.is_empty() {
-        format!("{} S{:02}E{:02}", title, season, episode)
-    } else {
-        format!("{} S{:02}E{:02}.{}", title, season, episode, ext)
+fn tv_filename(
+    title: &str,
+    season: i32,
+    episode: i32,
+    episode_title: Option<&str>,
+    ext: &str,
+) -> String {
+    match episode_title {
+        Some(et) if !et.is_empty() => format!("{} S{:02}E{:02} - {}.{}", title, season, episode, et, ext),
+        _ => format!("{} S{:02}E{:02}.{}", title, season, episode, ext),
     }
 }
 
@@ -72,13 +83,38 @@ fn album_caption(title: &str, season: i32, episodes: &[i32]) -> String {
     }
 }
 
-fn collect_files(arg: &Path, dir_mode: DirMode, out: &mut Vec<(PathBuf, u64)>) -> anyhow::Result<()> {
+/// Join the components of `under` with forward slashes — hunch was designed
+/// against Unix-style paths, so emit `/` regardless of platform separator.
+fn rel_to_slash(under: &Path) -> String {
+    under.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Each entry: `(abs_path, size, hunch_input)`. `hunch_input` is the full
+/// path relative to the user-supplied arg, with the arg's own basename as
+/// the first component — that's what lets hunch see ancestor directory
+/// names like `The.Walking.Dead.bdrip_[teko]` when the leaf filename
+/// doesn't carry the show title.
+fn collect_files(
+    arg: &Path,
+    dir_mode: DirMode,
+    out: &mut Vec<(PathBuf, u64, String)>,
+) -> anyhow::Result<()> {
     let meta = std::fs::metadata(arg)
         .with_context(|| format!("can't stat '{}'", arg.display()))?;
     if meta.is_file() {
         let abs = arg.canonicalize()
             .with_context(|| format!("can't canonicalize '{}'", arg.display()))?;
-        out.push((abs, meta.len()));
+        let rel = abs.file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("filename of '{}' is not valid UTF-8", arg.display()))?
+            .to_string();
+        out.push((abs, meta.len(), rel));
         return Ok(());
     }
     if meta.is_dir() {
@@ -88,7 +124,15 @@ fn collect_files(arg: &Path, dir_mode: DirMode, out: &mut Vec<(PathBuf, u64)>) -
                 arg.display()
             );
         }
-        let mut stack: Vec<PathBuf> = vec![arg.to_path_buf()];
+        let arg_canon = arg.canonicalize()
+            .with_context(|| format!("can't canonicalize '{}'", arg.display()))?;
+        let arg_root_name = arg_canon.file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!(
+                "can't determine a basename for arg '{}'", arg.display()
+            ))?
+            .to_string();
+        let mut stack: Vec<PathBuf> = vec![arg_canon.clone()];
         while let Some(d) = stack.pop() {
             let entries = std::fs::read_dir(&d)
                 .with_context(|| format!("can't read directory '{}'", d.display()))?;
@@ -99,9 +143,18 @@ fn collect_files(arg: &Path, dir_mode: DirMode, out: &mut Vec<(PathBuf, u64)>) -
                 if m.is_dir() {
                     stack.push(p);
                 } else if m.is_file() {
-                    let abs = p.canonicalize()
-                        .with_context(|| format!("can't canonicalize '{}'", p.display()))?;
-                    out.push((abs, m.len()));
+                    let under = p.strip_prefix(&arg_canon)
+                        .with_context(|| format!(
+                            "walked path '{}' is not under arg root '{}'",
+                            p.display(), arg_canon.display(),
+                        ))?;
+                    let rel_under = rel_to_slash(under);
+                    let rel = if rel_under.is_empty() {
+                        arg_root_name.clone()
+                    } else {
+                        format!("{}/{}", arg_root_name, rel_under)
+                    };
+                    out.push((p, m.len(), rel));
                 }
             }
         }
@@ -115,21 +168,21 @@ fn collect_files(arg: &Path, dir_mode: DirMode, out: &mut Vec<(PathBuf, u64)>) -
 /// chunks of ≤ALBUM_MAX as evenly as possible; single-episode seasons become a
 /// lone `Single`.
 pub fn build_tvshow_plan(paths: &[PathBuf], dir_mode: DirMode) -> anyhow::Result<Vec<UploadItem>> {
-    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    let mut files: Vec<(PathBuf, u64, String)> = Vec::new();
     for p in paths {
         collect_files(p, dir_mode, &mut files)?;
     }
     if files.is_empty() { return Ok(Vec::new()); }
 
     let mut episodes: Vec<Episode> = Vec::with_capacity(files.len());
-    for (abs, size) in files {
+    for (abs, size, rel) in files {
         if size > PART_MAX {
             bail!(
                 "file '{}' is {} bytes (> 4 GiB); --tvshow does not support multipart files",
                 abs.display(), size
             );
         }
-        episodes.push(parse_episode(abs, size)?);
+        episodes.push(parse_episode(abs, size, &rel)?);
     }
     Ok(assemble_plan(episodes))
 }
@@ -174,7 +227,9 @@ fn assemble_plan(mut episodes: Vec<Episode>) -> Vec<UploadItem> {
                     src: PartSource::File(e.abs_path.clone()),
                     offset: 0,
                     size: e.size,
-                    doc_filename: tv_filename(&e.title, e.season, e.episode, &e.ext),
+                    doc_filename: tv_filename(
+                        &e.title, e.season, e.episode, e.episode_title.as_deref(), &e.ext,
+                    ),
                     // Caption only on the first part — Telegram surfaces one
                     // caption per album, and the indexer's group-caption
                     // extractor picks up any non-empty one.
@@ -202,6 +257,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn ep(title: &str, season: i32, episode: i32, ext: &str) -> Episode {
+        ep_with_title(title, season, episode, None, ext)
+    }
+
+    fn ep_with_title(
+        title: &str,
+        season: i32,
+        episode: i32,
+        episode_title: Option<&str>,
+        ext: &str,
+    ) -> Episode {
         Episode {
             // Path content is irrelevant for assemble_plan tests — it is just
             // forwarded into PartSource::File. Use a synthetic, unique-ish path.
@@ -213,6 +278,7 @@ mod tests {
             title: title.to_string(),
             season,
             episode,
+            episode_title: episode_title.map(|s| s.to_string()),
             ext: ext.to_string(),
         }
     }
@@ -247,9 +313,21 @@ mod tests {
 
     #[test]
     fn tv_filename_formats_pad() {
-        assert_eq!(tv_filename("Show", 1, 2, "mkv"), "Show S01E02.mkv");
-        assert_eq!(tv_filename("Show", 12, 134, "mp4"), "Show S12E134.mp4");
-        assert_eq!(tv_filename("Show", 1, 2, ""), "Show S01E02");
+        assert_eq!(tv_filename("Show", 1, 2, None, "mkv"), "Show S01E02.mkv");
+        assert_eq!(tv_filename("Show", 12, 134, None, "mp4"), "Show S12E134.mp4");
+    }
+
+    #[test]
+    fn tv_filename_appends_episode_title_when_present() {
+        assert_eq!(
+            tv_filename("The Walking Dead", 1, 1, Some("Days Gone Bye"), "avi"),
+            "The Walking Dead S01E01 - Days Gone Bye.avi",
+        );
+        // Empty episode_title collapses back to the bare form.
+        assert_eq!(
+            tv_filename("Show", 1, 2, Some(""), "mkv"),
+            "Show S01E02.mkv",
+        );
     }
 
     #[test]
@@ -341,7 +419,9 @@ mod tests {
     #[test]
     fn parse_episode_extracts_title_season_episode() {
         let abs = PathBuf::from("/x/Breaking.Bad.S05E03.1080p.BluRay.x264-DEMAND.mkv");
-        let e = parse_episode(abs, 1234).unwrap();
+        let e = parse_episode(
+            abs, 1234, "Breaking.Bad.S05E03.1080p.BluRay.x264-DEMAND.mkv",
+        ).unwrap();
         assert_eq!(e.title, "Breaking Bad");
         assert_eq!(e.season, 5);
         assert_eq!(e.episode, 3);
@@ -350,9 +430,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_episode_uses_full_rel_path_to_recover_title_and_ep_title() {
+        // Show title lives only in the directory component; episode title in
+        // the leaf. The combined relative path is what makes both reachable.
+        let abs = PathBuf::from("/x/y/s01e01_Days.Gone.Bye.avi");
+        let rel = "The.Walking.Dead.bdrip_[teko]/Season_01/s01e01_Days.Gone.Bye.avi";
+        let e = parse_episode(abs, 100, rel).unwrap();
+        assert_eq!(e.title, "The Walking Dead");
+        assert_eq!(e.season, 1);
+        assert_eq!(e.episode, 1);
+        assert_eq!(e.episode_title.as_deref(), Some("Days Gone Bye"));
+        assert_eq!(e.ext, "avi");
+    }
+
+    #[test]
     fn parse_episode_rejects_unparseable_name() {
         let abs = PathBuf::from("/x/random-document.txt");
-        assert!(parse_episode(abs, 100).is_err());
+        assert!(parse_episode(abs, 100, "random-document.txt").is_err());
+    }
+
+    #[test]
+    fn parse_episode_rejects_empty_extension() {
+        // Trailing dot makes `Path::extension()` return `Some("")`.
+        let abs = PathBuf::from("/x/Breaking.Bad.S01E01.");
+        let err = parse_episode(abs, 100, "Breaking.Bad.S01E01.").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("empty extension"), "got: {}", msg);
     }
 
     // ---- filesystem-touching end-to-end tests --------------------------------

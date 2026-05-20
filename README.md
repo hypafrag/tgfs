@@ -11,6 +11,8 @@ Read-only HTTP and FUSE filesystem backed by Telegram channels. Indexes document
 - **HTTP Range requests** — seeking works in browsers and media players for single files, multipart concatenations, and inner-archive entries.
 - **Media playback** — audio and video files are served with inline `Content-Disposition` for in-browser playback.
 - **FUSE mount** — mount channels as a local read-only filesystem (macOS/Linux) for use with standard file tools. Archive entries preserve their original Unix permissions (Info-ZIP `external file attributes`) when available.
+- **TV-show layout** — per-channel [`tvshow_pattern`](#tvshow_pattern) reroutes episodes into a Plex/Jellyfin-style `Show/Season/Episode` tree, with a fallback chain that gracefully drops the episode title when hunch can't recover one.
+- **[`tgup`](#tgup--uploader-cli) uploader** — companion CLI for pushing local files into a tgfs-indexed channel. Handles single files, recursive directory walks, Telegram-album grouping, ffmpeg re-encoding with auto-thumbnails, and a TV-show grouping mode for season uploads.
 - **MIME interning** — MIME type strings are pooled across the index to reduce memory on large channels.
 
 ## Requirements
@@ -121,6 +123,39 @@ When enabled, the FUSE read handler short-circuits the probe and returns 4 KB of
 
 Since ID3v1 has been superseded by ID3v2 (which sits at the file start and is reachable without seeking), this trades the legacy tag for instant playback start. Defaults to `false`.
 
+### `tvshow_pattern`
+
+Per-channel template that reroutes TV-show episodes from the channel root into a Plex/Jellyfin-style directory tree. Each document name is parsed with [hunch](https://crates.io/crates/hunch) and substituted into the template; the rendered string becomes the file's virtual `<dir>/<filename>`. Files hunch can't decompose are left at their original locations.
+
+```yaml
+channels:
+  - name: TV Shows
+    tvshow_pattern: "{show_title}/Season {season:02}/Episode {episode:02} - {episode_title}.{ext}|{show_title}/Season {season:02}/Episode {episode:02}.{ext}"
+```
+
+Placeholders:
+
+| Token              | Source                                   |
+|--------------------|------------------------------------------|
+| `{show_title}`     | hunch's detected show title              |
+| `{episode_title}`  | hunch's detected episode title *(optional — see fallback chain)* |
+| `{season}`         | season number (decimal, no padding)      |
+| `{season:N}`       | season number, parsed width but unpadded |
+| `{season:0N}`      | season number, zero-padded to width N    |
+| `{episode}` / `{episode:N}` / `{episode:0N}` | same forms for episode number |
+| `{year}` / `{year:N}` / `{year:0N}`          | year if hunch found one     |
+| `{ext}`            | original file extension, lowercased      |
+
+**Width specs.** `:02` zero-pads to width 2 (e.g. `5` → `"05"`). `:2` parses the width for validation but emits the raw decimal (e.g. `5` → `"5"`, `12` → `"12"`) — useful when you want to document the expected width without forcing leading zeros.
+
+**Fallback chain.** A pattern string may contain multiple sub-patterns separated by `|`. Sub-patterns are tried left-to-right; the first one whose placeholders all resolve is used. Today only `{episode_title}` is genuinely optional, so the common shape is "with episode title | without":
+
+```text
+…Episode {episode:02} - {episode_title}.{ext}|…Episode {episode:02}.{ext}
+```
+
+For a file hunch reads as having an episode title (e.g. `s01e01_Days.Gone.Bye.avi`), the left sub-pattern wins and produces `Episode 01 - Days Gone Bye.avi`. For a file where hunch can't recover one (e.g. `s01e06_TS-19.avi`), the renderer falls through and emits `Episode 06.avi`.
+
 ### Message caption overrides
 
 Caption directives are recognized in any message text:
@@ -202,6 +237,63 @@ max_fetches_total: 8
 ```
 
 Omit or leave unset for unlimited concurrency (default).
+
+## tgup — uploader CLI
+
+`tgup` is a general-purpose Telegram uploader for pushing local files into a channel/group/chat. It pairs naturally with tgfs (the binary, configs, and session live in the same workspace), but nothing about it is tgfs-specific — anything you upload is just a regular Telegram message.
+
+Build from the same workspace (`cargo build --release --bin tgup`). On first use it prompts for an SMS code and stores its authenticated session at `~/.config/tgfs/session.sqlite3`; subsequent runs are non-interactive.
+
+```bash
+# Upload one file to a named channel
+tgup -c MyChannel path/to/file.mkv
+
+# Omit -c to pick the destination interactively. Channels declared in the
+# config file are listed at the top, followed by every other dialog this
+# account can send to.
+tgup path/to/file.mkv
+
+# Walk a directory and upload every contained file as flat siblings
+tgup -c Backups -d recursive ./backups/
+
+# Walk a directory but turn each file's parent dir into a `path:` caption,
+# so a tgfs-indexed channel reconstructs the local tree
+tgup -c Photos -d caption ./trip/
+
+# Group consecutive same-caption files into Telegram albums (≤10 per album)
+tgup -c Photos -a ./trip/*.jpg
+
+# Re-encode video files with ffmpeg (uses `ffmpeg.encode_args` from the
+# config) and attach a generated thumbnail to each uploaded video
+tgup -c HomeVideos --encode-video clip.mov
+
+# Dry-run: print the plan and exit without uploading
+tgup -c Photos --dry-run ./trip/
+```
+
+Most flags compose: `-d recursive` works alongside `-a`, `--encode-video`, etc. Mutually-exclusive combinations are listed under `tgup --help`.
+
+### Modes
+
+| Flag             | Behavior                                                                                                              |
+|------------------|-----------------------------------------------------------------------------------------------------------------------|
+| *(none)*         | Each argument is uploaded as its own message.                                                                         |
+| `-d recursive`   | Directory args are walked; every contained file is uploaded individually.                                             |
+| `-d caption`     | Same as `recursive`, but each file's caption carries `path: <relative dir>/` so tgfs reconstructs the local tree.     |
+| `-a / --album`   | Consecutive uploadable files sharing a caption are grouped into Telegram albums (≤10 each).                           |
+| `--encode-video` | Videos are streamed through ffmpeg before upload; an auto-generated thumbnail is attached to each one.                |
+| `--tvshow`       | Filenames are parsed as TV-show episodes, renamed `<Title> S##E##[ - <Episode Title>].<ext>`, and grouped per-season into albums. See below. |
+| `--dry-run`      | Print the upload plan and exit. Composes with any of the above.                                                       |
+
+### `--tvshow`
+
+For libraries of named episodes. Each input file is parsed with [hunch](https://crates.io/crates/hunch) from its **path relative to the arg** (so ancestor directories contribute to the parse), renamed to `<Title> S##E## - <Episode Title>.<ext>` (or the bare `<Title> S##E##.<ext>` when no episode title is recovered), sorted by `(title, season, episode)`, and grouped into per-season Telegram albums of up to 10 items each. Larger seasons split evenly: 11 episodes → albums of 6+5; 21 → 7+7+7. The album caption is `<Title> S## E##-E##` (range) or `<Title> S##E##` (single).
+
+```bash
+tgup -c "TV Shows" --tvshow -d recursive "The.Walking.Dead.bdrip_[teko]"
+```
+
+Pair with the tgfs [`tvshow_pattern`](#tvshow_pattern) channel option to expose these uploads as a Plex-style tree. Constraints: non-empty extensions only, files >4 GiB rejected, mutually exclusive with `-a`, `--encode-video`, `-d caption`, and `-d zip`.
 
 ## Docker
 
