@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
+# Logs from the integration runners append to ./test.log; wipe it at the
+# start of every run so each invocation starts from a clean file.
+rm -f test.log
+
 cargo test
-cargo run --example integration_test -- --log-level info
-cargo run --example tgup_integration_test -- --log-level info
+cargo run --quiet --example integration_test -- --log-level info
+cargo run --quiet --example tgup_integration_test -- --log-level info

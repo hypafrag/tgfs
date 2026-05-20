@@ -27,6 +27,7 @@
 //!   3. `ffmpeg` on `$PATH`.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -49,6 +50,7 @@ struct Args {
     spec: String,
     tgup: Option<String>,
     log_level: String,
+    log_file: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -56,6 +58,7 @@ fn parse_args() -> Args {
     let mut spec = "test_channels.yml".to_string();
     let mut tgup: Option<String> = None;
     let mut log_level = "info,tgfs=info".to_string();
+    let mut log_file: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -63,11 +66,17 @@ fn parse_args() -> Args {
             "--spec" => spec = it.next().expect("--spec requires a path"),
             "--tgup" => tgup = Some(it.next().expect("--tgup requires a path")),
             "--log-level" => log_level = it.next().expect("--log-level requires a value"),
+            "--log-file" => log_file = Some(it.next().expect("--log-file requires a path")),
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: tgup_integration_test [--config tgfs.yml] \
                      [--spec test_channels.yml] [--tgup target/debug/tgup] \
-                     [--log-level info,tgfs=debug]"
+                     [--log-level info,tgfs=debug] [--log-file test.log]\n\
+                     \n\
+                     --log-file is truncated at startup (one-off debugging mode). \
+                     When --log-file is omitted, logs append to ./test.log so a \
+                     single `./test` run aggregates output from all integration \
+                     runners into one file."
                 );
                 std::process::exit(0);
             }
@@ -77,7 +86,94 @@ fn parse_args() -> Args {
             }
         }
     }
-    Args { config, spec, tgup, log_level }
+    Args { config, spec, tgup, log_level, log_file }
+}
+
+fn init_logger(level: &str, log_file: Option<&str>) -> anyhow::Result<()> {
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(level),
+    );
+    builder.format(|buf, record| {
+        let ts = buf.timestamp_millis();
+        writeln!(
+            buf,
+            "{ts} {:5} {}: {}",
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+    let (path, truncate) = match log_file {
+        Some(p) => (p.to_string(), true),
+        None => ("test.log".to_string(), false),
+    };
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate { opts.truncate(true); } else { opts.append(true); }
+    let file = opts.open(&path)
+        .with_context(|| format!("opening log file {}", path))?;
+    builder.target(env_logger::Target::Pipe(Box::new(file)));
+    builder.write_style(env_logger::WriteStyle::Never);
+    builder.init();
+    Ok(())
+}
+
+/// Tiny cargo-test-look-alike harness: prints `test <name> ... ok|FAILED`
+/// to stdout while all `log!` output goes to test.log. Process exits
+/// non-zero if any test fails.
+struct TestRunner {
+    passed: usize,
+    failed: Vec<(String, String)>,
+}
+
+impl TestRunner {
+    fn new() -> Self { Self { passed: 0, failed: Vec::new() } }
+
+    async fn run<F, Fut>(&mut self, name: &str, body: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        print!("test {name} ... ");
+        let _ = std::io::stdout().flush();
+        info!("=== test {name} START ===");
+        match body().await {
+            Ok(()) => {
+                println!("{}", console::style("ok").green());
+                info!("=== test {name} OK ===");
+                self.passed += 1;
+            }
+            Err(e) => {
+                println!("{}", console::style("FAILED").red());
+                info!("=== test {name} FAILED: {e:?} ===");
+                self.failed.push((name.to_string(), format!("{e:?}")));
+            }
+        }
+    }
+
+    fn finish(self) -> bool {
+        println!();
+        if self.failed.is_empty() {
+            println!(
+                "test result: {}. {} passed; 0 failed",
+                console::style("ok").green(), self.passed,
+            );
+            true
+        } else {
+            println!("failures:");
+            for (name, err) in &self.failed {
+                println!();
+                println!("---- {} ----", console::style(name).red());
+                println!("{err}");
+            }
+            println!();
+            println!(
+                "test result: {}. {} passed; {} failed",
+                console::style("FAILED").red(), self.passed, self.failed.len(),
+            );
+            false
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -112,7 +208,7 @@ fn generate_video(path: &Path, label: &str) -> anyhow::Result<()> {
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .status()
         .context("running ffmpeg")?;
     if !status.success() {
@@ -213,14 +309,25 @@ fn write_tgup_config(base: &Config, channel_name: &str) -> anyhow::Result<PathBu
     Ok(path)
 }
 
-fn run_tgup(tgup_bin: &Path, config: &Path, channel: &str, extra: &[&str]) -> anyhow::Result<()> {
+fn run_tgup(
+    tgup_bin: &Path,
+    config: &Path,
+    channel: &str,
+    extra: &[&str],
+    log_path: &Path,
+) -> anyhow::Result<()> {
     let mut cmd = Command::new(tgup_bin);
     cmd.arg("--config").arg(config)
        .args(["-c", channel])
        .args(extra)
-       .stdin(Stdio::null())
-       .stdout(Stdio::inherit())
-       .stderr(Stdio::inherit());
+       .stdin(Stdio::null());
+    // Route tgup's stdout/stderr into the shared test.log so the
+    // cargo-test-style line on the parent's stdout stays clean.
+    let stdout = fs::OpenOptions::new().create(true).append(true).open(log_path)
+        .with_context(|| format!("opening {} for child stdout", log_path.display()))?;
+    let stderr = fs::OpenOptions::new().create(true).append(true).open(log_path)
+        .with_context(|| format!("opening {} for child stderr", log_path.display()))?;
+    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
     info!("running: {:?}", cmd);
     let status = cmd.status().context("spawning tgup")?;
     if !status.success() {
@@ -239,8 +346,8 @@ fn locate_tgup_bin(cli_override: Option<&str>) -> anyhow::Result<PathBuf> {
     let status = Command::new("cargo")
         .args(["build", "--bin", "tgup"])
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("cargo build --bin tgup")?;
     if !status.success() { bail!("cargo build --bin tgup failed"); }
@@ -256,9 +363,8 @@ async fn settle() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&args.log_level),
-    ).format_timestamp_millis().init();
+    let log_path = PathBuf::from(args.log_file.clone().unwrap_or_else(|| "test.log".to_string()));
+    init_logger(&args.log_level, args.log_file.as_deref())?;
 
     let cfg = config::load_config(&args.config)?;
     let spec_bytes = fs::read(&args.spec)
@@ -302,10 +408,6 @@ async fn main() -> anyhow::Result<()> {
     let peer = find_channel(&client, &channel_name).await?;
 
     // Pre-flight: wipe the channel once and confirm nothing is left behind.
-    // Service messages (channel-created, pin events, etc.) can't be removed
-    // via channels.deleteMessages and will throw off per-scenario asserts;
-    // surface them clearly so the user can delete them manually in the
-    // Telegram client before re-running.
     let deleted = delete_all_messages(&client, peer).await?;
     info!("cleared {deleted} pre-existing messages");
     clear_about(&client, peer).await.context("clearing channel description")?;
@@ -323,78 +425,88 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ---------------- scenario 1: plain upload ----------------
-    info!("=== scenario: plain upload ===");
-    run_tgup(&tgup_bin, &tgup_config, &channel_name,
-        &[plain_video.to_str().unwrap()])?;
-    settle().await;
-    let msgs = fetch_messages(&client, peer).await?;
-    assert_eq!(msgs.len(), 1, "plain: expected 1 message, got {}: {msgs:#?}", msgs.len());
-    assert_eq!(msgs[0].doc_name.as_deref(), Some("plain.mp4"),
-        "plain: unexpected doc name: {:?}", msgs[0].doc_name);
-    assert_eq!(msgs[0].text, "", "plain: caption should be empty");
-    assert!(msgs[0].grouped_id.is_none(), "plain: should not be in a Telegram album");
-    info!("scenario plain: OK");
+    let mut runner = TestRunner::new();
 
-    // ---------------- scenario 2: --album ----------------
-    info!("=== scenario: --album ===");
-    delete_all_messages(&client, peer).await?;
-    settle().await;
-    let mut argv: Vec<&str> = vec!["-a"];
-    let strs: Vec<String> = album_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-    for s in &strs { argv.push(s); }
-    run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv)?;
-    settle().await;
-    let msgs = fetch_messages(&client, peer).await?;
-    assert_eq!(msgs.len(), 5, "album: expected 5 messages, got {}", msgs.len());
-    let gid = msgs[0].grouped_id;
-    assert!(gid.is_some(), "album: messages should share a grouped_id");
-    assert!(msgs.iter().all(|m| m.grouped_id == gid),
-        "album: not all messages share the same grouped_id: {msgs:#?}");
-    let mut names: Vec<String> = msgs.iter()
-        .filter_map(|m| m.doc_name.clone()).collect();
-    names.sort();
-    let expected_names: Vec<String> = (1..=5).map(|i| format!("clip-{}.mp4", i)).collect();
-    assert_eq!(names, expected_names, "album: unexpected filenames");
-    info!("scenario album: OK");
+    runner.run("tgup::plain_upload", || async {
+        run_tgup(&tgup_bin, &tgup_config, &channel_name,
+            &[plain_video.to_str().unwrap()], &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 1 { bail!("expected 1 message, got {}: {msgs:#?}", msgs.len()); }
+        if msgs[0].doc_name.as_deref() != Some("plain.mp4") {
+            bail!("unexpected doc name: {:?}", msgs[0].doc_name);
+        }
+        if !msgs[0].text.is_empty() { bail!("caption should be empty, got {:?}", msgs[0].text); }
+        if msgs[0].grouped_id.is_some() { bail!("should not be in a Telegram album"); }
+        Ok(())
+    }).await;
 
-    // ---------------- scenario 3: --tvshow ----------------
-    info!("=== scenario: --tvshow ===");
-    delete_all_messages(&client, peer).await?;
-    settle().await;
-    let mut argv: Vec<&str> = vec!["--tvshow"];
-    let strs: Vec<String> = tv_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-    for s in &strs { argv.push(s); }
-    run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv)?;
-    settle().await;
-    let msgs = fetch_messages(&client, peer).await?;
-    assert_eq!(msgs.len(), 5, "tvshow: expected 5 messages, got {}", msgs.len());
-    let gid = msgs[0].grouped_id;
-    assert!(gid.is_some(), "tvshow: messages should share a grouped_id");
-    assert!(msgs.iter().all(|m| m.grouped_id == gid),
-        "tvshow: not all messages share the same grouped_id");
-    let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
-    names.sort();
-    let expected: Vec<String> = (1..=5).map(|n| format!("Some Show S01E{:02}.mp4", n)).collect();
-    assert_eq!(names, expected, "tvshow: filenames not renamed as expected");
-    let captions: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
-    assert!(captions.iter().any(|t| t.contains("Some Show S01 E01-E05")),
-        "tvshow: missing album caption; captions were {captions:?}");
-    info!("scenario tvshow: OK");
+    runner.run("tgup::album", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        let mut argv: Vec<&str> = vec!["-a"];
+        let strs: Vec<String> = album_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        for s in &strs { argv.push(s); }
+        run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 5 { bail!("expected 5 messages, got {}", msgs.len()); }
+        let gid = msgs[0].grouped_id;
+        if gid.is_none() { bail!("messages should share a grouped_id"); }
+        if !msgs.iter().all(|m| m.grouped_id == gid) {
+            bail!("not all messages share the same grouped_id: {msgs:#?}");
+        }
+        let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
+        names.sort();
+        let expected_names: Vec<String> = (1..=5).map(|i| format!("clip-{}.mp4", i)).collect();
+        if names != expected_names { bail!("unexpected filenames: {names:?}"); }
+        Ok(())
+    }).await;
 
-    // ---------------- scenario 4: --encode-video ----------------
-    info!("=== scenario: --encode-video ===");
-    delete_all_messages(&client, peer).await?;
-    settle().await;
-    run_tgup(&tgup_bin, &tgup_config, &channel_name,
-        &["--encode-video", encode_source.to_str().unwrap()])?;
-    settle().await;
-    let msgs = fetch_messages(&client, peer).await?;
-    assert_eq!(msgs.len(), 1, "encode-video: expected 1 message, got {}", msgs.len());
-    assert_eq!(msgs[0].doc_name.as_deref(), Some("encodeme.mp4"),
-        "encode-video: filename should be re-extensioned to .mp4");
-    info!("scenario encode-video: OK");
+    runner.run("tgup::tvshow", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        let mut argv: Vec<&str> = vec!["--tvshow"];
+        let strs: Vec<String> = tv_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        for s in &strs { argv.push(s); }
+        run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 5 { bail!("expected 5 messages, got {}", msgs.len()); }
+        let gid = msgs[0].grouped_id;
+        if gid.is_none() { bail!("messages should share a grouped_id"); }
+        if !msgs.iter().all(|m| m.grouped_id == gid) {
+            bail!("not all messages share the same grouped_id");
+        }
+        let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
+        names.sort();
+        let expected: Vec<String> = (1..=5).map(|n| format!("Some Show S01E{:02}.mp4", n)).collect();
+        if names != expected { bail!("filenames not renamed as expected: {names:?}"); }
+        let captions: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+        if !captions.iter().any(|t| t.contains("Some Show S01 E01-E05")) {
+            bail!("missing album caption; captions were {captions:?}");
+        }
+        Ok(())
+    }).await;
 
-    info!("all scenarios passed");
-    Ok(())
+    runner.run("tgup::encode_video", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        run_tgup(&tgup_bin, &tgup_config, &channel_name,
+            &["--encode-video", encode_source.to_str().unwrap()], &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 1 { bail!("expected 1 message, got {}", msgs.len()); }
+        if msgs[0].doc_name.as_deref() != Some("encodeme.mp4") {
+            bail!("filename should be re-extensioned to .mp4, got {:?}", msgs[0].doc_name);
+        }
+        Ok(())
+    }).await;
+
+    info!("all scenarios completed");
+    if runner.finish() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }

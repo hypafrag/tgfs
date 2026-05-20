@@ -46,7 +46,7 @@ use zip::CompressionMethod;
 
 use tgfs::config::{self, ArchiveView, ChannelEntry, Config, MultipartPolicy};
 use tgfs::index::{AppState, MimePool};
-use tgfs::{indexer, realtime};
+use tgfs::{indexer, realtime, server};
 use tgfs::login::connect_and_authorize;
 use tgfs::zip_cache::ZipCache;
 use tgfs::fuse as tgfs_fuse;
@@ -93,34 +93,37 @@ fn parse_args() -> Args {
 }
 
 /// REMINDER FOR FUTURE SELF: when integration tests fail or behave oddly,
-/// re-run with `--log-level debug --log-file integration_test.log` and read
-/// the resulting file. The log captures every Telegram RPC, FUSE callback,
-/// mount/unmount cycle, and download in chronological order — that's where
-/// to look first before stepping through code.
+/// inspect `test.log` first — every Telegram RPC, FUSE callback,
+/// mount/unmount cycle, and download is logged there in chronological
+/// order. Override the path with `--log-file <path>` for one-off debugging
+/// (that mode truncates the file at startup); the default `test.log`
+/// target is opened in append mode so multiple integration runners share
+/// the same log file across a single `./test` invocation.
 fn init_logger(level: &str, log_file: Option<&str>) -> anyhow::Result<()> {
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
     builder.format(|buf, record| {
         let ts = buf.timestamp_millis();
-        let level_style = buf.default_level_style(record.level());
         writeln!(
             buf,
-            "{ts} {level_style}{:5}{level_style:#} {}: {}",
+            "{ts} {:5} {}: {}",
             record.level(),
             record.target(),
             record.args()
         )
     });
-    if let Some(path) = log_file {
-        // Created from scratch on every run so each test invocation starts
-        // with a clean log file — no need to manually rotate between runs.
-        let file = fs::OpenOptions::new()
-            .create(true).write(true).truncate(true)
-            .open(path)
-            .with_context(|| format!("opening log file {}", path))?;
-        builder.target(env_logger::Target::Pipe(Box::new(file)));
-        // Force-disable ANSI styles since they don't render usefully in files.
-        builder.write_style(env_logger::WriteStyle::Never);
-    }
+    // Default → append to test.log (the wrapper `./test` script truncates it
+    // on each run). Explicit --log-file → use that path, truncated.
+    let (path, truncate) = match log_file {
+        Some(p) => (p.to_string(), true),
+        None => ("test.log".to_string(), false),
+    };
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate { opts.truncate(true); } else { opts.append(true); }
+    let file = opts.open(&path)
+        .with_context(|| format!("opening log file {}", path))?;
+    builder.target(env_logger::Target::Pipe(Box::new(file)));
+    builder.write_style(env_logger::WriteStyle::Never);
     builder.init();
     Ok(())
 }
@@ -442,6 +445,11 @@ fn variant_config(
 
 /// Mount the channel under MOUNT_PATH using `cfg`, run `body` with the
 /// mount visible to std::fs, then unmount and join.
+///
+/// The HTTP index router is also bound on a random `127.0.0.1` port using
+/// the same `AppState`, so every variant exercises both the FUSE tree and
+/// the web server against identical data. The bound base URL
+/// (`http://127.0.0.1:PORT`) is passed to `body` as the second argument.
 async fn mount_variant<F>(
     client: Client,
     cfg: Config,
@@ -449,7 +457,7 @@ async fn mount_variant<F>(
     body: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce(&Path, &str) -> anyhow::Result<()> + Send + 'static,
 {
     ensure_mount_dir()?;
     let mime_pool = MimePool::new();
@@ -477,13 +485,107 @@ where
     fs_handle.set_notifier(session.notifier());
     let bg = session.spawn().context("FUSE session spawn failed")?;
 
+    // Bind the HTTP server on a random local port and spawn it on the
+    // current runtime. Shares `state` with the FUSE filesystem so the two
+    // views can't drift.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await
+        .context("binding HTTP test listener")?;
+    let local_addr = listener.local_addr()?;
+    let base_url = format!("http://{}", local_addr);
+    info!("HTTP test server bound on {}", base_url);
+    let router = server::make_router(Arc::clone(&state));
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("HTTP test server failed");
+    });
+
     // Tiny pause so the kernel publishes the mount.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let body_result = tokio::task::spawn_blocking(move || body(Path::new(MOUNT_PATH))).await?;
+    let url_for_body = base_url.clone();
+    let body_result = tokio::task::spawn_blocking(move || {
+        body(Path::new(MOUNT_PATH), &url_for_body)
+    }).await?;
 
+    http_task.abort();
     shutdown_fuse(bg, MOUNT_PATH).await;
     body_result
+}
+
+/// Percent-encode a virtual path for use in an HTTP URL — segment by segment
+/// so the `/` separators survive but spaces and other special chars in
+/// individual names get escaped the same way `dir_listing` renders them.
+fn url_encode_path(rel: &str) -> String {
+    rel.split('/')
+        .map(|s| urlencoding::encode(s).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn http_client() -> anyhow::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(Into::into)
+}
+
+/// Fetch every `rel → bytes` pair via HTTP and assert bodies match.
+fn assert_http_layout_matches(base_url: &str, expected: &HashMap<String, Vec<u8>>) -> anyhow::Result<()> {
+    let client = http_client()?;
+    for (rel, expected_bytes) in expected {
+        let url = format!("{}/{}", base_url.trim_end_matches('/'), url_encode_path(rel));
+        let resp = client.get(&url).send().with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {} for {url}", resp.status());
+        }
+        let got = resp.bytes().with_context(|| format!("reading body of {url}"))?.to_vec();
+        if got != *expected_bytes {
+            bail!(
+                "HTTP content mismatch at {url}: expected {} bytes, got {} bytes",
+                expected_bytes.len(), got.len(),
+            );
+        }
+        info!("✓ HTTP {} ({} bytes)", rel, got.len());
+    }
+    Ok(())
+}
+
+/// Blocking HTTP GET wrapped for use from an async context. Returns the
+/// status code and the full response body, even for non-2xx responses (so
+/// callers can assert on 404s).
+async fn http_get(base_url: &str, rel: &str) -> anyhow::Result<(u16, Vec<u8>)> {
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), url_encode_path(rel));
+    tokio::task::spawn_blocking(move || -> anyhow::Result<(u16, Vec<u8>)> {
+        let c = http_client()?;
+        let resp = c.get(&url).send().with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let body = resp.bytes()?.to_vec();
+        Ok((status, body))
+    }).await?
+}
+
+/// GET a directory URL and assert the response is an HTML index containing
+/// each `needle` as a substring. Useful for sanity-checking the listing
+/// endpoint independently from file downloads.
+fn assert_http_listing_contains(base_url: &str, dir_rel: &str, needles: &[&str]) -> anyhow::Result<()> {
+    let client = http_client()?;
+    let dir = if dir_rel.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", url_encode_path(dir_rel.trim_end_matches('/')))
+    };
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), dir);
+    let resp = client.get(&url).send().with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} for listing {url}", resp.status());
+    }
+    let body = resp.text().with_context(|| format!("decoding listing body of {url}"))?;
+    for needle in needles {
+        if !body.contains(needle) {
+            bail!("listing {url} missing expected entry '{}'", needle);
+        }
+    }
+    info!("✓ HTTP listing {} contains {} expected entr(ies)", url, needles.len());
+    Ok(())
 }
 
 /// Compute the expected on-disk layout from the spec (for `archive_view: file`).
@@ -866,6 +968,17 @@ async fn run_mutation_test(
     let bg = session.spawn().context("FUSE session spawn failed")?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Bring up the HTTP index alongside the mount so the mutation test can
+    // cross-verify FUSE + HTTP after every add and delete.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await
+        .context("binding HTTP test listener")?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    info!("HTTP test server bound on {} (mutation variant)", base_url);
+    let router = server::make_router(Arc::clone(&state));
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("HTTP test server failed");
+    });
+
     // Drop whatever piled up during indexing + earlier variants, then start
     // the dispatcher so subsequent mutations route through it cleanly.
     let drained = drain_updates_backlog(&mut updates_rx);
@@ -910,7 +1023,11 @@ async fn run_mutation_test(
         assert_listing(&chan_dir, "mut_one.txt", true)?;
         let got = fs::read(&p1)?;
         if got != b"one" { bail!("mut_one.txt content mismatch: got {:?}", got); }
-        info!("✓ add mut_one.txt: lookup+readdir+content all consistent ({} watcher event(s))", ev.len());
+        let (status, body) = http_get(&base_url, &format!("{}/mut_one.txt", spec_name)).await?;
+        if status != 200 || body != b"one" {
+            bail!("HTTP probe after add: status={status}, body={} bytes", body.len());
+        }
+        info!("✓ add mut_one.txt: lookup+readdir+content+HTTP all consistent ({} watcher event(s))", ev.len());
 
         // -- Mutation 2: add a second mutable file ---------------------------
         info!("mutation: add mut_two.bin");
@@ -926,7 +1043,11 @@ async fn run_mutation_test(
         assert_listing(&chan_dir, "mut_one.txt", true)?;
         let got = fs::read(&p2)?;
         if got != payload2 { bail!("mut_two.bin content mismatch"); }
-        info!("✓ add mut_two.bin: listing keeps both mutables ({} watcher event(s))", ev.len());
+        let (status, body) = http_get(&base_url, &format!("{}/mut_two.bin", spec_name)).await?;
+        if status != 200 || body != payload2 {
+            bail!("HTTP probe after add mut_two.bin: status={status}, body={} bytes", body.len());
+        }
+        info!("✓ add mut_two.bin: listing keeps both mutables, HTTP serves new bytes ({} watcher event(s))", ev.len());
 
         // -- Mutation 3: delete one message ---------------------------------
         info!("mutation: delete mut_one.txt (msg {id1})");
@@ -941,6 +1062,10 @@ async fn run_mutation_test(
         // absence is the real proof of a clean delete.
         assert_listing(&chan_dir, "mut_one.txt", false)?;
         assert_listing(&chan_dir, "mut_two.bin", true)?;
+        let (status, _) = http_get(&base_url, &format!("{}/mut_one.txt", spec_name)).await?;
+        if status != 404 {
+            bail!("HTTP probe after delete mut_one.txt: expected 404, got {status}");
+        }
         check_watcher_saw_delete("mut_one.txt", &ev_rx, &p1)?;
 
         // -- Mutation 4: delete the remaining mutable message ----------------
@@ -955,6 +1080,10 @@ async fn run_mutation_test(
         // Both mutables should now be gone from the channel listing.
         assert_listing(&chan_dir, "mut_two.bin", false)?;
         assert_listing(&chan_dir, "mut_one.txt", false)?;
+        let (status, _) = http_get(&base_url, &format!("{}/mut_two.bin", spec_name)).await?;
+        if status != 404 {
+            bail!("HTTP probe after delete mut_two.bin: expected 404, got {status}");
+        }
         check_watcher_saw_delete("mut_two.bin", &ev_rx, &p2)?;
 
         Ok(())
@@ -972,6 +1101,7 @@ async fn run_mutation_test(
     }
     drop(watcher);
     dispatcher_task.abort();
+    http_task.abort();
     shutdown_fuse(bg, MOUNT_PATH).await;
     outcome
 }
@@ -1060,6 +1190,68 @@ fn collect_remove_events(
     false
 }
 
+// ------------------------ Test runner --------------------------------------
+
+/// Tiny cargo-test-look-alike harness so the integration runner can stream
+/// `test <name> ... ok|FAILED` lines to stdout while routing every `log!`
+/// call into `test.log`. Failures are collected and reported in a summary
+/// block at the end; the process exits non-zero if any test failed.
+struct TestRunner {
+    passed: usize,
+    failed: Vec<(String, String)>,
+}
+
+impl TestRunner {
+    fn new() -> Self { Self { passed: 0, failed: Vec::new() } }
+
+    async fn run<F, Fut>(&mut self, name: &str, body: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        use std::io::Write as _;
+        print!("test {name} ... ");
+        let _ = std::io::stdout().flush();
+        info!("=== test {name} START ===");
+        match body().await {
+            Ok(()) => {
+                println!("{}", console::style("ok").green());
+                info!("=== test {name} OK ===");
+                self.passed += 1;
+            }
+            Err(e) => {
+                println!("{}", console::style("FAILED").red());
+                info!("=== test {name} FAILED: {e:?} ===");
+                self.failed.push((name.to_string(), format!("{e:?}")));
+            }
+        }
+    }
+
+    fn finish(self) -> bool {
+        println!();
+        if self.failed.is_empty() {
+            println!(
+                "test result: {}. {} passed; 0 failed",
+                console::style("ok").green(), self.passed,
+            );
+            true
+        } else {
+            println!("failures:");
+            for (name, err) in &self.failed {
+                println!();
+                println!("---- {} ----", console::style(name).red());
+                println!("{err}");
+            }
+            println!();
+            println!(
+                "test result: {}. {} passed; {} failed",
+                console::style("FAILED").red(), self.passed, self.failed.len(),
+            );
+            false
+        }
+    }
+}
+
 // ------------------------ main ----------------------------------------------
 
 #[tokio::main]
@@ -1103,156 +1295,164 @@ async fn main() -> anyhow::Result<()> {
     // Re-index will pick up the just-uploaded messages.
     let zip_cache = Arc::new(Mutex::new(ZipCache::load("zip_index_cache.json.gz")));
 
-    // ----- Variant A: archive_view = file -----------------------------------
-    info!("== variant: archive_view=file, multipart_policy=none ==");
+    // Precompute expected layouts shared across variants.
     let expected_files = expected_layout_file_view(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None);
+    let expected_inner = expected_zip_inner_bytes(&spec)?;
+
+    let mut runner = TestRunner::new();
+
+    // ----- archive_view = file ---------------------------------------------
     let exp_a = expected_files.clone();
-    let client_a = client.clone();
-    let zc_a = Arc::clone(&zip_cache);
-    mount_variant(client_a, var_cfg, zc_a, move |root| {
-        assert_layout_matches(root, &exp_a)?;
-        // Verify the zip file itself is readable as a flat document and its
-        // bytes round-trip the locally-built archive.
-        for (rel, expected_bytes) in &exp_a {
-            if rel.ends_with(".zip") {
-                let p = root.join(rel);
-                let got = fs::read(&p)?;
-                if got.len() != expected_bytes.len() {
-                    bail!("zip-as-file size mismatch for {rel}: expected {}, got {}",
-                        expected_bytes.len(), got.len());
+    let spec_name = spec.name.clone();
+    runner.run("integration::archive_view_file", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None,
+        );
+        let exp_a_inner = exp_a.clone();
+        let spec_name_inner = spec_name.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp_a_inner)?;
+            for (rel, expected_bytes) in &exp_a_inner {
+                if rel.ends_with(".zip") {
+                    let p = root.join(rel);
+                    let got = fs::read(&p)?;
+                    if got.len() != expected_bytes.len() {
+                        bail!("zip-as-file size mismatch for {rel}: expected {}, got {}",
+                            expected_bytes.len(), got.len());
+                    }
                 }
             }
-        }
-        Ok(())
-    }).await?;
+            assert_http_layout_matches(base_url, &exp_a_inner)?;
+            assert_http_listing_contains(base_url, "", &[spec_name_inner.as_str()])?;
+            if let Some(any_rel) = exp_a_inner.keys().next() {
+                let leaf = any_rel.rsplit('/').next().unwrap_or(any_rel);
+                assert_http_listing_contains(base_url, &spec_name_inner, &[leaf])?;
+            }
+            Ok(())
+        }).await
+    }).await;
 
-    // ----- Variant B: archive_view = directory ------------------------------
-    info!("== variant: archive_view=directory ==");
-    let expected_inner = expected_zip_inner_bytes(&spec)?;
+    // ----- archive_view = directory ----------------------------------------
     let channel_dir = spec.name.clone();
     let exp_b_inner: HashMap<String, Vec<u8>> = expected_inner.iter()
         .map(|(k, v)| (format!("{}/{}", channel_dir, k), v.clone())).collect();
-    // Plus non-zip top-level files (zip files themselves are hidden under `directory`).
     let exp_b_top: HashMap<String, Vec<u8>> = expected_files.iter()
         .filter(|(k, _)| !k.ends_with(".zip"))
         .map(|(k, v)| (k.clone(), v.clone())).collect();
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None, None);
-    let client_b = client.clone();
-    let zc_b = Arc::clone(&zip_cache);
-    mount_variant(client_b, var_cfg, zc_b, move |root| {
-        assert_layout_matches(root, &exp_b_top)?;
-        assert_layout_matches(root, &exp_b_inner)?;
-        Ok(())
-    }).await?;
+    runner.run("integration::archive_view_directory", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None, None,
+        );
+        let top = exp_b_top.clone();
+        let inner = exp_b_inner.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &top)?;
+            assert_layout_matches(root, &inner)?;
+            assert_http_layout_matches(base_url, &top)?;
+            assert_http_layout_matches(base_url, &inner)?;
+            Ok(())
+        }).await
+    }).await;
 
-    // ----- Variant C: archive_view = file_and_directory ---------------------
-    info!("== variant: archive_view=file_and_directory ==");
+    // ----- archive_view = file_and_directory --------------------------------
     let mut exp_c: HashMap<String, Vec<u8>> = expected_files.clone();
     for (k, v) in expected_inner.iter() {
         exp_c.insert(format!("{}/{}", spec.name, k), v.clone());
     }
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None);
-    let client_c = client.clone();
-    let zc_c = Arc::clone(&zip_cache);
-    mount_variant(client_c, var_cfg, zc_c, move |root| {
-        assert_layout_matches(root, &exp_c)?;
-        Ok(())
-    }).await?;
+    runner.run("integration::archive_view_file_and_directory", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None,
+        );
+        let exp = exp_c.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp)?;
+            assert_http_layout_matches(base_url, &exp)?;
+            Ok(())
+        }).await
+    }).await;
 
-    // ----- Variant D: multipart_policy = suffix ---------------------------------
-    info!("== variant: archive_view=file, multipart_policy=suffix ==");
-    let expected_suffix = expected_layout_suffix_multipart(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None);
-    let exp_d = expected_suffix;
-    let client_d = client.clone();
-    let zc_d = Arc::clone(&zip_cache);
-    mount_variant(client_d, var_cfg, zc_d, move |root| {
-        assert_layout_matches(root, &exp_d)
-    }).await?;
+    // ----- multipart = suffix ----------------------------------------------
+    runner.run("integration::multipart_suffix", || async {
+        let exp = expected_layout_suffix_multipart(&spec.name, &spec)?;
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None,
+        );
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp)?;
+            assert_http_layout_matches(base_url, &exp)
+        }).await
+    }).await;
 
-    // ----- Variant E: multipart_policy = album ----------------------------------
-    info!("== variant: archive_view=file, multipart_policy=album ==");
-    let expected_album = expected_layout_album_multipart(&spec.name, &spec)?;
-    let var_cfg = variant_config(&cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album, None);
-    let exp_e = expected_album;
-    let client_e = client.clone();
-    let zc_e = Arc::clone(&zip_cache);
-    mount_variant(client_e, var_cfg, zc_e, move |root| {
-        assert_layout_matches(root, &exp_e)
-    }).await?;
+    // ----- multipart = album -----------------------------------------------
+    runner.run("integration::multipart_album", || async {
+        let exp = expected_layout_album_multipart(&spec.name, &spec)?;
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album, None,
+        );
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp)?;
+            assert_http_layout_matches(base_url, &exp)
+        }).await
+    }).await;
 
-    // ----- Variant F: tvshow_pattern -----------------------------------------
+    // ----- tvshow_pattern --------------------------------------------------
     // Channel-level template that hunch-decomposable filenames get rerouted
-    // through. Files hunch can't parse (the bulk of the spec — readme.txt,
-    // image.png, suffixed multipart, the album, etc.) must keep their
-    // original locations.
-    info!("== variant: tvshow_pattern ==");
-    let pattern = "{show_title}/Season {season}/Episode {episode}.{ext}";
-    let var_cfg = variant_config(
-        &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, Some(pattern),
-    );
-    // Expected rerouted layout: just the three episodes added to the spec.
-    // We deliberately do NOT include the original-location baseline because
-    // some non-tvshow files share names hunch may interpret loosely; the
-    // per-file presence checks below cover both reroute and pass-through.
-    let channel_dir = spec.name.clone();
-    let expected_tvshow: HashMap<String, Vec<u8>> = [
-        (
-            format!("{}/Breaking Bad/Season 1/Episode 1.mkv", channel_dir),
-            b"S01E01 payload".to_vec(),
-        ),
-        (
-            format!("{}/Breaking Bad/Season 1/Episode 2.mkv", channel_dir),
-            b"S01E02 payload".to_vec(),
-        ),
-        (
-            format!("{}/The Walking Dead/Season 2/Episode 5.mkv", channel_dir),
-            b"TWD payload".to_vec(),
-        ),
-    ].into_iter().collect();
-    let exp_f = expected_tvshow;
-    let channel_dir_f = channel_dir.clone();
-    let client_f = client.clone();
-    let zc_f = Arc::clone(&zip_cache);
-    mount_variant(client_f, var_cfg, zc_f, move |root| {
-        // Rerouted episodes are present at the rendered paths.
-        assert_layout_matches(root, &exp_f)?;
-        // Pass-through: a non-tvshow file from the spec keeps its original
-        // location (the channel root). If `tvshow_pattern` had been applied
-        // indiscriminately this read would fail with ENOENT.
-        let readme = root.join(&channel_dir_f).join("readme.txt");
-        if !readme.exists() {
-            bail!(
-                "non-tvshow file '{}' should still be at the channel root \
-                 — tvshow_pattern leaked into a file hunch could not parse",
-                readme.display()
-            );
-        }
-        // Pass-through: original tvshow-named files must NOT linger at the
-        // channel root, otherwise the rerouted entries would be duplicates.
-        let stray = root.join(&channel_dir_f).join("Breaking.Bad.S01E01.mkv");
-        if stray.exists() {
-            bail!(
-                "tvshow-renamed file '{}' should have been rerouted away from \
-                 the channel root, but it's still there",
-                stray.display()
-            );
-        }
+    // through. Files hunch can't parse must keep their original locations.
+    runner.run("integration::tvshow_pattern", || async {
+        let pattern = "{show_title}/Season {season}/Episode {episode}.{ext}";
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, Some(pattern),
+        );
+        let channel_dir = spec.name.clone();
+        let exp: HashMap<String, Vec<u8>> = [
+            (format!("{}/Breaking Bad/Season 1/Episode 1.mkv", channel_dir), b"S01E01 payload".to_vec()),
+            (format!("{}/Breaking Bad/Season 1/Episode 2.mkv", channel_dir), b"S01E02 payload".to_vec()),
+            (format!("{}/The Walking Dead/Season 2/Episode 5.mkv", channel_dir), b"TWD payload".to_vec()),
+        ].into_iter().collect();
+        let channel_dir_inner = channel_dir.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp)?;
+            assert_http_layout_matches(base_url, &exp)?;
+            let readme = root.join(&channel_dir_inner).join("readme.txt");
+            if !readme.exists() {
+                bail!(
+                    "non-tvshow file '{}' should still be at the channel root \
+                     — tvshow_pattern leaked into a file hunch could not parse",
+                    readme.display()
+                );
+            }
+            let stray = root.join(&channel_dir_inner).join("Breaking.Bad.S01E01.mkv");
+            if stray.exists() {
+                bail!(
+                    "tvshow-renamed file '{}' should have been rerouted away from \
+                     the channel root, but it's still there",
+                    stray.display()
+                );
+            }
+            Ok(())
+        }).await
+    }).await;
+
+    // ----- realtime mutations + native fs watcher --------------------------
+    // The mutation test consumes `updates_rx`, so it can only run once and
+    // must be moved into the closure.
+    let mut updates_rx_opt = Some(updates_rx);
+    runner.run("integration::realtime_mutations", || async {
+        let rx = updates_rx_opt.take().expect("realtime_mutations runs at most once");
+        run_mutation_test(
+            client.clone(),
+            &cfg,
+            &spec.name,
+            peer,
+            Arc::clone(&zip_cache),
+            rx,
+        ).await
+    }).await;
+
+    info!("all variants completed");
+    if runner.finish() {
         Ok(())
-    }).await?;
-
-    // ----- Variant G: realtime mutations + OS-native filesystem watcher ----
-    info!("== variant: realtime mutations + native fs watcher ==");
-    run_mutation_test(
-        client.clone(),
-        &cfg,
-        &spec.name,
-        peer,
-        Arc::clone(&zip_cache),
-        updates_rx,
-    ).await?;
-
-    info!("all variants OK");
-    Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }

@@ -66,6 +66,9 @@ hex = "0.4"
 base64 = "0.22"
 # FSEvents on macOS / inotify on Linux — native, never polling.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+# Blocking HTTP client used by the integration runner to exercise the HTTP
+# index alongside the FUSE mount. No TLS since we only hit http://127.0.0.1.
+reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
 
 # The integration test is an example because examples have access to
 # dev-dependencies (regular [[bin]] targets don't). Invoke as:
