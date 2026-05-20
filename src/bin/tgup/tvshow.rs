@@ -114,16 +114,21 @@ fn rel_to_slash(under: &Path) -> String {
         .join("/")
 }
 
-/// Each entry: `(abs_path, size, hunch_input)`. `hunch_input` is the full
-/// path relative to the user-supplied arg, with the arg's own basename as
-/// the first component — that's what lets hunch see ancestor directory
-/// names like `The.Walking.Dead.bdrip_[teko]` when the leaf filename
-/// doesn't carry the show title.
+/// Each entry: `(abs_path, size, hunch_input)`. `hunch_input` is the file's
+/// path **relative to the current working directory** — that way ancestor
+/// directories the user can see (e.g. `The.Walking.Dead.bdrip_[teko]/`)
+/// contribute to hunch's parse and recover the show title even when the
+/// leaf filename doesn't carry it. Falls back to the absolute path (leading
+/// separator stripped) when the file isn't under cwd.
 fn collect_files(
     arg: &Path,
     dir_mode: DirMode,
     out: &mut Vec<(PathBuf, u64, String)>,
 ) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()
+        .context("can't determine current working directory")?
+        .canonicalize()
+        .context("can't canonicalize current working directory")?;
     let meta = std::fs::metadata(arg)
         .with_context(|| format!("can't stat '{}'", arg.display()))?;
     if meta.is_file() {
@@ -133,10 +138,7 @@ fn collect_files(
         }
         let abs = arg.canonicalize()
             .with_context(|| format!("can't canonicalize '{}'", arg.display()))?;
-        let rel = abs.file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("filename of '{}' is not valid UTF-8", arg.display()))?
-            .to_string();
+        let rel = rel_from_cwd(&abs, &cwd);
         out.push((abs, meta.len(), rel));
         return Ok(());
     }
@@ -149,13 +151,7 @@ fn collect_files(
         }
         let arg_canon = arg.canonicalize()
             .with_context(|| format!("can't canonicalize '{}'", arg.display()))?;
-        let arg_root_name = arg_canon.file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!(
-                "can't determine a basename for arg '{}'", arg.display()
-            ))?
-            .to_string();
-        let mut stack: Vec<PathBuf> = vec![arg_canon.clone()];
+        let mut stack: Vec<PathBuf> = vec![arg_canon];
         while let Some(d) = stack.pop() {
             let entries = std::fs::read_dir(&d)
                 .with_context(|| format!("can't read directory '{}'", d.display()))?;
@@ -170,17 +166,7 @@ fn collect_files(
                         debug!("--tvshow: skipping non-video file '{}'", p.display());
                         continue;
                     }
-                    let under = p.strip_prefix(&arg_canon)
-                        .with_context(|| format!(
-                            "walked path '{}' is not under arg root '{}'",
-                            p.display(), arg_canon.display(),
-                        ))?;
-                    let rel_under = rel_to_slash(under);
-                    let rel = if rel_under.is_empty() {
-                        arg_root_name.clone()
-                    } else {
-                        format!("{}/{}", arg_root_name, rel_under)
-                    };
+                    let rel = rel_from_cwd(&p, &cwd);
                     out.push((p, m.len(), rel));
                 }
             }
@@ -188,6 +174,18 @@ fn collect_files(
         return Ok(());
     }
     bail!("'{}' is neither a file nor a directory", arg.display())
+}
+
+/// Compute the hunch input path for a canonical file path, relative to cwd
+/// when possible. Forward-slash joined regardless of platform separator.
+fn rel_from_cwd(file: &Path, cwd: &Path) -> String {
+    match file.strip_prefix(cwd) {
+        Ok(under) => rel_to_slash(under),
+        // Argument lives outside cwd (e.g. `tgup --tvshow /mnt/media/...`).
+        // Hand hunch the absolute path with the leading separator stripped
+        // so it still sees every ancestor directory.
+        Err(_) => rel_to_slash(file),
+    }
 }
 
 /// Walk `paths`, parse every file via `hunch`, group per (title, season), and
