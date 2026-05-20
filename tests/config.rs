@@ -35,6 +35,53 @@ fn expand_env_dollar_alone_is_kept() {
     assert_eq!(expand_env("price: $"), "price: $");
 }
 
+// -------- dotenv --------
+
+#[test]
+fn dotenv_parses_basic_pairs() {
+    let m = parse_dotenv("FOO=bar\nBAZ=qux\n");
+    assert_eq!(m.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(m.get("BAZ").map(String::as_str), Some("qux"));
+}
+
+#[test]
+fn dotenv_strips_quotes_and_comments_and_export_prefix() {
+    let m = parse_dotenv(
+        "# a comment\n\n\
+         export FOO=\"hello world\"\n\
+         BAR='one two'\n\
+         BAZ=  spacy  \n\
+         INVALID_LINE_NO_EQUALS\n",
+    );
+    assert_eq!(m.get("FOO").map(String::as_str), Some("hello world"));
+    assert_eq!(m.get("BAR").map(String::as_str), Some("one two"));
+    assert_eq!(m.get("BAZ").map(String::as_str), Some("spacy"));
+    assert!(!m.contains_key("INVALID_LINE_NO_EQUALS"));
+}
+
+#[test]
+fn expand_env_with_prefers_dotenv_over_environment() {
+    let mut dotenv = std::collections::HashMap::new();
+    dotenv.insert("TGFS_TEST_PREC".to_string(), "from_dotenv".to_string());
+    unsafe { std::env::set_var("TGFS_TEST_PREC", "from_env"); }
+    assert_eq!(
+        expand_env_with("X=${TGFS_TEST_PREC}", &dotenv),
+        "X=from_dotenv"
+    );
+    unsafe { std::env::remove_var("TGFS_TEST_PREC"); }
+}
+
+#[test]
+fn expand_env_with_falls_back_to_environment_when_dotenv_missing() {
+    let dotenv = std::collections::HashMap::new();
+    unsafe { std::env::set_var("TGFS_TEST_FALLBACK", "from_env"); }
+    assert_eq!(
+        expand_env_with("X=${TGFS_TEST_FALLBACK}", &dotenv),
+        "X=from_env"
+    );
+    unsafe { std::env::remove_var("TGFS_TEST_FALLBACK"); }
+}
+
 // -------- LogConfig::to_filter_string --------
 
 #[test]

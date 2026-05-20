@@ -299,9 +299,14 @@ pub struct SavedMessagesConfig {
     pub archive_view: ArchiveView,
 }
 
-/// Substitute `$VAR` and `${VAR}` references in `s` with values from the environment.
-/// Unset variables are replaced with an empty string.
-fn expand_env(s: &str) -> String {
+/// Substitute `$VAR` and `${VAR}` references in `s`. `dotenv` (typically the
+/// contents of `~/.config/tgfs/.env`) wins over the process environment; unset
+/// variables expand to an empty string.
+fn expand_env_with(s: &str, dotenv: &HashMap<String, String>) -> String {
+    let lookup = |name: &str| -> String {
+        if let Some(v) = dotenv.get(name) { return v.clone(); }
+        std::env::var(name).unwrap_or_default()
+    };
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -310,7 +315,7 @@ fn expand_env(s: &str) -> String {
             Some(&'{') => {
                 chars.next();
                 let name: String = chars.by_ref().take_while(|&c| c != '}').collect();
-                out.push_str(&std::env::var(&name).unwrap_or_default());
+                out.push_str(&lookup(&name));
             }
             Some(&c2) if c2.is_ascii_alphanumeric() || c2 == '_' => {
                 let mut name = String::new();
@@ -319,7 +324,7 @@ fn expand_env(s: &str) -> String {
                     else { break; }
                 }
                 let _ = c2;
-                out.push_str(&std::env::var(&name).unwrap_or_default());
+                out.push_str(&lookup(&name));
             }
             _ => out.push('$'),
         }
@@ -327,10 +332,64 @@ fn expand_env(s: &str) -> String {
     out
 }
 
+/// Path to the optional dotenv file. `$HOME/.config/tgfs/.env`. Absent /
+/// unreadable file → empty map; never errors.
+fn dotenv_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/tgfs/.env"))
+}
+
+fn load_dotenv() -> HashMap<String, String> {
+    match dotenv_path().and_then(|p| std::fs::read_to_string(&p).ok()) {
+        Some(data) => parse_dotenv(&data),
+        None => HashMap::new(),
+    }
+}
+
+/// Minimal dotenv parser: `KEY=VALUE` per line, `#` comments, blank lines
+/// ignored, surrounding single/double quotes around values stripped. No
+/// shell expansion or `export` prefix support — keep the format obvious so
+/// `${VAR}` resolution stays predictable.
+fn parse_dotenv(data: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for raw in data.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (k, v) = match line.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let key = k.trim().to_string();
+        if key.is_empty() { continue; }
+        let val = strip_matched_quotes(v.trim()).to_string();
+        out.insert(key, val);
+    }
+    out
+}
+
+fn strip_matched_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+fn expand_env(s: &str) -> String {
+    expand_env_with(s, &HashMap::new())
+}
+
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let data = std::fs::read_to_string(path)
         .map_err(|_| anyhow::anyhow!("{} not found", path))?;
-    Ok(serde_yaml::from_str(&expand_env(&data))?)
+    let dotenv = load_dotenv();
+    Ok(serde_yaml::from_str(&expand_env_with(&data, &dotenv))?)
 }
 
 
