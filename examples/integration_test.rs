@@ -926,18 +926,35 @@ fn drain_updates_backlog(rx: &mut tokio_mpsc::UnboundedReceiver<UpdatesLike>) ->
     n
 }
 
-/// The mutation test variant. Spawns the realtime dispatcher, installs an
-/// OS-native filesystem watcher on the mount, then performs add/delete
-/// operations through Telegram and asserts the FUSE state — and watcher
-/// stream — reflect them.
-async fn run_mutation_test(
+/// Owns every resource the realtime mutation tests need: the FUSE mount, the
+/// dispatcher task, the HTTP server, the OS-native filesystem watcher, and the
+/// set of `mutable:` message IDs uploaded so far (for cleanup).
+///
+/// Built once via [`setup_mutation_env`], shared across one-or-more
+/// [`do_mutation_round`] calls (so the realtime stream — which can only be
+/// consumed once — is reused), and finally consumed by
+/// [`teardown_mutation_env`].
+struct MutationEnv {
+    bg: fuser::BackgroundSession,
+    dispatcher_task: tokio::task::JoinHandle<()>,
+    http_task: tokio::task::JoinHandle<()>,
+    watcher: RecommendedWatcher,
+    ev_rx: std_mpsc::Receiver<notify::Result<Event>>,
+    base_url: String,
+    spec_name: String,
+    chan_dir: PathBuf,
+    mutable_ids: Vec<i32>,
+}
+
+/// Mount the channel, spawn the realtime dispatcher, bring up the HTTP server,
+/// and start watching the mount with the OS-native fs watcher.
+async fn setup_mutation_env(
     client: Client,
     base_cfg: &Config,
     spec_name: &str,
-    peer: PeerRef,
     zip_cache: Arc<Mutex<ZipCache>>,
     mut updates_rx: tokio_mpsc::UnboundedReceiver<UpdatesLike>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MutationEnv> {
     // Build a normal `archive_view=file, multipart_policy=none` variant.
     let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None, None);
 
@@ -1002,94 +1019,112 @@ async fn run_mutation_test(
         .context("starting watch on mount")?;
     info!("watching {} with OS-native backend", MOUNT_PATH);
 
-    let mount_root = Path::new(MOUNT_PATH);
-    let chan_dir = mount_root.join(spec_name);
+    let chan_dir = Path::new(MOUNT_PATH).join(spec_name);
 
-    // Tracks mutable msg_ids so we can clean up on the way out even if an
-    // assertion fails mid-test.
-    let mut mutable_ids: Vec<i32> = Vec::new();
+    Ok(MutationEnv {
+        bg, dispatcher_task, http_task, watcher, ev_rx, base_url,
+        spec_name: spec_name.to_string(), chan_dir, mutable_ids: Vec::new(),
+    })
+}
 
-    let outcome: anyhow::Result<()> = async {
-        // -- Mutation 1: add a single mutable file ---------------------------
-        info!("mutation: add mut_one.txt");
-        let id1 = upload_mutable_message(&client, peer, "mut_one.txt", b"one").await?;
-        mutable_ids.push(id1);
-        let p1 = chan_dir.join("mut_one.txt");
-        wait_for_file_state(&p1, true, Duration::from_secs(15))?;
-        // Adds only fire FUSE_NOTIFY_INVAL_ENTRY (no fsnotify event); we
-        // log whatever the watcher saw but don't gate on it.
-        let ev = drain_events(&ev_rx, Duration::from_millis(500));
-        // Cross-check readdir + content against the per-path metadata probe.
-        assert_listing(&chan_dir, "mut_one.txt", true)?;
-        let got = fs::read(&p1)?;
-        if got != b"one" { bail!("mut_one.txt content mismatch: got {:?}", got); }
-        let (status, body) = http_get(&base_url, &format!("{}/mut_one.txt", spec_name)).await?;
-        if status != 200 || body != b"one" {
-            bail!("HTTP probe after add: status={status}, body={} bytes", body.len());
-        }
-        info!("✓ add mut_one.txt: lookup+readdir+content+HTTP all consistent ({} watcher event(s))", ev.len());
+/// Run one add-add-delete-delete round against the live channel, using
+/// `prefix` to namespace the mutable filenames so multiple rounds against the
+/// same env can't collide. Updates `env.mutable_ids` as messages are uploaded
+/// and removed.
+async fn do_mutation_round(
+    env: &mut MutationEnv,
+    client: &Client,
+    peer: PeerRef,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    let name_one = format!("{prefix}_one.txt");
+    let name_two = format!("{prefix}_two.bin");
 
-        // -- Mutation 2: add a second mutable file ---------------------------
-        info!("mutation: add mut_two.bin");
-        let payload2: Vec<u8> = (0u8..32).collect();
-        let id2 = upload_mutable_message(&client, peer, "mut_two.bin", &payload2).await?;
-        mutable_ids.push(id2);
-        let p2 = chan_dir.join("mut_two.bin");
-        wait_for_file_state(&p2, true, Duration::from_secs(15))?;
-        let ev = drain_events(&ev_rx, Duration::from_millis(500));
-        assert_listing(&chan_dir, "mut_two.bin", true)?;
-        // The earlier add must still be visible in the listing — verifies
-        // the second rebuild didn't accidentally drop unrelated entries.
-        assert_listing(&chan_dir, "mut_one.txt", true)?;
-        let got = fs::read(&p2)?;
-        if got != payload2 { bail!("mut_two.bin content mismatch"); }
-        let (status, body) = http_get(&base_url, &format!("{}/mut_two.bin", spec_name)).await?;
-        if status != 200 || body != payload2 {
-            bail!("HTTP probe after add mut_two.bin: status={status}, body={} bytes", body.len());
-        }
-        info!("✓ add mut_two.bin: listing keeps both mutables, HTTP serves new bytes ({} watcher event(s))", ev.len());
+    // -- Mutation 1: add a single mutable file -------------------------------
+    info!("mutation: add {name_one}");
+    let id1 = upload_mutable_message(client, peer, &name_one, b"one").await?;
+    env.mutable_ids.push(id1);
+    let p1 = env.chan_dir.join(&name_one);
+    wait_for_file_state(&p1, true, Duration::from_secs(15))?;
+    // Adds only fire FUSE_NOTIFY_INVAL_ENTRY (no fsnotify event); we
+    // log whatever the watcher saw but don't gate on it.
+    let ev = drain_events(&env.ev_rx, Duration::from_millis(500));
+    // Cross-check readdir + content against the per-path metadata probe.
+    assert_listing(&env.chan_dir, &name_one, true)?;
+    let got = fs::read(&p1)?;
+    if got != b"one" { bail!("{name_one} content mismatch: got {:?}", got); }
+    let (status, body) = http_get(&env.base_url, &format!("{}/{}", env.spec_name, name_one)).await?;
+    if status != 200 || body != b"one" {
+        bail!("HTTP probe after add: status={status}, body={} bytes", body.len());
+    }
+    info!("✓ add {name_one}: lookup+readdir+content+HTTP all consistent ({} watcher event(s))", ev.len());
 
-        // -- Mutation 3: delete one message ---------------------------------
-        info!("mutation: delete mut_one.txt (msg {id1})");
-        client.invoke(&tl::functions::channels::DeleteMessages {
-            channel: peer.into(),
-            id: vec![id1],
-        }).await?;
-        mutable_ids.retain(|&i| i != id1);
-        verify_telegram_message_absent(&client, peer, id1).await?;
-        wait_for_file_state(&p1, false, Duration::from_secs(5))?;
-        // Listing must drop the entry — readdir and lookup agreeing on
-        // absence is the real proof of a clean delete.
-        assert_listing(&chan_dir, "mut_one.txt", false)?;
-        assert_listing(&chan_dir, "mut_two.bin", true)?;
-        let (status, _) = http_get(&base_url, &format!("{}/mut_one.txt", spec_name)).await?;
-        if status != 404 {
-            bail!("HTTP probe after delete mut_one.txt: expected 404, got {status}");
-        }
-        check_watcher_saw_delete("mut_one.txt", &ev_rx, &p1)?;
+    // -- Mutation 2: add a second mutable file -------------------------------
+    info!("mutation: add {name_two}");
+    let payload2: Vec<u8> = (0u8..32).collect();
+    let id2 = upload_mutable_message(client, peer, &name_two, &payload2).await?;
+    env.mutable_ids.push(id2);
+    let p2 = env.chan_dir.join(&name_two);
+    wait_for_file_state(&p2, true, Duration::from_secs(15))?;
+    let ev = drain_events(&env.ev_rx, Duration::from_millis(500));
+    assert_listing(&env.chan_dir, &name_two, true)?;
+    // The earlier add must still be visible in the listing — verifies
+    // the second rebuild didn't accidentally drop unrelated entries.
+    assert_listing(&env.chan_dir, &name_one, true)?;
+    let got = fs::read(&p2)?;
+    if got != payload2 { bail!("{name_two} content mismatch"); }
+    let (status, body) = http_get(&env.base_url, &format!("{}/{}", env.spec_name, name_two)).await?;
+    if status != 200 || body != payload2 {
+        bail!("HTTP probe after add {name_two}: status={status}, body={} bytes", body.len());
+    }
+    info!("✓ add {name_two}: listing keeps both mutables, HTTP serves new bytes ({} watcher event(s))", ev.len());
 
-        // -- Mutation 4: delete the remaining mutable message ----------------
-        info!("mutation: delete mut_two.bin (msg {id2})");
-        client.invoke(&tl::functions::channels::DeleteMessages {
-            channel: peer.into(),
-            id: vec![id2],
-        }).await?;
-        mutable_ids.retain(|&i| i != id2);
-        verify_telegram_message_absent(&client, peer, id2).await?;
-        wait_for_file_state(&p2, false, Duration::from_secs(5))?;
-        // Both mutables should now be gone from the channel listing.
-        assert_listing(&chan_dir, "mut_two.bin", false)?;
-        assert_listing(&chan_dir, "mut_one.txt", false)?;
-        let (status, _) = http_get(&base_url, &format!("{}/mut_two.bin", spec_name)).await?;
-        if status != 404 {
-            bail!("HTTP probe after delete mut_two.bin: expected 404, got {status}");
-        }
-        check_watcher_saw_delete("mut_two.bin", &ev_rx, &p2)?;
+    // -- Mutation 3: delete one message --------------------------------------
+    info!("mutation: delete {name_one} (msg {id1})");
+    client.invoke(&tl::functions::channels::DeleteMessages {
+        channel: peer.into(),
+        id: vec![id1],
+    }).await?;
+    env.mutable_ids.retain(|&i| i != id1);
+    verify_telegram_message_absent(client, peer, id1).await?;
+    wait_for_file_state(&p1, false, Duration::from_secs(5))?;
+    // Listing must drop the entry — readdir and lookup agreeing on
+    // absence is the real proof of a clean delete.
+    assert_listing(&env.chan_dir, &name_one, false)?;
+    assert_listing(&env.chan_dir, &name_two, true)?;
+    let (status, _) = http_get(&env.base_url, &format!("{}/{}", env.spec_name, name_one)).await?;
+    if status != 404 {
+        bail!("HTTP probe after delete {name_one}: expected 404, got {status}");
+    }
+    check_watcher_saw_delete(&name_one, &env.ev_rx, &p1)?;
 
-        Ok(())
-    }.await;
+    // -- Mutation 4: delete the remaining mutable message --------------------
+    info!("mutation: delete {name_two} (msg {id2})");
+    client.invoke(&tl::functions::channels::DeleteMessages {
+        channel: peer.into(),
+        id: vec![id2],
+    }).await?;
+    env.mutable_ids.retain(|&i| i != id2);
+    verify_telegram_message_absent(client, peer, id2).await?;
+    wait_for_file_state(&p2, false, Duration::from_secs(5))?;
+    // Both mutables should now be gone from the channel listing.
+    assert_listing(&env.chan_dir, &name_two, false)?;
+    assert_listing(&env.chan_dir, &name_one, false)?;
+    let (status, _) = http_get(&env.base_url, &format!("{}/{}", env.spec_name, name_two)).await?;
+    if status != 404 {
+        bail!("HTTP probe after delete {name_two}: expected 404, got {status}");
+    }
+    check_watcher_saw_delete(&name_two, &env.ev_rx, &p2)?;
 
-    // Always try to clean up the mutables, regardless of test outcome.
+    Ok(())
+}
+
+/// Tear down the mount, dispatcher, HTTP server, and watcher; best-effort
+/// delete of any mutable messages still on Telegram.
+async fn teardown_mutation_env(env: MutationEnv, client: &Client, peer: PeerRef) {
+    let MutationEnv {
+        bg, dispatcher_task, http_task, watcher, mutable_ids, ..
+    } = env;
     if !mutable_ids.is_empty() {
         info!("post-test cleanup: removing {} leftover mutable msg(s)", mutable_ids.len());
         if let Err(e) = client.invoke(&tl::functions::channels::DeleteMessages {
@@ -1103,7 +1138,6 @@ async fn run_mutation_test(
     dispatcher_task.abort();
     http_task.abort();
     shutdown_fuse(bg, MOUNT_PATH).await;
-    outcome
 }
 
 /// Watcher-event check after a confirmed delete.
@@ -1434,19 +1468,48 @@ async fn main() -> anyhow::Result<()> {
     }).await;
 
     // ----- realtime mutations + native fs watcher --------------------------
-    // The mutation test consumes `updates_rx`, so it can only run once and
-    // must be moved into the closure.
+    // `updates_rx` can only be consumed once, and we want two separate test
+    // entries to exercise the realtime path: one that mutates immediately
+    // after setup, and one that mutates after the dispatcher has been idle
+    // for a minute. Share the env across both via a single Option cell:
+    // the first test sets up + mutates + parks the env; the second takes
+    // the env, idles, mutates, and tears down.
     let mut updates_rx_opt = Some(updates_rx);
+    let env_cell: Arc<tokio::sync::Mutex<Option<MutationEnv>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let env_cell_a = Arc::clone(&env_cell);
     runner.run("integration::realtime_mutations", || async {
         let rx = updates_rx_opt.take().expect("realtime_mutations runs at most once");
-        run_mutation_test(
-            client.clone(),
-            &cfg,
-            &spec.name,
-            peer,
-            Arc::clone(&zip_cache),
-            rx,
-        ).await
+        let mut env = setup_mutation_env(
+            client.clone(), &cfg, &spec.name, Arc::clone(&zip_cache), rx,
+        ).await?;
+        let outcome = do_mutation_round(&mut env, &client, peer, "mut").await;
+        if outcome.is_err() {
+            // Don't strand the mount + dispatcher if this round failed —
+            // the second test would just immediately bail on missing env.
+            teardown_mutation_env(env, &client, peer).await;
+        } else {
+            *env_cell_a.lock().await = Some(env);
+        }
+        outcome
+    }).await;
+
+    // Idle for 60s after the first round's mutations, then run another
+    // add/delete round. This exercises the realtime pipeline's ability to
+    // keep delivering updates after the connection has been idle, which is
+    // where transport-level heartbeats and reconnect logic come into play.
+    let env_cell_b = Arc::clone(&env_cell);
+    runner.run("integration::realtime_mutations_after_idle", || async {
+        let mut guard = env_cell_b.lock().await;
+        let mut env = guard.take().ok_or_else(|| anyhow!(
+            "realtime env unavailable (setup in realtime_mutations failed?)"
+        ))?;
+        info!("idling 60s before next mutation round…");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let outcome = do_mutation_round(&mut env, &client, peer, "idle").await;
+        teardown_mutation_env(env, &client, peer).await;
+        outcome
     }).await;
 
     info!("all variants completed");
