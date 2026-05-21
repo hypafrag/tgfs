@@ -27,12 +27,12 @@ use tgfs::login::connect_and_authorize_with_session;
 use args::{default_config_path, default_session_path, parse_args, DirMode};
 use ffmpeg::{
     build_encode_args, ffmpeg_in_path, ffprobe_in_path,
+    generate_test_thumbnails,
     run_encoded_album_fmp4, run_encoded_video,
     run_leading_moov_pipeline, run_leading_moov_album_pipeline,
-    thumbnail_args,
 };
 use tgfs::config::Streamification;
-use plan::{apply_encode_video_to_tvshow_plan, collect_path, find_channel, group_into_albums, plan_has_video, print_plan, UploadItem};
+use plan::{apply_encode_video_to_tvshow_plan, collect_path, find_channel, group_into_albums, plan_has_video, print_plan, PartSource, UploadItem};
 use progress::{set_bar_style, set_prefix_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
@@ -108,28 +108,33 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     // When omitted, connect now and show the interactive picker — its return
     // value gives us both the display name and the resolved PeerRef, so we
     // skip the redundant title-walk in resolve_channel_peer afterwards.
+    // When --test-thumbnails is set, skip Telegram entirely.
     let (channel_name, channel_entry, picked_peer, picked_client): (
         String,
         Option<&tgfs::config::ChannelEntry>,
         Option<_>,
         Option<_>,
-    ) = match &args.channel {
-        Some(name) => {
-            let entry = find_channel(&config, name).ok_or_else(|| {
-                anyhow!("channel '{}' is not defined in {}", name, config_path.display())
-            })?;
-            (name.clone(), Some(entry), None, None)
-        }
-        None => {
-            if args.dry_run {
-                bail!("--dry-run requires -c/--channel; the interactive picker needs a live Telegram connection");
+    ) = if args.test_thumbnails.is_some() && args.channel.is_none() {
+        (String::new(), None, None, None)
+    } else {
+        match &args.channel {
+            Some(name) => {
+                let entry = find_channel(&config, name).ok_or_else(|| {
+                    anyhow!("channel '{}' is not defined in {}", name, config_path.display())
+                })?;
+                (name.clone(), Some(entry), None, None)
             }
-            println!("Connecting to Telegram to populate destination picker...");
-            let (client, _rx) =
-                connect_and_authorize_with_session(&config, &session_path.to_string_lossy()).await?;
-            let (name, peer) = picker::pick_destination(&client, &config).await?;
-            let entry = find_channel(&config, &name);
-            (name, entry, Some(peer), Some(client))
+            None => {
+                if args.dry_run {
+                    bail!("--dry-run requires -c/--channel; the interactive picker needs a live Telegram connection");
+                }
+                println!("Connecting to Telegram to populate destination picker...");
+                let (client, _rx) =
+                    connect_and_authorize_with_session(&config, &session_path.to_string_lossy()).await?;
+                let (name, peer) = picker::pick_destination(&client, &config).await?;
+                let entry = find_channel(&config, &name);
+                (name, entry, Some(peer), Some(client))
+            }
         }
     };
     let policy = channel_entry
@@ -137,7 +142,6 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     let encode_args = build_encode_args(&config.ffmpeg.encode_args);
-    let thumb_args = thumbnail_args();
 
     let cwd = std::env::current_dir()
         .context("can't determine current working directory")?
@@ -159,6 +163,59 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
 
     if args.album {
         plan = group_into_albums(plan);
+    }
+
+    // --test-thumbnails: extract candidates for all video items, write them to
+    // the given directory, print which was selected, then exit.
+    if let Some(thumb_dir) = &args.test_thumbnails {
+        if !ffmpeg_in_path() {
+            bail!("--test-thumbnails requires ffmpeg on $PATH (not found)");
+        }
+        std::fs::create_dir_all(thumb_dir)
+            .with_context(|| format!("creating thumbnail output dir '{}'", thumb_dir.display()))?;
+        std::fs::create_dir_all(ffmpeg::SCRATCH_DIR)
+            .with_context(|| format!("create_dir_all {}", ffmpeg::SCRATCH_DIR))?;
+        for item in &plan {
+            match item {
+                UploadItem::EncodedVideo { source, doc_filename, .. } => {
+                    generate_test_thumbnails(source, thumb_dir, doc_filename).await?;
+                }
+                UploadItem::EncodedAlbum { parts } => {
+                    for part in parts {
+                        let PartSource::File(path) = &part.src;
+                        generate_test_thumbnails(path, thumb_dir, &part.doc_filename).await?;
+                    }
+                }
+                UploadItem::FileAlbum { parts } => {
+                    for part in parts {
+                        let PartSource::File(path) = &part.src;
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        if matches!(ext.to_lowercase().as_str(), "mp4" | "avi" | "mkv" | "mov" | "webm" | "flv" | "wmv") {
+                            generate_test_thumbnails(path, thumb_dir, &part.doc_filename).await?;
+                        }
+                    }
+                }
+                UploadItem::Single(part) => {
+                    let PartSource::File(path) = &part.src;
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if matches!(ext.to_lowercase().as_str(), "mp4" | "avi" | "mkv" | "mov" | "webm" | "flv" | "wmv") {
+                        generate_test_thumbnails(path, thumb_dir, &part.doc_filename).await?;
+                    }
+                }
+                UploadItem::SuffixParts { parts, .. } => {
+                    if let Some(first) = parts.first() {
+                        let PartSource::File(path) = &first.src;
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        if matches!(ext.to_lowercase().as_str(), "mp4" | "avi" | "mkv" | "mov" | "webm" | "flv" | "wmv") {
+                            generate_test_thumbnails(path, thumb_dir, &first.doc_filename).await?;
+                        }
+                    }
+                }
+                UploadItem::AlbumParts { .. } => {}
+            }
+        }
+        println!("Thumbnails written to '{}'", thumb_dir.display());
+        return Ok(());
     }
 
     // Warn once before the plan: when the plan contains video files but
@@ -234,7 +291,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     if let Some(ref upload_pb) = upload_pb {
         run_leading_moov_pipeline(
             &client, peer, &encode_args, config.ffmpeg.encode_args.video.vres,
-            &thumb_args, &plan, &mp, &file_pb, upload_pb, &total_pb,
+            &plan, &mp, &file_pb, upload_pb, &total_pb,
         ).await?;
     } else {
         for item in plan.iter() {
@@ -264,7 +321,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                         run_leading_moov_album_pipeline(
                             &client, peer, parts,
                             &encode_args, config.ffmpeg.encode_args.video.vres,
-                            &thumb_args, &mp, &file_pb, &total_pb,
+                            &mp, &file_pb, &total_pb,
                         ).await?;
                         completed_files += parts.len();
                     } else {
@@ -276,7 +333,7 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                         run_encoded_album_fmp4(
                             &client, peer, parts,
                             &encode_args, config.ffmpeg.encode_args.video.vres,
-                            &thumb_args, &mp, &file_pb, &total_pb,
+                            &mp, &file_pb, &total_pb,
                             || {
                                 local_done += 1;
                                 total_pb_for_tally.set_message(format!("TOTAL {}/{}", local_done, total_files_c));
@@ -290,7 +347,6 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
                         &client, peer,
                         streamification,
                         &encode_args, config.ffmpeg.encode_args.video.vres,
-                        &thumb_args,
                         item, &mp, &file_pb, &total_pb,
                     ).await?;
                     completed_files += 1;

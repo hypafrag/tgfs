@@ -105,21 +105,159 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     a
 }
 
-/// Hardcoded thumbnail-extraction args. Excludes B-frames, picks the most
-/// representative frame via `thumbnail=1440` (histogram-based, naturally avoids
-/// black frames), then downscales to fit a 512x512 box without upscaling.
-pub fn thumbnail_args() -> Vec<String> {
-    [
-        "-vf",
-        "select=not(eq(pict_type\\,B)),thumbnail=1440,scale=512:512:force_original_aspect_ratio=decrease,hue=s=0",
-        "-frames:v",
-        "1",
-        "-q:v",
-        "5",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+/// Sample one non-B frame every this many seconds from the start of the video.
+const THUMB_INTERVAL_SECS: f64 = 2.0;
+/// Only sample within the first this many seconds.
+const THUMB_WINDOW_SECS: u32 = 60;
+/// Maximum candidates (THUMB_WINDOW_SECS / THUMB_INTERVAL_SECS).
+const THUMB_MAX_CANDIDATES: usize = (THUMB_WINDOW_SECS as f64 / THUMB_INTERVAL_SECS) as usize;
+/// Discard candidates whose sharpness score is below this fraction of the best score.
+const THUMB_SCORE_THRESHOLD: f64 = 0.5;
+
+/// One scored thumbnail candidate.
+struct ThumbCandidate {
+    /// Timestamp in seconds (approx: index × THUMB_INTERVAL_SECS).
+    timestamp_secs: f64,
+    /// JPEG bytes.
+    bytes: Vec<u8>,
+    /// Laplacian variance (higher = sharper).
+    score: f64,
+}
+
+/// Run ffmpeg once to extract one non-B frame every `THUMB_INTERVAL_SECS` seconds
+/// from the first `THUMB_WINDOW_SECS` seconds, writing them as `thumb_NNN.jpg`
+/// under `out_dir`. Returns scored candidates.
+async fn generate_thumbnail_candidates(input: &Path, out_dir: &Path) -> anyhow::Result<Vec<ThumbCandidate>> {
+    let vf = "select=not(eq(pict_type\\,B)),fps=0.5,scale=512:512:force_original_aspect_ratio=decrease,hue=s=0";
+    let pattern = out_dir.join("thumb_%03d.jpg");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-nostdin")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(input)
+        .arg("-t").arg(THUMB_WINDOW_SECS.to_string())
+        .arg("-vf").arg(vf)
+        .arg("-q:v").arg("5")
+        .arg(pattern);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output().await.context("failed to spawn ffmpeg for thumbnails")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg thumbnail extraction failed: {}", err.trim());
+    }
+
+    let mut candidates = Vec::new();
+    for i in 0..THUMB_MAX_CANDIDATES {
+        let p = out_dir.join(format!("thumb_{:03}.jpg", i + 1));
+        if !p.exists() { break; }
+        let bytes = std::fs::read(&p)
+            .with_context(|| format!("reading thumbnail candidate '{}'", p.display()))?;
+        let score = laplacian_variance(&bytes);
+        candidates.push(ThumbCandidate {
+            timestamp_secs: i as f64 * THUMB_INTERVAL_SECS,
+            bytes,
+            score,
+        });
+    }
+    Ok(candidates)
+}
+
+/// From a list of scored candidates, discard those significantly below the best
+/// score, then return the index of the sharpest remaining candidate.
+fn select_best_candidate(candidates: &[ThumbCandidate]) -> usize {
+    let best_score = candidates.iter().map(|c| c.score).fold(0.0f64, f64::max);
+    let threshold = best_score * THUMB_SCORE_THRESHOLD;
+    candidates.iter().enumerate()
+        .filter(|(_, c)| c.score >= threshold)
+        .max_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Compute the Laplacian variance of a JPEG image as a sharpness metric.
+/// Higher = sharper. Returns 0.0 on decode error.
+fn laplacian_variance(jpeg_bytes: &[u8]) -> f64 {
+    let img = match image::load_from_memory(jpeg_bytes) {
+        Ok(i) => i,
+        Err(_) => return 0.0,
+    };
+    let luma = img.to_luma8();
+    let (w, h) = luma.dimensions();
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let pixels = luma.as_raw();
+    let w = w as usize;
+    let h = h as usize;
+    let mut sum: f64 = 0.0;
+    let mut sum_sq: f64 = 0.0;
+    let mut count: usize = 0;
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let center  = pixels[y * w + x] as i32;
+            let top     = pixels[(y - 1) * w + x] as i32;
+            let bottom  = pixels[(y + 1) * w + x] as i32;
+            let left    = pixels[y * w + (x - 1)] as i32;
+            let right   = pixels[y * w + (x + 1)] as i32;
+            let l = (top + bottom + left + right - 4 * center) as f64;
+            sum    += l;
+            sum_sq += l * l;
+            count  += 1;
+        }
+    }
+    if count == 0 { return 0.0; }
+    let n = count as f64;
+    let mean = sum / n;
+    (sum_sq / n) - (mean * mean)
+}
+
+/// Sample frames every `THUMB_INTERVAL_SECS` from the first `THUMB_WINDOW_SECS`,
+/// discard those significantly below the sharpest, return the best JPEG bytes.
+pub async fn pick_best_thumbnail(input: &Path, candidate_dir: &Path) -> anyhow::Result<Vec<u8>> {
+    let candidates = generate_thumbnail_candidates(input, candidate_dir).await?;
+    if candidates.is_empty() {
+        anyhow::bail!("ffmpeg produced no thumbnail candidates for '{}'", input.display());
+    }
+    let best_idx = select_best_candidate(&candidates);
+    Ok(candidates.into_iter().nth(best_idx).unwrap().bytes)
+}
+
+/// For `--test-thumbnails`: extract candidates, write the selected one to
+/// `out_dir/<prefix>.jpg`, print per-frame scores, return selected index.
+pub async fn generate_test_thumbnails(input: &Path, out_dir: &Path, prefix: &str) -> anyhow::Result<usize> {
+    let tmp_dir = PathBuf::from(SCRATCH_DIR).join(format!(
+        "thumb_candidates_{}",
+        input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("creating temp thumb dir '{}'", tmp_dir.display()))?;
+
+    let result = async {
+        let candidates = generate_thumbnail_candidates(input, &tmp_dir).await?;
+        if candidates.is_empty() {
+            anyhow::bail!("ffmpeg produced no thumbnail candidates for '{}'", input.display());
+        }
+        let best_idx = select_best_candidate(&candidates);
+        let best_score = candidates[best_idx].score;
+        let threshold = best_score * THUMB_SCORE_THRESHOLD;
+
+        println!("'{}':", prefix);
+        for (i, c) in candidates.iter().enumerate() {
+            let selected = i == best_idx;
+            let discarded = c.score < threshold && !selected;
+            let marker = if selected { " ← selected" } else if discarded { " (discarded)" } else { "" };
+            println!("  t={:3.0}s  score={:6.1}{}", c.timestamp_secs, c.score, marker);
+        }
+
+        let dest = out_dir.join(format!("{}.jpg", prefix));
+        std::fs::write(&dest, &candidates[best_idx].bytes)
+            .with_context(|| format!("writing thumbnail to '{}'", dest.display()))?;
+        Ok(best_idx)
+    }.await;
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    result
 }
 
 pub fn ffmpeg_in_path() -> bool { tool_in_path("ffmpeg") }
@@ -213,98 +351,48 @@ fn tool_in_path(name: &str) -> bool {
 //     }
 // }
 
-/// Run ffmpeg with the given args, capturing all of stdout into memory. The
-/// `progress_pb` is updated as bytes arrive on stdout. ffmpeg's stderr is
-/// captured into a string and surfaced on failure.
-async fn run_ffmpeg_to_buffer(
-    input: &Path,
-    extra_args: &[String],
-    output_format_args: &[&str],
-    progress_pb: &ProgressBar,
-    progress_label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-nostdin")
-        .arg("-loglevel").arg("error")
-        .arg("-i").arg(input);
-    for a in extra_args { cmd.arg(a); }
-    for a in output_format_args { cmd.arg(a); }
-    cmd.arg("pipe:1");
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
-    let mut stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
-
-    set_spinner_style(progress_pb);
-    progress_pb.set_position(0);
-    set_label(progress_pb, progress_label.to_string());
-
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = stdout.read(&mut chunk).await.context("reading ffmpeg stdout")?;
-        if n == 0 { break; }
-        buf.extend_from_slice(&chunk[..n]);
-        progress_pb.set_position(buf.len() as u64);
-    }
-    let status = child.wait().await.context("waiting for ffmpeg")?;
-    if !status.success() {
-        let mut err = String::new();
-        stderr.read_to_string(&mut err).await.ok();
-        bail!("ffmpeg exited with status {}: {}", status, err.trim());
-    }
-    progress_pb.disable_steady_tick();
-    Ok(buf)
-}
 
 async fn make_thumbnail_to_buffer(
     input: &Path,
-    thumbnail_args: &[String],
     progress_pb: &ProgressBar,
 ) -> anyhow::Result<Vec<u8>> {
     let label = format!(
         "thumbnail {}",
         input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
     );
-    // `-f mjpeg pipe:1` emits raw JPEG bytes on stdout; combined with
-    // `-frames:v 1` from the thumbnail args this is exactly one image.
-    run_ffmpeg_to_buffer(input, thumbnail_args, &["-f", "mjpeg"], progress_pb, &label).await
+    set_spinner_style(progress_pb);
+    progress_pb.set_position(0);
+    set_label(progress_pb, label);
+
+    let tmp_dir = PathBuf::from(SCRATCH_DIR).join(format!(
+        "thumb_candidates_{}",
+        input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("creating temp thumb dir '{}'", tmp_dir.display()))?;
+    let result = pick_best_thumbnail(input, &tmp_dir).await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    progress_pb.disable_steady_tick();
+    result
 }
 
-/// Headless thumbnail extraction — same `-f mjpeg pipe:1` invocation as the
-/// re-encode path but without touching any progress bar. Used by the plain
-/// upload path to attach a thumbnail to videos that weren't going through
-/// ffmpeg in the first place. Returns the raw JPEG bytes (suitable for
-/// `upload_thumb`).
+/// Headless thumbnail extraction — picks the sharpest of up to
+/// `THUMB_CANDIDATES` candidates without touching any progress bar. Used by the
+/// plain upload path to attach a thumbnail to videos that weren't going through
+/// ffmpeg re-encoding. Returns the raw JPEG bytes (suitable for `upload_thumb`).
 pub async fn make_thumbnail_silent(input: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-nostdin")
-        .arg("-loglevel").arg("error")
-        .arg("-i").arg(input);
-    for a in thumbnail_args() { cmd.arg(a); }
-    cmd.arg("-f").arg("mjpeg").arg("pipe:1");
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("failed to spawn ffmpeg for thumbnail")?;
-    let mut stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = stdout.read(&mut chunk).await.context("reading ffmpeg thumbnail stdout")?;
-        if n == 0 { break; }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let status = child.wait().await.context("waiting for ffmpeg thumbnail")?;
-    if !status.success() {
-        let mut err = String::new();
-        stderr.read_to_string(&mut err).await.ok();
-        bail!("ffmpeg thumbnail exited with status {}: {}", status, err.trim());
-    }
-    Ok(buf)
+    std::fs::create_dir_all(SCRATCH_DIR)
+        .with_context(|| format!("create_dir_all {SCRATCH_DIR}"))?;
+    let tmp_dir = PathBuf::from(SCRATCH_DIR).join(format!(
+        "thumb_candidates_{}",
+        input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("creating temp thumb dir '{}'", tmp_dir.display()))?;
+    let result = pick_best_thumbnail(input, &tmp_dir).await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    result
 }
 
 /// Run `ffprobe` against a source video file and extract `(duration, width,
@@ -372,7 +460,6 @@ async fn encode_via_pipe_and_upload(
     source_size: u64,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     streamable: bool,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -384,7 +471,7 @@ async fn encode_via_pipe_and_upload(
     });
     let scale_args = compute_scale_args(&video_info, vres);
 
-    let thumb_bytes = make_thumbnail_to_buffer(src, thumbnail_args, file_pb).await?;
+    let thumb_bytes = make_thumbnail_to_buffer(src, file_pb).await?;
     let thumb = upload_thumb(client, thumb_bytes, doc_filename).await?;
 
     let duration_us = duration_us_of(&video_info);
@@ -478,7 +565,6 @@ pub async fn encode_and_upload_for_album(
     src: &Path,
     doc_filename: &str,
     encode_args: &[String],
-    thumbnail_args: &[String],
     vres: u32,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -486,7 +572,7 @@ pub async fn encode_and_upload_for_album(
 ) -> anyhow::Result<(grammers_client::media::Uploaded, Option<VideoInfo>, grammers_client::media::Uploaded)> {
     let (files, video_info, thumb) = encode_via_pipe_and_upload(
         client, mp, src, doc_filename, source_size,
-        encode_args, vres, thumbnail_args,
+        encode_args, vres,
         true, file_pb, total_pb, false,
     ).await?;
     if files.len() != 1 {
@@ -862,7 +948,6 @@ pub async fn run_encoded_album_fmp4(
     parts: &[UploadPart],
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     mp: &MultiProgress,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -873,7 +958,7 @@ pub async fn run_encoded_album_fmp4(
         let PartSource::File(src) = &part.src;
         let (uploaded, video_info, thumb) = encode_and_upload_for_album(
             client, mp, src, &part.doc_filename,
-            encode_args, thumbnail_args,
+            encode_args,
             vres, file_pb, total_pb, part.size,
         ).await.with_context(|| format!("encoding '{}'", src.display()))?;
         let mut media = InputMedia::new()
@@ -904,7 +989,6 @@ pub async fn run_encoded_video(
     streamification: Streamification,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     item: &UploadItem,
     mp: &MultiProgress,
     file_pb: &ProgressBar,
@@ -913,7 +997,7 @@ pub async fn run_encoded_video(
     let spec = EncodedVideoSpec::from_item(item);
     if matches!(streamification, Streamification::LeadingMoov) {
         run_encoded_video_leading_moov(
-            client, peer, spec, encode_args, vres, thumbnail_args,
+            client, peer, spec, encode_args, vres,
             mp, file_pb, total_pb,
         ).await
     } else {
@@ -922,7 +1006,7 @@ pub async fn run_encoded_video(
         let streamable = streamification != Streamification::None;
         let (files, video_info, thumb) = encode_via_pipe_and_upload(
             client, mp, &spec.source, &spec.doc_filename, spec.source_size,
-            encode_args, vres, thumbnail_args,
+            encode_args, vres,
             streamable, file_pb, total_pb, allow_multipart,
         ).await?;
         file_pb.set_position(spec.source_size);
@@ -946,7 +1030,6 @@ async fn run_encoded_video_leading_moov(
     spec: EncodedVideoSpec,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     mp: &MultiProgress,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -959,7 +1042,7 @@ async fn run_encoded_video_leading_moov(
     });
     let scale_args = compute_scale_args(&video_info, vres);
 
-    let thumb_bytes = make_thumbnail_to_buffer(&source, thumbnail_args, file_pb).await?;
+    let thumb_bytes = make_thumbnail_to_buffer(&source, file_pb).await?;
     let thumb = upload_thumb(client, thumb_bytes, &doc_filename).await?;
 
     let duration_us = duration_us_of(&video_info);
@@ -1092,7 +1175,6 @@ async fn encode_source_to_scratch(
     source_size: u64,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     encode_pb: &ProgressBar,
     total_pb: &ProgressBar,
     encoded_bytes: Arc<AtomicU64>,
@@ -1103,7 +1185,7 @@ async fn encode_source_to_scratch(
     });
     let scale_args = compute_scale_args(&video_info, vres);
 
-    let thumb_bytes = make_thumbnail_to_buffer(src, thumbnail_args, encode_pb).await?;
+    let thumb_bytes = make_thumbnail_to_buffer(src, encode_pb).await?;
     let thumb = upload_thumb(client, thumb_bytes, doc_filename).await?;
 
     let duration_us = duration_us_of(&video_info);
@@ -1155,7 +1237,6 @@ pub async fn encode_to_scratch(
     client: &Client,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     item: &UploadItem,
     encode_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -1166,7 +1247,7 @@ pub async fn encode_to_scratch(
 
     let out = encode_source_to_scratch(
         client, &source, &doc_filename, source_size,
-        encode_args, vres, thumbnail_args, encode_pb, total_pb, encoded_bytes,
+        encode_args, vres, encode_pb, total_pb, encoded_bytes,
     ).await?;
 
     Ok(EncodedJob {
@@ -1238,7 +1319,6 @@ pub async fn run_leading_moov_pipeline(
     peer: PeerRef,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     plan: &[UploadItem],
     mp: &MultiProgress,
     encode_pb: &ProgressBar,
@@ -1303,7 +1383,7 @@ pub async fn run_leading_moov_pipeline(
     let mut encoder_err: Option<anyhow::Error> = None;
     for item in plan.iter() {
         match encode_to_scratch(
-            client, encode_args, vres, thumbnail_args, item, encode_pb, total_pb,
+            client, encode_args, vres, item, encode_pb, total_pb,
             encoded_bytes.clone(),
         ).await {
             Ok(job) => {
@@ -1350,7 +1430,6 @@ async fn encode_album_part_to_scratch(
     part: &UploadPart,
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     encode_pb: &ProgressBar,
     total_pb: &ProgressBar,
     encoded_bytes: Arc<AtomicU64>,
@@ -1361,7 +1440,7 @@ async fn encode_album_part_to_scratch(
 
     let out = encode_source_to_scratch(
         client, src, &doc_filename, source_size,
-        encode_args, vres, thumbnail_args, encode_pb, total_pb, encoded_bytes,
+        encode_args, vres, encode_pb, total_pb, encoded_bytes,
     ).await?;
 
     Ok(EncodedAlbumPart {
@@ -1435,7 +1514,6 @@ pub async fn run_leading_moov_album_pipeline(
     parts: &[UploadPart],
     encode_args: &[String],
     vres: u32,
-    thumbnail_args: &[String],
     mp: &MultiProgress,
     file_pb: &ProgressBar,
     total_pb: &ProgressBar,
@@ -1493,7 +1571,7 @@ pub async fn run_leading_moov_album_pipeline(
     let mut encoder_err: Option<anyhow::Error> = None;
     for part in parts.iter() {
         match encode_album_part_to_scratch(
-            client, part, encode_args, vres, thumbnail_args,
+            client, part, encode_args, vres,
             file_pb, total_pb, encoded_bytes.clone(),
         ).await {
             Ok(job) => {

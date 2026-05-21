@@ -25,6 +25,9 @@ pub struct Args {
     pub album: bool,
     pub tvshow: bool,
     pub paths: Vec<PathBuf>,
+    /// `--test-thumbnails <dir>`: write thumbnail candidates to this directory
+    /// and exit without connecting to Telegram.
+    pub test_thumbnails: Option<PathBuf>,
 }
 
 /// Path to `~/.config/tgfs/`. Falls back to the current directory when `HOME`
@@ -94,6 +97,11 @@ fn print_usage() {
              never written to a temporary file. Requires\n                          \
              ffmpeg on PATH.\n  \
            --dry-run              Print the plan and exit.\n  \
+           --test-thumbnails <dir>\n                          \
+             Build the plan, extract thumbnail candidates for\n                          \
+             all video items, write them to <dir> with the\n                          \
+             selected (sharpest) one labeled, then exit without\n                          \
+             connecting to Telegram.\n  \
            --config <path>        Config file (default:\n                          \
              ~/.config/tgfs/tgfs.yml). The auth session is\n                          \
              also stored next to the default config at\n                          \
@@ -110,6 +118,7 @@ pub fn parse_args() -> anyhow::Result<Args> {
     let mut encode_video = false;
     let mut album = false;
     let mut tvshow = false;
+    let mut test_thumbnails: Option<PathBuf> = None;
     let mut paths: Vec<PathBuf> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -128,6 +137,10 @@ pub fn parse_args() -> anyhow::Result<Args> {
             "--encode-video" => encode_video = true,
             "-a" | "--album" => album = true,
             "--tvshow" => tvshow = true,
+            "--test-thumbnails" => {
+                let v = args.next().ok_or_else(|| anyhow!("--test-thumbnails requires a directory path"))?;
+                test_thumbnails = Some(PathBuf::from(v));
+            }
             other if other.starts_with("--channel=") => {
                 channel = Some(other.trim_start_matches("--channel=").to_string());
             }
@@ -148,5 +161,5 @@ pub fn parse_args() -> anyhow::Result<Args> {
             bail!("--tvshow is incompatible with -d caption|zip");
         }
     }
-    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, album, tvshow, paths })
+    Ok(Args { config_path, channel, dir_mode, dry_run, encode_video, album, tvshow, paths, test_thumbnails })
 }
