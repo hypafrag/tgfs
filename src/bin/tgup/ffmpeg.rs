@@ -105,13 +105,13 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
     a
 }
 
-/// Hardcoded thumbnail-extraction args. Picks a representative frame
-/// (`thumbnail=100` evaluates 100 frames and keeps the most distinctive)
-/// then downscales to fit a 320x320 box without upscaling.
+/// Hardcoded thumbnail-extraction args. Excludes B-frames, picks the most
+/// representative frame via `thumbnail=1440` (histogram-based, naturally avoids
+/// black frames), then downscales to fit a 512x512 box without upscaling.
 pub fn thumbnail_args() -> Vec<String> {
     [
         "-vf",
-        "select=gt(scene\\,0.4),thumbnail=100,scale=512:512:force_original_aspect_ratio=decrease,hue=s=0",
+        "select=not(eq(pict_type\\,B)),thumbnail=1440,scale=512:512:force_original_aspect_ratio=decrease,hue=s=0",
         "-frames:v",
         "1",
         "-q:v",
