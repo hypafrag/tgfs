@@ -111,7 +111,7 @@ pub fn build_encode_args(cfg: &EncodeArgs) -> Vec<String> {
 pub fn thumbnail_args() -> Vec<String> {
     [
         "-vf",
-        "thumbnail=100,scale=320:320:force_original_aspect_ratio=decrease,hue=s=0",
+        "select=gt(scene\\,0.4),thumbnail=100,scale=512:512:force_original_aspect_ratio=decrease,hue=s=0",
         "-frames:v",
         "1",
         "-q:v",
