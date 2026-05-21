@@ -58,8 +58,10 @@ impl Dispatcher {
         Self { client, state, zip_cache, fs, channel_id_to_name, channel_to_dir }
     }
 
-    /// Subscribe to Telegram updates and process them until the stream errors.
-    /// Intended to run as a long-lived `tokio::spawn` task.
+    /// Subscribe to Telegram updates and process them until the inner updates
+    /// channel is permanently closed. Transient connection errors (e.g. MTProxy
+    /// bridge reset) are retried after a brief delay because `UpdateStream::next`
+    /// returns via `&mut self` and the inner `mpsc::Receiver` stays alive.
     pub async fn run(self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
         let mut stream = self
             .client
@@ -74,8 +76,8 @@ impl Dispatcher {
                     }
                 }
                 Err(e) => {
-                    warn!("realtime: update stream ended: {:?}", e);
-                    return;
+                    warn!("realtime: update stream error: {:?}, retrying in 5s", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
