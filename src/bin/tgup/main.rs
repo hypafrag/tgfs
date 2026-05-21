@@ -361,6 +361,10 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     if let Some(pb) = upload_pb { pb.finish_with_message("done"); }
     total_pb.finish();
     println!("All uploads complete.");
+    // Tear down grammers' sender pool cleanly. Without this, dropping the
+    // tokio runtime cancels its background tasks mid-poll and one of them
+    // panics on the resulting `JoinError::Cancelled`.
+    client.disconnect();
     Ok(())
 }
 
