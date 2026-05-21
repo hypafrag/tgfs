@@ -453,7 +453,10 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                 })
                 .await
                 .with_context(|| format!("saveBigFilePart {}", part_idx_c))
-                .map(|_| ());
+                .and_then(|ok| {
+                    if ok { Ok(()) }
+                    else { Err(anyhow::anyhow!("saveBigFilePart {} returned false", part_idx_c)) }
+                });
             if res.is_ok() {
                 if let (Some(bf), Some(bp), Some(up), Some(tu)) =
                     (vb_buf_fill, vb_buf_pb, vb_upload_pb, vb_total_uploaded)
