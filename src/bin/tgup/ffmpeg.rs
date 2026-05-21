@@ -112,7 +112,7 @@ const THUMB_WINDOW_SECS: u32 = 60;
 /// Maximum candidates (THUMB_WINDOW_SECS / THUMB_INTERVAL_SECS).
 const THUMB_MAX_CANDIDATES: usize = (THUMB_WINDOW_SECS as f64 / THUMB_INTERVAL_SECS) as usize;
 /// Discard candidates whose sharpness score is below this fraction of the best score.
-const THUMB_SCORE_THRESHOLD: f64 = 0.5;
+const THUMB_SCORE_THRESHOLD: f64 = 0.7;
 
 /// One scored thumbnail candidate.
 struct ThumbCandidate {
@@ -163,8 +163,8 @@ async fn generate_thumbnail_candidates(input: &Path, out_dir: &Path) -> anyhow::
     Ok(candidates)
 }
 
-/// From a list of scored candidates, discard those significantly below the best
-/// score, then return the index of the sharpest remaining candidate.
+/// Discard candidates below `THUMB_SCORE_THRESHOLD * best_score`,
+/// then return the index of the sharpest remaining candidate.
 fn select_best_candidate(candidates: &[ThumbCandidate]) -> usize {
     let best_score = candidates.iter().map(|c| c.score).fold(0.0f64, f64::max);
     let threshold = best_score * THUMB_SCORE_THRESHOLD;
@@ -239,10 +239,10 @@ pub async fn generate_test_thumbnails(input: &Path, out_dir: &Path, prefix: &str
             anyhow::bail!("ffmpeg produced no thumbnail candidates for '{}'", input.display());
         }
         let best_idx = select_best_candidate(&candidates);
-        let best_score = candidates[best_idx].score;
+        let best_score = candidates.iter().map(|c| c.score).fold(0.0f64, f64::max);
         let threshold = best_score * THUMB_SCORE_THRESHOLD;
 
-        println!("'{}':", prefix);
+        println!("'{}' (threshold={:.1}):", prefix, threshold);
         for (i, c) in candidates.iter().enumerate() {
             let selected = i == best_idx;
             let discarded = c.score < threshold && !selected;
