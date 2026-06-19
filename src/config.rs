@@ -80,34 +80,45 @@ pub struct ProxyConfig {
     pub proxy_type: ProxyType,
 }
 
-/// Logging configuration from `tgfs.yml`.
-///
-/// Either a bare level string (`log: debug`) or a per-module map:
-/// ```yaml
-/// log:
-///   tgfs: debug
-///   grammers_mtsender: warn
-/// ```
+/// Log level: either a bare string (`level: debug`) or a per-module map.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
-pub enum LogConfig {
+pub enum LogLevel {
     /// Global level (e.g. `"debug"`, `"trace"`).
-    Level(String),
+    Global(String),
     /// Per-module directives, each value a level string.
     Modules(HashMap<String, String>),
 }
 
-impl LogConfig {
+impl LogLevel {
     /// Convert to an `env_logger` filter string (e.g. `"tgfs=debug,grammers_mtsender=warn"`).
     pub fn to_filter_string(&self) -> String {
         match self {
-            LogConfig::Level(l) => l.clone(),
-            LogConfig::Modules(map) => map.iter()
+            LogLevel::Global(l) => l.clone(),
+            LogLevel::Modules(map) => map.iter()
                 .map(|(module, level)| format!("{}={}", module, level))
                 .collect::<Vec<_>>()
                 .join(","),
         }
     }
+}
+
+/// Logging configuration block under `log:` in `tgfs.yml`:
+/// ```yaml
+/// log:
+///   level:
+///     tgfs: debug
+///     grammers_mtsender: warn
+///   file: /tmp/tgup.log
+/// ```
+#[derive(Deserialize, Clone, Default)]
+pub struct LogConfig {
+    #[serde(default)]
+    pub level: Option<LogLevel>,
+    /// Path to a log file. When set, tgup appends log lines there in addition
+    /// to the terminal.
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 /// ffmpeg invocation parameters used by `tgup --encode-video`. The actual

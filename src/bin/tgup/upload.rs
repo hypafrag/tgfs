@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
+use log::{debug, warn};
 use grammers_client::Client;
 use grammers_client::media::{Attribute, InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
@@ -454,8 +455,13 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
                 .await
                 .with_context(|| format!("saveBigFilePart {}", part_idx_c))
                 .and_then(|ok| {
-                    if ok { Ok(()) }
-                    else { Err(anyhow::anyhow!("saveBigFilePart {} returned false", part_idx_c)) }
+                    if ok {
+                        debug!("saveBigFilePart {} ok (file_id={}, total_parts={})", part_idx_c, file_id_c, tparam);
+                        Ok(())
+                    } else {
+                        warn!("saveBigFilePart {} returned false (file_id={}, total_parts={})", part_idx_c, file_id_c, tparam);
+                        Err(anyhow::anyhow!("saveBigFilePart {} returned false", part_idx_c))
+                    }
                 });
             if res.is_ok() {
                 if let (Some(bf), Some(bp), Some(up), Some(tu)) =
@@ -550,6 +556,7 @@ pub async fn upload_one_big_file<R: AsyncRead + Unpin>(
     if part_idx == 0 {
         return Ok((None, eof));
     }
+    debug!("upload_one_big_file done: file_id={} parts={} bytes={}", file_id, part_idx, uploaded);
     Ok((Some(RawBigFile { file_id, parts: part_idx, size: uploaded }), eof))
 }
 

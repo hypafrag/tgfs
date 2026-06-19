@@ -11,7 +11,10 @@ use tgfs::zip_cache::ZipCache;
 /// Initialize the global logger.
 fn init_logger(log: Option<&LogConfig>) {
     use std::io::Write as _;
-    let default_filter = log.map(|l| l.to_filter_string()).unwrap_or_else(|| "info".to_string());
+    let default_filter = log
+        .and_then(|l| l.level.as_ref())
+        .map(|l| l.to_filter_string())
+        .unwrap_or_else(|| "info".to_string());
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format(|buf, record| {
             let ts = buf.timestamp_millis();

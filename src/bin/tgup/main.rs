@@ -38,10 +38,12 @@ use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
 /// A `Write` adapter that routes log lines through `MultiProgress::println` so
 /// they appear above the progress bars without corrupting the cursor-up redraw
-/// arithmetic indicatif uses to overwrite them in place.
+/// arithmetic indicatif uses to overwrite them in place. Optionally also
+/// appends to a log file when `file` is set.
 struct MpLogWriter {
     mp: Arc<MultiProgress>,
     buf: Vec<u8>,
+    file: Option<std::sync::Mutex<std::fs::File>>,
 }
 
 impl std::io::Write for MpLogWriter {
@@ -55,6 +57,12 @@ impl std::io::Write for MpLogWriter {
             let trimmed = line.trim_end_matches('\n');
             if !trimmed.is_empty() {
                 let _ = self.mp.println(trimmed);
+                if let Some(ref f) = self.file {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = f.lock() {
+                        let _ = writeln!(f, "{}", trimmed);
+                    }
+                }
             }
         }
         self.buf.clear();
@@ -374,9 +382,39 @@ async fn main() -> ExitCode {
     // `println` — that way `grammers` (or any other `log::warn!`) writes don't
     // interleave with the bar redraws and desync the cursor-up arithmetic.
     let mp = Arc::new(MultiProgress::new());
-    let log_writer = MpLogWriter { mp: mp.clone(), buf: Vec::new() };
+    // Read config early (best-effort) so we can honor log: and log_file:.
+    // Full config validation happens inside run(); ignore errors here.
+    let early_config: Option<tgfs::config::Config> = {
+        let mut args_iter = std::env::args().skip(1);
+        let config_path = loop {
+            match args_iter.next() {
+                Some(a) if a == "--config" => {
+                    break args_iter.next()
+                        .unwrap_or_else(|| default_config_path().to_string_lossy().into_owned());
+                }
+                None => break default_config_path().to_string_lossy().into_owned(),
+                _ => {}
+            }
+        };
+        tgfs::config::load_config(&config_path).ok()
+    };
+    let log_filter = early_config.as_ref()
+        .and_then(|c| c.log.as_ref())
+        .and_then(|l| l.level.as_ref())
+        .map(|l| l.to_filter_string())
+        .unwrap_or_else(|| "warn,grammers_mtsender=error,tgfs=info".to_string());
+    let log_file: Option<std::sync::Mutex<std::fs::File>> = early_config.as_ref()
+        .and_then(|c| c.log.as_ref())
+        .and_then(|l| l.file.as_deref())
+        .and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true).append(true).open(path)
+                .map(std::sync::Mutex::new)
+                .ok()
+        });
+    let log_writer = MpLogWriter { mp: mp.clone(), buf: Vec::new(), file: log_file };
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,grammers_mtsender=error"),
+        env_logger::Env::default().default_filter_or(log_filter),
     )
         .target(env_logger::Target::Pipe(Box::new(log_writer)))
         .init();

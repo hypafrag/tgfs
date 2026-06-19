@@ -8,9 +8,11 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{bail, Context as _};
+use log::info;
 use grammers_client::Client;
-use grammers_client::media::InputMedia;
+use grammers_client::media::{InputMedia, Media};
 use grammers_client::message::InputMessage;
+use grammers_client::tl;
 use grammers_session::types::PeerRef;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
@@ -26,8 +28,8 @@ use super::progress::{
     ScaledProgressReader, SpeedReader,
 };
 use super::upload::{
-    finalize_big_file, upload_one_big_file, upload_thumb, video_attribute, RawBigFile, TG_CHUNK,
-    UPLOAD_CONCURRENCY, VideoInfo, VideoUploadBars,
+    finalize_big_file, random_file_id, upload_one_big_file, upload_thumb, video_attribute,
+    RawBigFile, TG_CHUNK, UPLOAD_CONCURRENCY, VideoInfo, VideoUploadBars,
 };
 
 /// Build the ffmpeg argv list (everything between `-i <input>` and `pipe:1`)
@@ -1455,15 +1457,22 @@ async fn encode_album_part_to_scratch(
 }
 
 /// Upload a pre-encoded album part from its scratch file, delete the scratch,
-/// and return an `InputMedia` ready for `send_album`.
-async fn upload_album_part_scratch(
+/// immediately commit the parts via `messages.UploadMedia` (while the
+/// connection is still fresh), and return an `InputSingleMedia` ready for
+/// `messages.SendMultiMedia`.
+///
+/// Calling `UploadMedia` here — rather than deferring to `send_album` at the
+/// end — prevents FILE_PART_MISSING when an MTProxy connection resets between
+/// the upload of the last part and the eventual `sendMultiMedia` call.
+async fn upload_and_commit_album_part(
     client: &Client,
+    peer: PeerRef,
     part: EncodedAlbumPart,
     upload_pb: &ProgressBar,
     total_pb: &ProgressBar,
     video_bars: &VideoUploadBars,
     uploaded_bytes: Arc<AtomicU64>,
-) -> anyhow::Result<InputMedia> {
+) -> anyhow::Result<tl::enums::InputSingleMedia> {
     let EncodedAlbumPart {
         scratch_path,
         scratch_size,
@@ -1492,13 +1501,54 @@ async fn upload_album_part_scratch(
     }
 
     let raw = files.into_iter().next().unwrap();
-    let uploaded = finalize_big_file(&raw, doc_filename.clone());
-    let mut media = InputMedia::new().caption(caption).document(uploaded);
-    if let Some(ref info) = video_info {
-        media = media.attribute(video_attribute(info));
+    info!(target: "tgfs", "album part '{}' uploaded: file_id={} parts={} bytes={}", doc_filename, raw.file_id, raw.parts, raw.size);
+
+    // Commit the uploaded parts to a stable server-side document reference
+    // immediately, before any possible connection reset can invalidate them.
+    let input_file = tl::enums::InputFile::Big(tl::types::InputFileBig {
+        id: raw.file_id,
+        parts: raw.parts,
+        name: doc_filename.clone(),
+    });
+    let mut attributes: Vec<tl::enums::DocumentAttribute> = vec![
+        tl::types::DocumentAttributeFilename { file_name: doc_filename.clone() }.into(),
+    ];
+    if let Some(ref vi) = video_info {
+        attributes.push(video_attribute(vi).into());
     }
-    media = media.thumbnail(thumb);
-    Ok(media)
+    let upload_media = tl::enums::InputMedia::UploadedDocument(tl::types::InputMediaUploadedDocument {
+        nosound_video: false,
+        force_file: false,
+        spoiler: false,
+        file: input_file,
+        thumb: Some(thumb.raw),
+        mime_type: "video/mp4".to_string(),
+        attributes,
+        stickers: None,
+        ttl_seconds: None,
+        video_cover: None,
+        video_timestamp: None,
+    });
+
+    info!(target: "tgfs", "committing album part '{}' via UploadMedia", doc_filename);
+    let committed = client.invoke(&tl::functions::messages::UploadMedia {
+        business_connection_id: None,
+        peer: peer.into(),
+        media: upload_media,
+    }).await.with_context(|| format!("UploadMedia for '{}'", doc_filename))?;
+
+    let committed_input = Media::from_raw(committed)
+        .ok_or_else(|| anyhow::anyhow!("Media::from_raw returned None for '{}'", doc_filename))?
+        .to_raw_input_media()
+        .ok_or_else(|| anyhow::anyhow!("to_raw_input_media returned None for '{}'", doc_filename))?;
+
+    info!(target: "tgfs", "album part '{}' committed successfully", doc_filename);
+    Ok(tl::enums::InputSingleMedia::Media(tl::types::InputSingleMedia {
+        media: committed_input,
+        random_id: random_file_id(),
+        message: caption,
+        entities: None,
+    }))
 }
 
 /// Run the LeadingMoov pipeline for an `EncodedAlbum` item. Mirrors
@@ -1546,20 +1596,21 @@ pub async fn run_leading_moov_album_pipeline(
     let n = parts.len();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedAlbumPart>(1);
 
-    // Uploader: collect InputMedia items, return them when done.
+    // Uploader: commit each part immediately via UploadMedia, collect the
+    // resulting InputSingleMedia handles, then fire a single SendMultiMedia.
     let uploader = {
         let client = client.clone();
         let upload_pb = upload_pb.clone();
         let total_pb = total_pb.clone();
         let uploaded_bytes = uploaded_bytes.clone();
         tokio::spawn(async move {
-            let mut medias: Vec<InputMedia> = Vec::with_capacity(n);
+            let mut medias: Vec<tl::enums::InputSingleMedia> = Vec::with_capacity(n);
             while let Some(job) = rx.recv().await {
-                let media = upload_album_part_scratch(
-                    &client, job, &upload_pb, &total_pb, &video_bars,
+                let single_media = upload_and_commit_album_part(
+                    &client, peer, job, &upload_pb, &total_pb, &video_bars,
                     uploaded_bytes.clone(),
                 ).await?;
-                medias.push(media);
+                medias.push(single_media);
                 total_pb.set_message(format!("TOTAL {}/{}", medias.len(), n));
                 upload_bar_pending(&upload_pb);
             }
@@ -1591,6 +1642,23 @@ pub async fn run_leading_moov_album_pipeline(
     if let Some(e) = encoder_err { return Err(e); }
     let medias = uploader_res.context("uploader join")??;
 
-    client.send_album(peer, medias).await.context("sending encoded album")?;
+    info!(target: "tgfs", "all {} album parts committed, calling SendMultiMedia now", n);
+    client.invoke(&tl::functions::messages::SendMultiMedia {
+        silent: false,
+        background: false,
+        clear_draft: false,
+        peer: peer.into(),
+        reply_to: None,
+        schedule_date: None,
+        multi_media: medias,
+        send_as: None,
+        noforwards: false,
+        update_stickersets_order: false,
+        invert_media: false,
+        quick_reply_shortcut: None,
+        effect: None,
+        allow_paid_floodskip: false,
+        allow_paid_stars: None,
+    }).await.context("sending encoded album")?;
     Ok(())
 }
