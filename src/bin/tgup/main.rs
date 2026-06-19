@@ -32,7 +32,7 @@ use ffmpeg::{
     run_leading_moov_pipeline, run_leading_moov_album_pipeline,
 };
 use tgfs::config::Streamification;
-use plan::{apply_encode_video_to_tvshow_plan, collect_path, find_channel, group_into_albums, plan_has_video, print_plan, PartSource, UploadItem};
+use plan::{apply_encode_video_to_plan, collect_path, find_channel, group_into_albums, plan_has_video, print_plan, PartSource, UploadItem};
 use progress::{set_bar_style, set_prefix_label, LABEL_WIDTH};
 use upload::{resolve_channel_peer, upload_album, upload_part_as_message};
 
@@ -160,17 +160,26 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
     if args.tvshow {
         plan = tvshow::build_tvshow_plan(&args.paths, args.dir_mode).await?;
         if args.encode_video {
-            plan = apply_encode_video_to_tvshow_plan(plan, policy);
+            plan = apply_encode_video_to_plan(plan, policy);
         }
     } else {
+        // When grouping into albums, defer the video→EncodedVideo conversion
+        // until after grouping: converting up front would turn every video
+        // into an EncodedVideo before `group_into_albums` runs, and that
+        // function only merges consecutive `Single`s, leaving each encoded
+        // video as its own ungrouped message instead of one album.
+        let collect_encode_video = args.encode_video && !args.album;
         for p in &args.paths {
-            collect_path(p, &cwd, policy, args.dir_mode, args.encode_video, &mut plan)?;
+            collect_path(p, &cwd, policy, args.dir_mode, collect_encode_video, &mut plan)?;
         }
     }
     if plan.is_empty() { bail!("nothing to upload"); }
 
     if args.album {
         plan = group_into_albums(plan);
+        if args.encode_video {
+            plan = apply_encode_video_to_plan(plan, policy);
+        }
     }
 
     // --test-thumbnails: extract candidates for all video items, write them to

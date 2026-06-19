@@ -263,11 +263,16 @@ async fn clear_about(client: &Client, peer: PeerRef) -> anyhow::Result<()> {
     // Wipe whatever `integration_test` (or a previous run) wrote to the
     // channel description — otherwise the tgfs runner will see its sentinel
     // hash next time and skip re-population, leaving stale spec data behind.
-    client.invoke(&tl::functions::messages::EditChatAbout {
+    let res = client.invoke(&tl::functions::messages::EditChatAbout {
         peer: peer.into(),
         about: String::new(),
-    }).await?;
-    Ok(())
+    }).await;
+    match res {
+        // Already empty (e.g. a prior run cleared it and nothing repopulated
+        // it since) — that's the desired end state, not a failure.
+        Err(e) if e.to_string().contains("CHAT_ABOUT_NOT_MODIFIED") => Ok(()),
+        other => Ok(other.map(|_| ())?),
+    }
 }
 
 async fn delete_all_messages(client: &Client, peer: PeerRef) -> anyhow::Result<usize> {
@@ -502,6 +507,36 @@ async fn main() -> anyhow::Result<()> {
         if msgs.len() != 5 { bail!("expected 5 messages, got {}", msgs.len()); }
         let gid = msgs[0].grouped_id;
         if gid.is_none() { bail!("messages should share a grouped_id"); }
+        if !msgs.iter().all(|m| m.grouped_id == gid) {
+            bail!("not all messages share the same grouped_id: {msgs:#?}");
+        }
+        let mut names: Vec<String> = msgs.iter().filter_map(|m| m.doc_name.clone()).collect();
+        names.sort();
+        let expected_names: Vec<String> = (1..=5).map(|i| format!("clip-{}.mp4", i)).collect();
+        if names != expected_names { bail!("unexpected filenames: {names:?}"); }
+        Ok(())
+    }).await;
+
+    // Regression test: `--album --encode-video` (without `--tvshow`) must
+    // still group the encoded videos into one Telegram album. `plan_one_file`
+    // converts each video straight to `UploadItem::EncodedVideo` before
+    // `group_into_albums` runs, and `group_into_albums` only merges
+    // consecutive `Single` items — `EncodedVideo` items pass through
+    // ungrouped, so each ends up as its own message instead of one album.
+    runner.run("tgup::album_encode_video", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        let mut argv: Vec<&str> = vec!["-a", "--encode-video"];
+        let strs: Vec<String> = album_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        for s in &strs { argv.push(s); }
+        run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 5 { bail!("expected 5 messages, got {}: {msgs:#?}", msgs.len()); }
+        let gid = msgs[0].grouped_id;
+        if gid.is_none() {
+            bail!("messages should share a grouped_id (one Telegram album), but got no grouped_id: {msgs:#?}");
+        }
         if !msgs.iter().all(|m| m.grouped_id == gid) {
             bail!("not all messages share the same grouped_id: {msgs:#?}");
         }
