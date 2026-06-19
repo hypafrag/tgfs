@@ -82,21 +82,21 @@ fn expand_env_with_falls_back_to_environment_when_dotenv_missing() {
     unsafe { std::env::remove_var("TGFS_TEST_FALLBACK"); }
 }
 
-// -------- LogConfig::to_filter_string --------
+// -------- LogLevel::to_filter_string --------
 
 #[test]
-fn log_config_level_round_trips() {
-    let cfg = LogConfig::Level("debug".into());
-    assert_eq!(cfg.to_filter_string(), "debug");
+fn log_level_global_round_trips() {
+    let lvl = LogLevel::Global("debug".into());
+    assert_eq!(lvl.to_filter_string(), "debug");
 }
 
 #[test]
-fn log_config_modules_emits_directive_list() {
+fn log_level_modules_emits_directive_list() {
     let mut m = HashMap::new();
     m.insert("tgfs".to_string(), "debug".to_string());
-    let cfg = LogConfig::Modules(m);
+    let lvl = LogLevel::Modules(m);
     // Single entry so HashMap ordering doesn't matter.
-    assert_eq!(cfg.to_filter_string(), "tgfs=debug");
+    assert_eq!(lvl.to_filter_string(), "tgfs=debug");
 }
 
 // -------- MultipartPolicy default --------
