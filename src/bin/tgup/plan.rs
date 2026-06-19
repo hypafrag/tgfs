@@ -69,12 +69,16 @@ pub fn plan_has_video(plan: &[UploadItem]) -> bool {
     })
 }
 
-/// When `--tvshow` and `--encode-video` are combined, convert every video
-/// `Single` or `FileAlbum` part into an encoded upload:
+/// Convert every video `Single` or `FileAlbum` part of a plan into an encoded
+/// upload:
 ///   - `Single` (video)    → `EncodedVideo`  (individual encoded message)
 ///   - `FileAlbum` (video) → `EncodedAlbum`  (encode-then-album, grouping preserved)
-/// Non-video parts are left unchanged.
-pub fn apply_encode_video_to_tvshow_plan(
+/// Non-video parts are left unchanged. Used for `--tvshow --encode-video`
+/// (applied to the per-season tvshow plan) and for plain `-a/--album
+/// --encode-video` (applied after `group_into_albums`, so albums formed from
+/// consecutive `Single`s survive the conversion to `EncodedAlbum` instead of
+/// being converted to `EncodedVideo` per-file beforehand and left ungrouped).
+pub fn apply_encode_video_to_plan(
     plan: Vec<UploadItem>,
     policy: MultipartPolicy,
 ) -> Vec<UploadItem> {

@@ -79,8 +79,10 @@ fn print_usage() {
              zip        — not implemented (exits with error)\n  \
            -a, --album            Group consecutive uploadable files into Telegram\n                          \
              albums (up to 10 items each). Only files sharing the\n                          \
-             same caption are grouped together; multipart and\n                          \
-             encoded-video items are passed through unchanged.\n  \
+             same caption are grouped together; multipart items\n                          \
+             are passed through unchanged. Compatible with\n                          \
+             --encode-video: each file in the resulting album(s)\n                          \
+             is re-encoded before upload.\n  \
            --tvshow               Treat inputs as TV-show episodes. Filenames are\n                          \
              parsed via hunch to extract show title, season, and\n                          \
              episode; files are renamed to\n                          \
