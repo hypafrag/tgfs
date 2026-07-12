@@ -9,10 +9,12 @@ fn split_part_suffix_basic_two_digit() {
 }
 
 #[test]
-fn split_part_suffix_three_digit_still_matches() {
-    // Spec talks about two-digit parts, but split_part_suffix only requires
-    // "all digits"; the contiguity check in assemble enforces the rest.
-    assert_eq!(split_part_suffix("dump.bin.123"), Some(("dump.bin", 123)));
+fn split_part_suffix_requires_exactly_two_digits() {
+    // The spec is two-digit `.NN` parts; anything looser would treat
+    // ordinary numeric extensions (versions, indices) as multipart parts.
+    assert_eq!(split_part_suffix("notes.0"), None);
+    assert_eq!(split_part_suffix("dump.bin.123"), None);
+    assert_eq!(split_part_suffix("v1.5"), None);
 }
 
 #[test]
@@ -258,6 +260,115 @@ fn apply_prefix_collapse_below_threshold_does_nothing() {
     let mut v = vec![fe("ab_one.bin", None), fe("ab_two.bin", None)];
     apply_prefix_collapse(&mut v, 5);
     assert!(v[0].path.is_none() && v[1].path.is_none());
+}
+
+// -------- bug demonstrations (these assert the CORRECT behavior and fail
+// until the corresponding bug is fixed) --------
+
+/// Offline `Client` — never connects; enough to satisfy the `&Client`
+/// parameter of assembly functions on paths that don't perform RPCs.
+fn offline_client() -> Client {
+    let session = std::sync::Arc::new(grammers_session::storages::MemorySession::default());
+    let pool = grammers_mtsender::SenderPool::new(session, 1);
+    Client::new(pool.handle)
+}
+
+/// A `FileEntry` whose single part is a synthetic Telegram document carrying
+/// a real filename attribute, so `doc_name()` resolves like production data.
+fn fe_doc(doc_name: &str, path: Option<&str>, size: usize, msg_id: i32) -> FileEntry {
+    let doc = Document::from_raw_media(tl::types::MessageMediaDocument {
+        nopremium: false,
+        spoiler: false,
+        video: false,
+        round: false,
+        voice: false,
+        document: Some(tl::enums::Document::Document(tl::types::Document {
+            id: msg_id as i64,
+            access_hash: 0,
+            file_reference: Vec::new(),
+            date: 0,
+            mime_type: "application/octet-stream".to_string(),
+            size: size as i64,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::enums::DocumentAttribute::Filename(
+                tl::types::DocumentAttributeFilename { file_name: doc_name.to_string() },
+            )],
+        })),
+        alt_documents: None,
+        video_cover: None,
+        video_timestamp: None,
+        ttl_seconds: None,
+    });
+    FileEntry {
+        name: doc_name.to_string(),
+        path: path.map(std::path::PathBuf::from),
+        parts: smallvec![Media::Document(doc)],
+        msg_ids: smallvec![msg_id],
+        size: Some(size),
+        mime_idx: 0,
+        archive_entries: None,
+        file_type: FileType::File,
+        mtime: None,
+    }
+}
+
+fn test_zip_cache() -> Mutex<ZipCache> {
+    Mutex::new(ZipCache::load("/nonexistent/tgfs_test_zip_cache.json"))
+}
+
+/// The docs specify multipart parts as two-digit `.NN` suffixes. But
+/// `split_part_suffix` accepts ANY all-digit suffix, and the assembler only
+/// checks contiguity from 0 — so two ordinary, unrelated files that happen to
+/// be named `notes.0` and `notes.1` are silently fused into one bogus
+/// concatenated file called `notes`.
+#[tokio::test]
+async fn single_digit_numeric_extensions_are_not_multipart() {
+    let client = offline_client();
+    let zip_cache = test_zip_cache();
+    let files = vec![
+        fe_doc("notes.0", None, 5, 1),
+        fe_doc("notes.1", None, 5, 2),
+    ];
+    let mut removed = std::collections::BTreeSet::new();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+    assemble_suffix_multipart(&files, ArchiveView::File, &client, &zip_cache, &mut removed, &mut new_files).await;
+    assert!(
+        new_files.is_empty() && removed.is_empty(),
+        "unrelated files 'notes.0' and 'notes.1' were merged into a single \
+         multipart file {:?}",
+        new_files.first().map(|f| &f.name)
+    );
+}
+
+/// Suffix-multipart grouping buckets by document-name base only, ignoring the
+/// entries' virtual directories. The saved-messages assembler guards against
+/// this (it requires all parts to share the same `path`); the channel
+/// assembler does not — so a part set under `A/` gets fused with a
+/// same-named part under `B/` into one broken concatenation.
+#[tokio::test]
+async fn suffix_multipart_does_not_merge_across_virtual_directories() {
+    let client = offline_client();
+    let zip_cache = test_zip_cache();
+    let files = vec![
+        fe_doc("data.bin.00", Some("A"), 10, 1),
+        fe_doc("data.bin.01", Some("A"), 10, 2),
+        fe_doc("data.bin.02", Some("B"), 10, 3),
+    ];
+    let mut removed = std::collections::BTreeSet::new();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+    assemble_suffix_multipart(&files, ArchiveView::File, &client, &zip_cache, &mut removed, &mut new_files).await;
+    for f in &new_files {
+        let from_a = f.msg_ids.iter().any(|id| *id == 1 || *id == 2);
+        let from_b = f.msg_ids.iter().any(|id| *id == 3);
+        assert!(
+            !(from_a && from_b),
+            "'{}' concatenates parts from virtual directory A/ (msgs 1,2) \
+             with a part from B/ (msg 3)",
+            f.name
+        );
+    }
 }
 
 // -------- ZIP parsing --------

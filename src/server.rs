@@ -68,8 +68,18 @@ fn parse_range(headers: &HeaderMap, total: usize) -> Result<Option<(usize, usize
             let mut parts = r.splitn(2, '-');
             let start_opt = parts.next().and_then(|s| if s.is_empty() { None } else { s.parse::<usize>().ok() });
             let end_opt = parts.next().and_then(|s| if s.is_empty() { None } else { s.parse::<usize>().ok() });
-            let start = start_opt.unwrap_or(0);
-            let end = end_opt.unwrap_or(total.saturating_sub(1));
+            let (start, end) = match (start_opt, end_opt) {
+                // RFC 7233 suffix range: `bytes=-N` means the final N bytes.
+                (None, Some(n)) => {
+                    if n == 0 { return Err(StatusCode::RANGE_NOT_SATISFIABLE); }
+                    (total.saturating_sub(n), total.saturating_sub(1))
+                }
+                // An end past the last byte reads as "to the end" (RFC 7233 §2.1).
+                (start, end) => (
+                    start.unwrap_or(0),
+                    end.unwrap_or(usize::MAX).min(total.saturating_sub(1)),
+                ),
+            };
             if start > end || start >= total { return Err(StatusCode::RANGE_NOT_SATISFIABLE); }
             return Ok(Some((start, end)));
         }
@@ -154,11 +164,36 @@ fn stream_parts_range(
         let mut remaining: Option<usize> = length;
         for idx in part_idx..parts.len() {
             if remaining == Some(0) { break; }
+            let start_off = if idx == part_idx { offset_in_part } else { 0 };
+            if matches!(&parts[idx], Media::Photo(_)) {
+                // Photos can't go through iter_download over a Document;
+                // range-download them chunk-by-chunk via the same path FUSE uses.
+                let psize = sizes[idx];
+                let mut pos = start_off;
+                while pos < psize && remaining != Some(0) {
+                    let mut want = std::cmp::min(DOWNLOAD_CHUNK_SIZE, psize - pos);
+                    if let Some(r) = remaining { want = std::cmp::min(want, r); }
+                    let part_media = std::slice::from_ref(&parts[idx]);
+                    match crate::indexer::download_range(&ctx.state.client, part_media, pos, want).await {
+                        Ok(buf) if buf.is_empty() => break,
+                        Ok(buf) => {
+                            let n = buf.len();
+                            if tx.send(Ok(Bytes::from(buf))).await.is_err() { return; }
+                            pos += n;
+                            if let Some(r) = remaining.as_mut() { *r -= std::cmp::min(n, *r); }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::other(format!("photo download error: {e}")))).await;
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
             let mut doc = match effective_part_doc(&ctx.state, &parts, idx) {
                 Some(d) => d,
-                None => continue, // skip non-document parts (photos handled elsewhere)
+                None => continue, // skip unsupported non-document parts
             };
-            let start_off = if idx == part_idx { offset_in_part } else { 0 };
             let first_chunk = (start_off / DOWNLOAD_CHUNK_SIZE) as i32;
             let offset_in_first = start_off % DOWNLOAD_CHUNK_SIZE;
             // Outer loop allows rebuilding iter_download from `chunks_consumed`

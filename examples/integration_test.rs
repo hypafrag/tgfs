@@ -161,6 +161,13 @@ struct FileSpec {
     /// Recursive zip contents. Mutually exclusive with text/blob.
     #[serde(default)]
     zip: Option<Vec<ZipEntry>>,
+    /// When true, the file is uploaded as a Telegram *photo* (not a document).
+    /// Bytes are generated deterministically at runtime. Layout helpers skip
+    /// photo entries: Telegram re-encodes photos server-side and the indexer
+    /// exposes them as `photo_<id>.jpg`, so neither the name nor the bytes
+    /// can be predicted from the spec.
+    #[serde(default)]
+    photo: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -181,8 +188,18 @@ struct ZipEntry {
 }
 
 impl FileSpec {
-    /// Materialize the file's raw bytes (text/blob/zip → concrete buffer).
+    fn is_photo(&self) -> bool {
+        self.photo.unwrap_or(false)
+    }
+
+    /// Materialize the file's raw bytes (text/blob/zip/photo → concrete buffer).
     fn build_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        if self.is_photo() {
+            if self.text.is_some() || self.blob.is_some() || self.zip.is_some() {
+                bail!("photo file '{}' must not also carry text/blob/zip", self.name);
+            }
+            return synth_photo_jpeg();
+        }
         match (&self.text, &self.blob, &self.zip) {
             (Some(t), None, None) => Ok(t.as_bytes().to_vec()),
             (None, Some(b), None) => decode_blob(b),
@@ -190,6 +207,20 @@ impl FileSpec {
             _ => bail!("file '{}' must specify exactly one of text/blob/zip", self.name),
         }
     }
+}
+
+/// Deterministic 320×240 gradient JPEG, large enough for Telegram to accept
+/// as a photo. Telegram re-encodes it anyway, so the exact bytes only need to
+/// be a valid image.
+fn synth_photo_jpeg() -> anyhow::Result<Vec<u8>> {
+    let mut img = image::RgbImage::new(320, 240);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        *p = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+    }
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg)
+        .context("encoding synthetic photo JPEG")?;
+    Ok(buf.into_inner())
 }
 
 fn decode_blob(b: &str) -> anyhow::Result<Vec<u8>> {
@@ -356,7 +387,12 @@ async fn upload_message(
 
     if uploaded.len() == 1 {
         let (_name, up) = uploaded.into_iter().next().unwrap();
-        client.send_message(peer, InputMessage::new().text(caption).file(up)).await?;
+        let msg_input = if msg.files[0].is_photo() {
+            InputMessage::new().text(caption).photo(up)
+        } else {
+            InputMessage::new().text(caption).file(up)
+        };
+        client.send_message(peer, msg_input).await?;
     } else {
         // Album: first InputMedia carries the caption; subsequent ones must be
         // bare media. grammers' `send_album` sends them as a grouped multi-media
@@ -417,6 +453,7 @@ fn variant_config(
     archive_view: ArchiveView,
     multipart_policy: MultipartPolicy,
     tvshow_pattern: Option<&str>,
+    collapse_by_prefix: Option<usize>,
 ) -> Config {
     Config {
         api_id: base.api_id,
@@ -436,7 +473,7 @@ fn variant_config(
             directory: None,
             archive_view,
             skip_deflated_id3v1: false,
-            collapse_by_prefix: None,
+            collapse_by_prefix,
             multipart_policy,
             tvshow_pattern: tvshow_pattern.map(|s| s.to_string()),
         }],
@@ -549,6 +586,84 @@ fn assert_http_layout_matches(base_url: &str, expected: &HashMap<String, Vec<u8>
     Ok(())
 }
 
+/// Synchronous HTTP GET for use inside `mount_variant` bodies. Returns the
+/// status code and full body, even for non-2xx responses.
+fn http_get_blocking(base_url: &str, rel: &str) -> anyhow::Result<(u16, Vec<u8>)> {
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), url_encode_path(rel));
+    let c = http_client()?;
+    let resp = c.get(&url).send().with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.bytes()?.to_vec();
+    Ok((status, body))
+}
+
+/// Synchronous ranged GET: sends a `Range` header and returns
+/// `(status, Content-Range header if any, body)`.
+fn http_get_range_blocking(
+    base_url: &str,
+    rel: &str,
+    range: &str,
+) -> anyhow::Result<(u16, Option<String>, Vec<u8>)> {
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), url_encode_path(rel));
+    let c = http_client()?;
+    let resp = c.get(&url)
+        .header(reqwest::header::RANGE, range)
+        .send()
+        .with_context(|| format!("GET {url} (Range: {range})"))?;
+    let status = resp.status().as_u16();
+    let content_range = resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body = resp.bytes()?.to_vec();
+    Ok((status, content_range, body))
+}
+
+/// Synchronous GET returning `(status, <header> value if any)`. Body is
+/// discarded — used for header-only assertions like Content-Disposition.
+fn http_get_header_blocking(
+    base_url: &str,
+    rel: &str,
+    header: &str,
+) -> anyhow::Result<(u16, Option<String>)> {
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), url_encode_path(rel));
+    let c = http_client()?;
+    let resp = c.get(&url).send().with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let value = resp.headers()
+        .get(header)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    Ok((status, value))
+}
+
+/// Assert one ranged GET: 206 status, exact body slice, exact Content-Range.
+fn assert_range(
+    base_url: &str,
+    rel: &str,
+    range: &str,
+    full: &[u8],
+    start: usize,
+    end: usize,
+) -> anyhow::Result<()> {
+    let (status, cr, body) = http_get_range_blocking(base_url, rel, range)?;
+    if status != 206 {
+        bail!("Range '{range}' on {rel}: expected 206, got {status}");
+    }
+    let want_cr = format!("bytes {}-{}/{}", start, end, full.len());
+    if cr.as_deref() != Some(want_cr.as_str()) {
+        bail!("Range '{range}' on {rel}: Content-Range {:?}, expected '{want_cr}'", cr);
+    }
+    if body != full[start..=end] {
+        bail!(
+            "Range '{range}' on {rel}: body mismatch ({} bytes, expected {})",
+            body.len(), end - start + 1,
+        );
+    }
+    info!("✓ Range {range} on {rel} → bytes {start}-{end}");
+    Ok(())
+}
+
 /// Blocking HTTP GET wrapped for use from an async context. Returns the
 /// status code and the full response body, even for non-2xx responses (so
 /// callers can assert on 404s).
@@ -595,6 +710,7 @@ fn expected_layout_file_view(channel_name: &str, spec: &ChannelSpec) -> anyhow::
     for msg in &spec.messages {
         let dir_override = msg.text.as_deref().and_then(parse_path_directive);
         for f in &msg.files {
+            if f.is_photo() { continue; }
             let bytes = f.build_bytes()?;
             let prefix = match &dir_override {
                 Some(d) => format!("{}/{}/", channel_name, d.trim_end_matches('/')),
@@ -663,6 +779,33 @@ fn assert_layout_matches(root: &Path, expected: &HashMap<String, Vec<u8>>) -> an
     Ok(())
 }
 
+/// Read the raw `..` dirent of `dir` and return its inode number.
+/// `std::fs::read_dir` hides dot entries, so this goes through libc readdir —
+/// the entries come straight from the FUSE `readdir` reply.
+fn read_dotdot_ino(dir: &Path) -> anyhow::Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    unsafe {
+        let d = libc::opendir(c.as_ptr());
+        if d.is_null() {
+            bail!("opendir({}) failed: {}", dir.display(), std::io::Error::last_os_error());
+        }
+        loop {
+            let ent = libc::readdir(d);
+            if ent.is_null() {
+                libc::closedir(d);
+                bail!("no '..' entry in readdir of {}", dir.display());
+            }
+            let name = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
+            if name.to_bytes() == b".." {
+                let ino = (*ent).d_ino as u64;
+                libc::closedir(d);
+                return Ok(ino);
+            }
+        }
+    }
+}
+
 // ------------------------ Multipart helpers ---------------------------------
 
 /// Parse `<stem>.NN` suffix filenames (exactly two decimal digits).
@@ -685,19 +828,23 @@ fn has_multipart_directive(text: &str) -> bool {
 }
 
 /// Expected layout for `multipart_policy=suffix`: `.NN` parts are merged into
-/// their base name; every other file appears individually.
+/// their base name *within their virtual directory*; every other file appears
+/// individually. Same-named part sets in different directories merge
+/// independently.
 fn expected_layout_suffix_multipart(
     channel_name: &str,
     spec: &ChannelSpec,
 ) -> anyhow::Result<HashMap<String, Vec<u8>>> {
-    let mut suffix_groups: HashMap<String, BTreeMap<u8, Vec<u8>>> = HashMap::new();
+    let mut suffix_groups: HashMap<(String, String), BTreeMap<u8, Vec<u8>>> = HashMap::new();
     let mut out = HashMap::new();
 
     for msg in &spec.messages {
         let dir_override = msg.text.as_deref().and_then(parse_path_directive);
         for f in &msg.files {
+            if f.is_photo() { continue; }
             if let Some((base, num)) = parse_suffix_part(&f.name) {
-                suffix_groups.entry(base).or_default().insert(num, f.build_bytes()?);
+                let dir = dir_override.as_deref().map(|d| d.trim_end_matches('/')).unwrap_or("").to_string();
+                suffix_groups.entry((dir, base)).or_default().insert(num, f.build_bytes()?);
             } else {
                 let bytes = f.build_bytes()?;
                 let prefix = match &dir_override {
@@ -709,9 +856,14 @@ fn expected_layout_suffix_multipart(
         }
     }
 
-    for (base, parts) in suffix_groups {
+    for ((dir, base), parts) in suffix_groups {
         let merged: Vec<u8> = parts.into_values().flatten().collect();
-        out.insert(format!("{}/{}", channel_name, base), merged);
+        let key = if dir.is_empty() {
+            format!("{}/{}", channel_name, base)
+        } else {
+            format!("{}/{}/{}", channel_name, dir, base)
+        };
+        out.insert(key, merged);
     }
 
     Ok(out)
@@ -744,6 +896,7 @@ fn expected_layout_album_multipart(
             out.insert(format!("{prefix}{first_name}"), merged);
         } else {
             for f in &msg.files {
+                if f.is_photo() { continue; }
                 let bytes = f.build_bytes()?;
                 let prefix = match &dir_override {
                     Some(d) => format!("{}/{}/", channel_name, d.trim_end_matches('/')),
@@ -956,7 +1109,7 @@ async fn setup_mutation_env(
     mut updates_rx: tokio_mpsc::UnboundedReceiver<UpdatesLike>,
 ) -> anyhow::Result<MutationEnv> {
     // Build a normal `archive_view=file, multipart_policy=none` variant.
-    let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None, None);
+    let cfg = variant_config(base_cfg, spec_name, ArchiveView::File, MultipartPolicy::None, None, None);
 
     ensure_mount_dir()?;
     let mime_pool = MimePool::new();
@@ -1115,6 +1268,56 @@ async fn do_mutation_round(
         bail!("HTTP probe after delete {name_two}: expected 404, got {status}");
     }
     check_watcher_saw_delete(&name_two, &env.ev_rx, &p2)?;
+
+    // -- Mutation 5: edit a caption to relocate a file ------------------------
+    // Exercises the `MessageEdited` realtime path: adding a `path: moved/`
+    // directive must move the file into the virtual directory, dropping the
+    // old location from FUSE and HTTP alike.
+    let name_three = format!("{prefix}_move.txt");
+    info!("mutation: add {name_three}, then edit its caption to `path: moved/`");
+    let id3 = upload_mutable_message(client, peer, &name_three, b"three").await?;
+    env.mutable_ids.push(id3);
+    let p3 = env.chan_dir.join(&name_three);
+    wait_for_file_state(&p3, true, Duration::from_secs(15))?;
+
+    client.edit_message(
+        peer,
+        id3,
+        InputMessage::new().text(format!("{MUTABLE_TAG}\npath: moved/")),
+    ).await.context("editing caption to add path directive")?;
+
+    let p3_moved = env.chan_dir.join("moved").join(&name_three);
+    wait_for_file_state(&p3_moved, true, Duration::from_secs(15))?;
+    wait_for_file_state(&p3, false, Duration::from_secs(5))?;
+    assert_listing(&env.chan_dir, &name_three, false)?;
+    assert_listing(&env.chan_dir.join("moved"), &name_three, true)?;
+    let got = fs::read(&p3_moved)?;
+    if got != b"three" { bail!("{name_three} content mismatch after caption edit"); }
+    let (status, body) = http_get(&env.base_url, &format!("{}/moved/{}", env.spec_name, name_three)).await?;
+    if status != 200 || body != b"three" {
+        bail!("HTTP probe of moved file: status={status}, body={} bytes", body.len());
+    }
+    let (status, _) = http_get(&env.base_url, &format!("{}/{}", env.spec_name, name_three)).await?;
+    if status != 404 {
+        bail!("HTTP probe of old location after move: expected 404, got {status}");
+    }
+    info!("✓ caption edit relocated {name_three} to moved/ (FUSE + HTTP agree)");
+
+    // Clean up: delete the moved message; both the file and its now-empty
+    // virtual directory must disappear.
+    client.invoke(&tl::functions::channels::DeleteMessages {
+        channel: peer.into(),
+        id: vec![id3],
+    }).await?;
+    env.mutable_ids.retain(|&i| i != id3);
+    verify_telegram_message_absent(client, peer, id3).await?;
+    wait_for_file_state(&p3_moved, false, Duration::from_secs(5))?;
+    wait_for_file_state(&env.chan_dir.join("moved"), false, Duration::from_secs(5))?;
+    let (status, _) = http_get(&env.base_url, &format!("{}/moved/{}", env.spec_name, name_three)).await?;
+    if status != 404 {
+        bail!("HTTP probe after deleting moved file: expected 404, got {status}");
+    }
+    info!("✓ delete of moved file removed both the file and its virtual directory");
 
     Ok(())
 }
@@ -1340,7 +1543,7 @@ async fn main() -> anyhow::Result<()> {
     let spec_name = spec.name.clone();
     runner.run("integration::archive_view_file", || async {
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None,
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None, None,
         );
         let exp_a_inner = exp_a.clone();
         let spec_name_inner = spec_name.clone();
@@ -1367,15 +1570,34 @@ async fn main() -> anyhow::Result<()> {
     }).await;
 
     // ----- archive_view = directory ----------------------------------------
+    // Exclude every zip-classified file (by `.zip` name *or* `type: zip`
+    // caption) from the raw-file expectations: in directory view those are
+    // exposed only as browsable directories and raw download is a 404.
+    let zip_raw_paths: HashSet<String> = {
+        let mut s = HashSet::new();
+        for msg in &spec.messages {
+            let dir_override = msg.text.as_deref().and_then(parse_path_directive);
+            for f in &msg.files {
+                if f.zip.is_some() {
+                    let prefix = match &dir_override {
+                        Some(d) => format!("{}/{}/", spec.name, d.trim_end_matches('/')),
+                        None => format!("{}/", spec.name),
+                    };
+                    s.insert(format!("{prefix}{}", f.name));
+                }
+            }
+        }
+        s
+    };
     let channel_dir = spec.name.clone();
     let exp_b_inner: HashMap<String, Vec<u8>> = expected_inner.iter()
         .map(|(k, v)| (format!("{}/{}", channel_dir, k), v.clone())).collect();
     let exp_b_top: HashMap<String, Vec<u8>> = expected_files.iter()
-        .filter(|(k, _)| !k.ends_with(".zip"))
+        .filter(|(k, _)| !zip_raw_paths.contains(*k))
         .map(|(k, v)| (k.clone(), v.clone())).collect();
     runner.run("integration::archive_view_directory", || async {
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None, None,
+            &cfg, &spec.name, ArchiveView::Directory, MultipartPolicy::None, None, None,
         );
         let top = exp_b_top.clone();
         let inner = exp_b_inner.clone();
@@ -1395,7 +1617,7 @@ async fn main() -> anyhow::Result<()> {
     }
     runner.run("integration::archive_view_file_and_directory", || async {
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None,
+            &cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None, None,
         );
         let exp = exp_c.clone();
         mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
@@ -1409,11 +1631,27 @@ async fn main() -> anyhow::Result<()> {
     runner.run("integration::multipart_suffix", || async {
         let exp = expected_layout_suffix_multipart(&spec.name, &spec)?;
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None,
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None, None,
         );
+        let chan = spec.name.clone();
         mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
             assert_layout_matches(root, &exp)?;
-            assert_http_layout_matches(base_url, &exp)
+            assert_http_layout_matches(base_url, &exp)?;
+            // Regression guards for the two merge bugs:
+            // - `notes.0`/`notes.1` (single-digit) must not fuse into `notes`;
+            // - `A/data.bin.*` and `B/data.bin.*` must not fuse into a
+            //   channel-root `data.bin`.
+            for stray in ["notes", "data.bin"] {
+                let p = root.join(&chan).join(stray);
+                if p.exists() {
+                    bail!(
+                        "'{}' exists — unrelated or cross-directory parts were \
+                         fused into one multipart file",
+                        p.display()
+                    );
+                }
+            }
+            Ok(())
         }).await
     }).await;
 
@@ -1421,8 +1659,188 @@ async fn main() -> anyhow::Result<()> {
     runner.run("integration::multipart_album", || async {
         let exp = expected_layout_album_multipart(&spec.name, &spec)?;
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album, None,
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Album, None, None,
         );
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            assert_layout_matches(root, &exp)?;
+            assert_http_layout_matches(base_url, &exp)
+        }).await
+    }).await;
+
+    // ----- HTTP Range requests ---------------------------------------------
+    // Mounted with FileAndDirectory + Suffix so every ranged-read code path
+    // is reachable at once: plain single-doc files, multipart concatenations
+    // (part-boundary crossing), and deflated/stored files inside archives.
+    runner.run("integration::http_range_requests", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::Suffix, None, None,
+        );
+        let chan = spec.name.clone();
+        let readme_rel = format!("{}/readme.txt", chan);
+        let readme = expected_files.get(&readme_rel)
+            .ok_or_else(|| anyhow!("readme.txt missing from expected layout"))?.clone();
+        let suffix_map = expected_layout_suffix_multipart(&spec.name, &spec)?;
+        let merged_rel = format!("{}/suffixed", chan);
+        let merged = suffix_map.get(&merged_rel)
+            .ok_or_else(|| anyhow!("merged 'suffixed' missing from suffix layout"))?.clone();
+        let deflated_rel = format!("{}/project/src/main.py", chan);
+        let deflated = expected_inner.get("project/src/main.py")
+            .ok_or_else(|| anyhow!("project/src/main.py missing from zip layout"))?.clone();
+        let stored_rel = format!("{}/project/logo.bin", chan);
+        let stored = expected_inner.get("project/logo.bin")
+            .ok_or_else(|| anyhow!("project/logo.bin missing from zip layout"))?.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |_root, base_url| {
+            let len = readme.len();
+            // Middle slice of a plain file.
+            assert_range(base_url, &readme_rel, "bytes=5-15", &readme, 5, 15)?;
+            // RFC 7233 suffix range: the final N bytes.
+            assert_range(base_url, &readme_rel, "bytes=-7", &readme, len - 7, len - 1)?;
+            // End past EOF reads as "to the end" with a clamped Content-Range.
+            assert_range(base_url, &readme_rel, "bytes=0-999999999", &readme, 0, len - 1)?;
+            // Start past EOF is unsatisfiable.
+            let (status, _, _) = http_get_range_blocking(
+                base_url, &readme_rel, &format!("bytes={}-", len))?;
+            if status != 416 {
+                bail!("range past EOF: expected 416, got {status}");
+            }
+            info!("✓ Range past EOF → 416");
+            // Multipart concatenation: bytes 3-8 of "Hello, world!" span the
+            // part-0/part-1 boundary at offset 7.
+            assert_range(base_url, &merged_rel, "bytes=3-8", &merged, 3, 8)?;
+            // Deflated inner-archive file (inflate-then-slice path).
+            assert_range(base_url, &deflated_rel, "bytes=5-20", &deflated, 5, 20)?;
+            // Stored inner-archive file (direct offset path).
+            assert_range(base_url, &stored_rel, "bytes=1-4", &stored, 1, 4)?;
+            Ok(())
+        }).await
+    }).await;
+
+    // ----- photo message ---------------------------------------------------
+    // A real Telegram photo (not a document) must be listed and be
+    // downloadable with identical bytes over FUSE and HTTP. Regression for
+    // photos streaming as a silent empty body over HTTP.
+    runner.run("integration::photo_message", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None, None,
+        );
+        let chan = spec.name.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            let chan_dir = root.join(&chan);
+            let photo_name = list_dir(&chan_dir)?
+                .into_iter()
+                .find(|n| n.starts_with("photo_") && n.ends_with(".jpg"))
+                .ok_or_else(|| anyhow!("no photo_<id>.jpg entry in channel listing"))?;
+            let p = chan_dir.join(&photo_name);
+            let meta_len = fs::metadata(&p)?.len();
+            let fuse_bytes = fs::read(&p)?;
+            if fuse_bytes.is_empty() {
+                bail!("photo read over FUSE returned 0 bytes");
+            }
+            if fuse_bytes.len() as u64 != meta_len {
+                bail!("photo FUSE size mismatch: getattr says {meta_len}, read {} bytes", fuse_bytes.len());
+            }
+            if fuse_bytes[..2] != [0xFF, 0xD8] {
+                bail!("photo bytes are not JPEG (no FFD8 magic)");
+            }
+            let (status, body) = http_get_blocking(base_url, &format!("{}/{}", chan, photo_name))?;
+            if status != 200 {
+                bail!("HTTP photo download: expected 200, got {status}");
+            }
+            if body != fuse_bytes {
+                bail!(
+                    "photo bytes differ between HTTP ({}) and FUSE ({})",
+                    body.len(), fuse_bytes.len()
+                );
+            }
+            info!("✓ photo {} ({} bytes) identical over FUSE and HTTP", photo_name, meta_len);
+            Ok(())
+        }).await
+    }).await;
+
+    // ----- caption `type:` directives ---------------------------------------
+    // `type: media` forces inline Content-Disposition on a plain binary;
+    // `type: zip` makes a non-.zip filename browsable as an archive.
+    runner.run("integration::caption_type_directives", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::FileAndDirectory, MultipartPolicy::None, None, None,
+        );
+        let chan = spec.name.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
+            let (status, disp) = http_get_header_blocking(
+                base_url, &format!("{}/inline.bin", chan), "content-disposition")?;
+            if status != 200 || !disp.as_deref().unwrap_or("").starts_with("inline") {
+                bail!("type: media → expected inline disposition, got status={status} disposition={disp:?}");
+            }
+            let (status, disp) = http_get_header_blocking(
+                base_url, &format!("{}/readme.txt", chan), "content-disposition")?;
+            if status != 200 || !disp.as_deref().unwrap_or("").starts_with("attachment") {
+                bail!("plain document → expected attachment disposition, got status={status} disposition={disp:?}");
+            }
+            // type: zip on bundle.dat → browsable as `bundle/` via FUSE + HTTP.
+            let inner = root.join(&chan).join("bundle").join("inner.txt");
+            let got = fs::read(&inner)
+                .with_context(|| format!("reading {}", inner.display()))?;
+            if got != b"inside bundle.dat" {
+                bail!("bundle/inner.txt content mismatch over FUSE");
+            }
+            assert_http_listing_contains(base_url, &chan, &["bundle/"])?;
+            info!("✓ type: media inline disposition, type: zip browsable");
+            Ok(())
+        }).await
+    }).await;
+
+    // ----- FUSE seek + `..` inode -------------------------------------------
+    runner.run("integration::fuse_seek_and_dotdot", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::Suffix, None, None,
+        );
+        let chan = spec.name.clone();
+        mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, _base_url| {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            use std::os::unix::fs::MetadataExt as _;
+            let chan_dir = root.join(&chan);
+            // Seek into the merged multipart file across the part-0/part-1
+            // boundary (parts are 7+5+1 bytes of "Hello, world!").
+            let mut f = fs::File::open(chan_dir.join("suffixed"))?;
+            f.seek(SeekFrom::Start(3))?;
+            let mut buf = [0u8; 6];
+            f.read_exact(&mut buf)?;
+            if &buf != b"lo, wo" {
+                bail!("seek-read across part boundary returned {:?}", String::from_utf8_lossy(&buf));
+            }
+            f.seek(SeekFrom::Start(8))?;
+            let mut tail = Vec::new();
+            f.read_to_end(&mut tail)?;
+            if tail != b"orld!" {
+                bail!("seek-read into part 1 returned {:?}", String::from_utf8_lossy(&tail));
+            }
+            // `..` of a nested virtual dir must report the parent's inode.
+            let parent_ino = fs::metadata(&chan_dir)?.ino();
+            let dotdot_ino = read_dotdot_ino(&chan_dir.join("docs"))?;
+            if dotdot_ino != parent_ino {
+                bail!("readdir '..' inode {dotdot_ino} != parent inode {parent_ino}");
+            }
+            info!("✓ multipart seek-reads exact, '..' inode correct");
+            Ok(())
+        }).await
+    }).await;
+
+    // ----- collapse_by_prefix ----------------------------------------------
+    // With min prefix length 20 exactly one pair in the spec qualifies; both
+    // files move under a directory named after their shared trimmed prefix,
+    // everything else stays put.
+    runner.run("integration::collapse_by_prefix", || async {
+        let var_cfg = variant_config(
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, None, Some(20),
+        );
+        let mut exp = expected_files.clone();
+        let dir = "Collapse_Prefix_Demo_Track_0";
+        for n in ["Collapse_Prefix_Demo_Track_01.txt", "Collapse_Prefix_Demo_Track_02.txt"] {
+            let old = format!("{}/{}", spec.name, n);
+            let bytes = exp.remove(&old)
+                .ok_or_else(|| anyhow!("{old} missing from expected layout"))?;
+            exp.insert(format!("{}/{}/{}", spec.name, dir, n), bytes);
+        }
         mount_variant(client.clone(), var_cfg, Arc::clone(&zip_cache), move |root, base_url| {
             assert_layout_matches(root, &exp)?;
             assert_http_layout_matches(base_url, &exp)
@@ -1435,7 +1853,7 @@ async fn main() -> anyhow::Result<()> {
     runner.run("integration::tvshow_pattern", || async {
         let pattern = "{show_title}/Season {season}/Episode {episode}.{ext}";
         let var_cfg = variant_config(
-            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, Some(pattern),
+            &cfg, &spec.name, ArchiveView::File, MultipartPolicy::None, Some(pattern), None,
         );
         let channel_dir = spec.name.clone();
         let exp: HashMap<String, Vec<u8>> = [

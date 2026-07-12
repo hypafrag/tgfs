@@ -158,7 +158,12 @@ async fn main() -> anyhow::Result<()> {
                 _ = sigint.recv()  => {}
             }
             info!("Shutting down, unmounting {mp}...");
-            std::process::Command::new("fusermount").args(["-u", &mp]).status().ok();
+            // Linux ships fusermount; macOS (macFUSE) has no fusermount — use umount.
+            if cfg!(target_os = "macos") {
+                std::process::Command::new("umount").arg(&mp).status().ok();
+            } else {
+                std::process::Command::new("fusermount").args(["-u", &mp]).status().ok();
+            }
             std::process::exit(0);
         });
     }

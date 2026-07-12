@@ -20,12 +20,13 @@ fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes(b[o..o+2].try_into().un
 fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o+4].try_into().unwrap()) }
 fn u64le(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o+8].try_into().unwrap()) }
 
-/// Detect a multipart-file suffix: `<base>.<digits>`. Returns `(base, part_num)`.
-/// Requires at least one digit after the final `.`.
+/// Detect a multipart-file suffix: `<base>.NN`. Returns `(base, part_num)`.
+/// Requires exactly two digits after the final `.` — looser matching would
+/// fuse ordinary files like `notes.0`/`notes.1` into a bogus multipart merge.
 fn split_part_suffix(name: &str) -> Option<(&str, usize)> {
     let dot = name.rfind('.')?;
     let (base, rest) = (&name[..dot], &name[dot + 1..]);
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    if rest.len() != 2 || !rest.bytes().all(|b| b.is_ascii_digit()) { return None; }
     Some((base, rest.parse().ok()?))
 }
 
@@ -864,14 +865,17 @@ async fn assemble_suffix_multipart(
     removed: &mut std::collections::BTreeSet<usize>,
     new_files: &mut Vec<FileEntry>,
 ) {
-    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    // Bucket by (virtual directory, base name): same-named part sets living
+    // in different virtual directories are unrelated and must not be fused.
+    let mut groups: HashMap<(String, String), Vec<(usize, usize)>> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         if let Some((base, part)) = split_part_suffix(f.doc_name()) {
-            groups.entry(base.to_string()).or_default().push((i, part));
+            let dir_key = f.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            groups.entry((dir_key, base.to_string())).or_default().push((i, part));
         }
     }
 
-    for (base, mut entries) in groups.into_iter() {
+    for ((_dir, base), mut entries) in groups.into_iter() {
         if entries.len() < 2 { continue; }
         entries.sort_by_key(|&(_, p)| p);
         if !entries.iter().enumerate().all(|(i, &(_, p))| p == i) { continue; }
@@ -913,6 +917,9 @@ async fn assemble_suffix_multipart(
 
         let combined_file_type = first.file_type.clone();
         let (exposed_base, exposed_path) = split_name(&exposed_name);
+        // A `path:` override on part 0 wins; otherwise the merged file stays
+        // in the directory its parts live in.
+        let exposed_path = exposed_path.or_else(|| first.path.clone());
 
         let combined = FileEntry {
             name: exposed_base,

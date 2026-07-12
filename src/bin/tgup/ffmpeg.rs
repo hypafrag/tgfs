@@ -522,7 +522,9 @@ async fn encode_via_pipe_and_upload(
         ).await?;
         if let Some(r) = raw { files.push(r); }
         if eof { break; }
-        if !allow_multipart && files.len() > 1 {
+        // More encoded data is coming, i.e. a second 4 GiB chunk would start.
+        // Kill the encoder now instead of uploading that whole chunk first.
+        if !allow_multipart && !files.is_empty() {
             let _ = run.child.kill().await;
             multipart_overrun = true;
             break;

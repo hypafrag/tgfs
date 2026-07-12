@@ -193,7 +193,7 @@ impl Dispatcher {
     }
 
     async fn delete_messages(&self, channel_name: &str, msg_ids: &[i32]) -> anyhow::Result<()> {
-        let (mut raw_entries, group_captions, archive_view, collapse, multipart_policy, tvshow_pattern) = {
+        let (mut raw_entries, mut group_captions, archive_view, collapse, multipart_policy, tvshow_pattern) = {
             let lock = self.state.channels.get(channel_name)
                 .ok_or_else(|| anyhow::anyhow!("unknown channel {}", channel_name))?;
             let g = lock.read().unwrap();
@@ -208,6 +208,13 @@ impl Dispatcher {
             }
         }
         if !changed { return Ok(()); }
+
+        // Drop captions whose album no longer has any surviving member, so
+        // the map doesn't grow forever and a recycled grouped_id can't
+        // inherit a stale caption.
+        let live_gids: std::collections::HashSet<i64> =
+            raw_entries.values().filter_map(|r| r.grouped_id).collect();
+        group_captions.retain(|gid, _| live_gids.contains(gid));
 
         let new_files = assemble_channel_files(
             &self.client,
@@ -224,6 +231,7 @@ impl Dispatcher {
             let lock = self.state.channels.get(channel_name).unwrap();
             let mut g = lock.write().unwrap();
             g.raw_entries = raw_entries;
+            g.group_captions = group_captions;
             g.files = Arc::new(new_files);
         }
 

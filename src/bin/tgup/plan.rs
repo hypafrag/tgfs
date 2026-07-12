@@ -89,11 +89,20 @@ pub fn apply_encode_video_to_plan(
                 let PartSource::File(ref src) = part.src;
                 if is_video_path(src) {
                     let doc_filename = replace_ext(&part.doc_filename, "mp4");
+                    // Preserve the directory the part was headed to: a
+                    // caption-mode Single carries it as a `path: <dir>/`
+                    // directive, which the EncodedVideo must re-emit.
+                    let rel_dir = rel_dir_from_caption(&part.caption);
+                    let virtual_path = if rel_dir.is_empty() {
+                        doc_filename.clone()
+                    } else {
+                        format!("{}/{}", rel_dir, doc_filename)
+                    };
                     out.push(UploadItem::EncodedVideo {
                         source: src.clone(),
-                        doc_filename: doc_filename.clone(),
-                        virtual_path: doc_filename,
-                        rel_dir: String::new(),
+                        doc_filename,
+                        virtual_path,
+                        rel_dir,
                         policy,
                         source_size: part.size,
                     });
@@ -102,23 +111,39 @@ pub fn apply_encode_video_to_plan(
                 }
             }
             UploadItem::FileAlbum { parts } => {
-                let renamed: Vec<UploadPart> = parts
-                    .into_iter()
-                    .map(|p| {
-                        let PartSource::File(ref src) = p.src;
-                        if is_video_path(src) {
-                            UploadPart { doc_filename: replace_ext(&p.doc_filename, "mp4"), ..p }
-                        } else {
-                            p
-                        }
-                    })
-                    .collect();
-                out.push(UploadItem::EncodedAlbum { parts: renamed });
+                // Only an all-video album can be re-encoded: every part of an
+                // EncodedAlbum is fed to ffmpeg as a video source, so a mixed
+                // album (photos sharing a caption with videos) must pass
+                // through unchanged.
+                let all_videos = parts.iter().all(|p| {
+                    let PartSource::File(ref src) = p.src;
+                    is_video_path(src)
+                });
+                if all_videos {
+                    let renamed: Vec<UploadPart> = parts
+                        .into_iter()
+                        .map(|p| UploadPart { doc_filename: replace_ext(&p.doc_filename, "mp4"), ..p })
+                        .collect();
+                    out.push(UploadItem::EncodedAlbum { parts: renamed });
+                } else {
+                    out.push(UploadItem::FileAlbum { parts });
+                }
             }
             other => out.push(other),
         }
     }
     out
+}
+
+/// Extract the directory of a `path: <dir>/` caption directive, mirroring the
+/// indexer's directory-only override semantics. Empty when the caption has no
+/// `path:` line.
+fn rel_dir_from_caption(caption: &str) -> String {
+    caption
+        .lines()
+        .find_map(|l| l.strip_prefix("path:"))
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .unwrap_or_default()
 }
 
 pub fn replace_ext(name: &str, new_ext: &str) -> String {
@@ -718,5 +743,65 @@ mod tests {
         let out = group_into_albums(plan, AlbumSplitMode::Even);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], UploadItem::Single(_)));
+    }
+
+    // -------- bug demonstrations (these assert the CORRECT behavior and
+    // fail until the corresponding bug is fixed) --------
+
+    /// With `-d caption --album --encode-video`, videos are collected as plain
+    /// `Single`s carrying a `path: <dir>/` caption, grouped, and only then
+    /// converted by `apply_encode_video_to_plan`. The conversion must carry
+    /// the caption's directory into the `EncodedVideo`'s `rel_dir` /
+    /// `virtual_path` (like `plan_one_file`'s own encode branch does) —
+    /// otherwise the encoded upload silently lands at the channel root
+    /// instead of under `shows/`.
+    #[test]
+    fn encode_conversion_preserves_caption_directory() {
+        let video = UploadPart {
+            src: PartSource::File(PathBuf::from("/synthetic/shows/ep1.mkv")),
+            offset: 0,
+            size: 100,
+            doc_filename: "ep1.mkv".to_string(),
+            caption: "path: shows/".to_string(),
+        };
+        let out = apply_encode_video_to_plan(
+            vec![UploadItem::Single(video)],
+            MultipartPolicy::None,
+        );
+        match &out[0] {
+            UploadItem::EncodedVideo { rel_dir, virtual_path, .. } => {
+                assert_eq!(
+                    rel_dir, "shows",
+                    "the `path: shows/` caption was dropped during video→EncodedVideo conversion"
+                );
+                assert_eq!(virtual_path, "shows/ep1.mp4");
+            }
+            _ => panic!("video Single was not converted to EncodedVideo"),
+        }
+    }
+
+    /// `apply_encode_video_to_plan` converts every `FileAlbum` into an
+    /// `EncodedAlbum` wholesale, including non-video parts. Every part of an
+    /// `EncodedAlbum` is later fed to ffmpeg as a video source, so a photo
+    /// that shared an album with a video gets "re-encoded" — the conversion
+    /// must never schedule a non-video for encoding.
+    #[test]
+    fn mixed_album_keeps_non_videos_out_of_encode() {
+        let album = UploadItem::FileAlbum {
+            parts: vec![part("clip.mp4", "same caption"), part("pic.jpg", "same caption")],
+        };
+        let out = apply_encode_video_to_plan(vec![album], MultipartPolicy::None);
+        for item in &out {
+            if let UploadItem::EncodedAlbum { parts } = item {
+                for p in parts {
+                    let PartSource::File(src) = &p.src;
+                    assert!(
+                        is_video_path(src),
+                        "non-video '{}' was scheduled for ffmpeg re-encoding inside an EncodedAlbum",
+                        src.display()
+                    );
+                }
+            }
+        }
     }
 }

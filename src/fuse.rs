@@ -607,7 +607,12 @@ impl Filesystem for TgfsFS {
         };
         let mut entries: Vec<(u64, FuseFileType, String)> = Vec::new();
         entries.push((path_hash(&path), FuseFileType::Directory, ".".to_string()));
-        entries.push((path_hash("/"), FuseFileType::Directory, "..".to_string()));
+        let parent_ino = if path == "/" {
+            path_hash("/")
+        } else {
+            path_hash(&split_parent_name(&path).0)
+        };
+        entries.push((parent_ino, FuseFileType::Directory, "..".to_string()));
 
         if let Some(children_vec) = g.children.get(&path) {
             for name in children_vec.iter() {
