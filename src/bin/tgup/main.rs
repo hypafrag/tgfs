@@ -168,15 +168,15 @@ async fn run(mp: Arc<MultiProgress>) -> anyhow::Result<()> {
         // into an EncodedVideo before `group_into_albums` runs, and that
         // function only merges consecutive `Single`s, leaving each encoded
         // video as its own ungrouped message instead of one album.
-        let collect_encode_video = args.encode_video && !args.album;
+        let collect_encode_video = args.encode_video && args.album.is_none();
         for p in &args.paths {
             collect_path(p, &cwd, policy, args.dir_mode, collect_encode_video, &mut plan)?;
         }
     }
     if plan.is_empty() { bail!("nothing to upload"); }
 
-    if args.album {
-        plan = group_into_albums(plan);
+    if let Some(album_mode) = args.album {
+        plan = group_into_albums(plan, album_mode);
         if args.encode_video {
             plan = apply_encode_video_to_plan(plan, policy);
         }

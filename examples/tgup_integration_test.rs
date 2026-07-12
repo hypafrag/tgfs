@@ -6,7 +6,8 @@
 //! end-to-end:
 //!
 //!   * plain upload of a single file
-//!   * `-a/--album` grouping
+//!   * `-a/--album fill` grouping (greedy packing)
+//!   * `-a/--album even` grouping (balanced split across albums)
 //!   * `--tvshow` show/season grouping + filename normalization
 //!   * `--encode-video` re-encode
 //!
@@ -420,6 +421,16 @@ async fn main() -> anyhow::Result<()> {
         album_files.push(p);
     }
 
+    // 11 files (> ALBUM_MAX) so `-a even` has something to balance: 11 → 6+5.
+    let album_even_dir = scratch.join("album_even");
+    fs::create_dir_all(&album_even_dir)?;
+    let mut album_even_files: Vec<PathBuf> = Vec::new();
+    for i in 1..=11 {
+        let p = album_even_dir.join(format!("clip-{}.mp4", i));
+        generate_video(&p, &format!("ALBUM-EVEN {}", i))?;
+        album_even_files.push(p);
+    }
+
     let tvshow_dir = scratch.join("tvshow");
     fs::create_dir_all(&tvshow_dir)?;
     // Episode titles are embedded in the filenames so hunch can extract them
@@ -498,7 +509,7 @@ async fn main() -> anyhow::Result<()> {
     runner.run("tgup::album", || async {
         delete_all_messages(&client, peer).await?;
         settle().await;
-        let mut argv: Vec<&str> = vec!["-a"];
+        let mut argv: Vec<&str> = vec!["-a", "fill"];
         let strs: Vec<String> = album_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         for s in &strs { argv.push(s); }
         run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
@@ -517,6 +528,32 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     }).await;
 
+    // `-a even` on a run longer than ALBUM_MAX (10) must split into balanced
+    // albums (11 → 6+5) rather than packing the first album to 10 and leaving
+    // a lone straggler, which `-a fill` would do instead.
+    runner.run("tgup::album_even", || async {
+        delete_all_messages(&client, peer).await?;
+        settle().await;
+        let mut argv: Vec<&str> = vec!["-a", "even"];
+        let strs: Vec<String> = album_even_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        for s in &strs { argv.push(s); }
+        run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;
+        settle().await;
+        let msgs = fetch_messages(&client, peer).await?;
+        if msgs.len() != 11 { bail!("expected 11 messages, got {}: {msgs:#?}", msgs.len()); }
+        let gids: std::collections::HashSet<_> = msgs.iter().filter_map(|m| m.grouped_id).collect();
+        if gids.len() != 2 {
+            bail!("expected 2 distinct album grouped_ids (6+5 split), got {}: {msgs:#?}", gids.len());
+        }
+        for gid in &gids {
+            let count = msgs.iter().filter(|m| m.grouped_id == Some(*gid)).count();
+            if count != 5 && count != 6 {
+                bail!("expected album sizes of 5 and 6, got an album of size {count}: {msgs:#?}");
+            }
+        }
+        Ok(())
+    }).await;
+
     // Regression test: `--album --encode-video` (without `--tvshow`) must
     // still group the encoded videos into one Telegram album. `plan_one_file`
     // converts each video straight to `UploadItem::EncodedVideo` before
@@ -526,7 +563,7 @@ async fn main() -> anyhow::Result<()> {
     runner.run("tgup::album_encode_video", || async {
         delete_all_messages(&client, peer).await?;
         settle().await;
-        let mut argv: Vec<&str> = vec!["-a", "--encode-video"];
+        let mut argv: Vec<&str> = vec!["-a", "fill", "--encode-video"];
         let strs: Vec<String> = album_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         for s in &strs { argv.push(s); }
         run_tgup(&tgup_bin, &tgup_config, &channel_name, &argv, &log_path)?;

@@ -425,6 +425,39 @@ fn relative_dir_from_cwd(parent: &Path, cwd: &Path) -> anyhow::Result<String> {
 /// Telegram allows at most 10 media in one album.
 pub const ALBUM_MAX: usize = 10;
 
+/// How `group_into_albums` splits a run of same-caption files into albums of
+/// at most `ALBUM_MAX` items.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlbumSplitMode {
+    /// Greedily pack each album to `ALBUM_MAX` before starting a new one; only
+    /// the last album in a run may be smaller. This is the original `-a`
+    /// behavior.
+    Fill,
+    /// Distribute the whole run across `ceil(n / ALBUM_MAX)` albums as evenly
+    /// as possible, mirroring the `--tvshow` per-season split.
+    Even,
+}
+
+/// Distribute `n` items across `ceil(n / ALBUM_MAX)` albums as evenly as
+/// possible. e.g. n=11 → [6,5]; n=13 → [7,6]; n=21 → [7,7,7].
+pub fn split_album_sizes(n: usize) -> Vec<usize> {
+    if n == 0 { return Vec::new(); }
+    let k = (n + ALBUM_MAX - 1) / ALBUM_MAX;
+    let base = n / k;
+    let extra = n % k;
+    (0..k).map(|i| if i < extra { base + 1 } else { base }).collect()
+}
+
+/// Split `n` items into chunks of at most `ALBUM_MAX`, packing every chunk
+/// but the last to full capacity. e.g. n=11 → [10,1]; n=21 → [10,10,1].
+fn fill_album_sizes(n: usize) -> Vec<usize> {
+    if n == 0 { return Vec::new(); }
+    let mut sizes = vec![ALBUM_MAX; n / ALBUM_MAX];
+    let rem = n % ALBUM_MAX;
+    if rem > 0 { sizes.push(rem); }
+    sizes
+}
+
 /// Post-process a plan to merge runs of `Single` items into `FileAlbum`s.
 ///
 /// Only consecutive `Single`s that share the same `caption` are merged so the
@@ -432,7 +465,10 @@ pub const ALBUM_MAX: usize = 10;
 /// uniformly to every part of an album) yields the same virtual paths as the
 /// ungrouped upload would have. Non-`Single` items are passed through and act
 /// as boundaries that flush any in-progress group.
-pub fn group_into_albums(plan: Vec<UploadItem>) -> Vec<UploadItem> {
+///
+/// `mode` controls how a run longer than `ALBUM_MAX` is split into multiple
+/// albums — see [`AlbumSplitMode`].
+pub fn group_into_albums(plan: Vec<UploadItem>, mode: AlbumSplitMode) -> Vec<UploadItem> {
     let mut out: Vec<UploadItem> = Vec::new();
     let mut buf: Vec<UploadPart> = Vec::new();
     let mut buf_caption: Option<String> = None;
@@ -440,27 +476,44 @@ pub fn group_into_albums(plan: Vec<UploadItem>) -> Vec<UploadItem> {
         match item {
             UploadItem::Single(part) => {
                 let cap_changed = buf_caption.as_ref().map_or(false, |c| c != &part.caption);
-                if buf.len() >= ALBUM_MAX || cap_changed {
-                    flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+                if cap_changed {
+                    flush_album_run(&mut buf, &mut buf_caption, &mut out, mode);
                 }
                 if buf.is_empty() { buf_caption = Some(part.caption.clone()); }
                 buf.push(part);
             }
             other => {
-                flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+                flush_album_run(&mut buf, &mut buf_caption, &mut out, mode);
                 out.push(other);
             }
         }
     }
-    flush_album_buf(&mut buf, &mut buf_caption, &mut out);
+    flush_album_run(&mut buf, &mut buf_caption, &mut out, mode);
     out
 }
 
-fn flush_album_buf(buf: &mut Vec<UploadPart>, caption: &mut Option<String>, out: &mut Vec<UploadItem>) {
-    match buf.len() {
-        0 => {}
-        1 => out.push(UploadItem::Single(buf.pop().unwrap())),
-        _ => out.push(UploadItem::FileAlbum { parts: std::mem::take(buf) }),
+/// Flush an accumulated same-caption run, splitting it into one or more
+/// albums per `mode`. `Fill` packs greedily; `Even` balances the whole run.
+fn flush_album_run(
+    buf: &mut Vec<UploadPart>,
+    caption: &mut Option<String>,
+    out: &mut Vec<UploadItem>,
+    mode: AlbumSplitMode,
+) {
+    if buf.is_empty() { return; }
+    let parts = std::mem::take(buf);
+    let chunk_sizes = match mode {
+        AlbumSplitMode::Fill => fill_album_sizes(parts.len()),
+        AlbumSplitMode::Even => split_album_sizes(parts.len()),
+    };
+    let mut iter = parts.into_iter();
+    for size in chunk_sizes {
+        let chunk: Vec<UploadPart> = iter.by_ref().take(size).collect();
+        match chunk.len() {
+            0 => {}
+            1 => out.push(UploadItem::Single(chunk.into_iter().next().unwrap())),
+            _ => out.push(UploadItem::FileAlbum { parts: chunk }),
+        }
     }
     *caption = None;
 }
@@ -560,5 +613,110 @@ pub fn print_plan(plan: &[UploadItem], channel: &str, encode_video: bool) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(name: &str, caption: &str) -> UploadPart {
+        UploadPart {
+            src: PartSource::File(PathBuf::from(format!("/synthetic/{name}"))),
+            offset: 0,
+            size: 1,
+            doc_filename: name.to_string(),
+            caption: caption.to_string(),
+        }
+    }
+
+    fn singles(n: usize, caption: &str) -> Vec<UploadItem> {
+        (0..n).map(|i| UploadItem::Single(part(&format!("f{i}"), caption))).collect()
+    }
+
+    /// Pull the size of each grouped chunk out of a `group_into_albums` result,
+    /// for a plan that only ever produces `Single`/`FileAlbum` items.
+    fn chunk_sizes(out: &[UploadItem]) -> Vec<usize> {
+        out.iter().map(|i| match i {
+            UploadItem::Single(_) => 1,
+            UploadItem::FileAlbum { parts } => parts.len(),
+            _ => panic!("unexpected item kind in test plan"),
+        }).collect()
+    }
+
+    #[test]
+    fn split_album_sizes_balances_evenly() {
+        assert_eq!(split_album_sizes(0), Vec::<usize>::new());
+        assert_eq!(split_album_sizes(1), vec![1]);
+        assert_eq!(split_album_sizes(10), vec![10]);
+        assert_eq!(split_album_sizes(11), vec![6, 5]);
+        assert_eq!(split_album_sizes(13), vec![7, 6]);
+        assert_eq!(split_album_sizes(21), vec![7, 7, 7]);
+    }
+
+    #[test]
+    fn fill_album_sizes_packs_greedily() {
+        assert_eq!(fill_album_sizes(0), Vec::<usize>::new());
+        assert_eq!(fill_album_sizes(1), vec![1]);
+        assert_eq!(fill_album_sizes(10), vec![10]);
+        assert_eq!(fill_album_sizes(11), vec![10, 1]);
+        assert_eq!(fill_album_sizes(21), vec![10, 10, 1]);
+    }
+
+    #[test]
+    fn group_into_albums_fill_packs_full_chunks_then_remainder() {
+        let plan = singles(11, "same caption");
+        let out = group_into_albums(plan, AlbumSplitMode::Fill);
+        assert_eq!(chunk_sizes(&out), vec![10, 1]);
+    }
+
+    #[test]
+    fn group_into_albums_even_balances_the_whole_run() {
+        let plan = singles(11, "same caption");
+        let out = group_into_albums(plan, AlbumSplitMode::Even);
+        assert_eq!(chunk_sizes(&out), vec![6, 5]);
+    }
+
+    #[test]
+    fn group_into_albums_even_matches_fill_under_album_max() {
+        // Runs that fit in a single album behave identically under both modes.
+        let plan = singles(7, "same caption");
+        let fill = group_into_albums(plan.clone(), AlbumSplitMode::Fill);
+        let even = group_into_albums(plan, AlbumSplitMode::Even);
+        assert_eq!(chunk_sizes(&fill), vec![7]);
+        assert_eq!(chunk_sizes(&even), vec![7]);
+    }
+
+    #[test]
+    fn group_into_albums_caption_change_flushes_the_run() {
+        let mut plan = singles(3, "caption A");
+        plan.extend(singles(4, "caption B"));
+        let out = group_into_albums(plan, AlbumSplitMode::Even);
+        assert_eq!(chunk_sizes(&out), vec![3, 4]);
+    }
+
+    #[test]
+    fn group_into_albums_non_single_item_is_a_boundary() {
+        let mut plan = singles(2, "caption A");
+        plan.push(UploadItem::SuffixParts {
+            display: "big.mkv".to_string(),
+            parts: vec![part("big.mkv.00", ""), part("big.mkv.01", "")],
+        });
+        plan.extend(singles(3, "caption A"));
+        let out = group_into_albums(plan, AlbumSplitMode::Even);
+        // The SuffixParts boundary forces two separate same-caption runs even
+        // though the caption string is identical on both sides.
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[0], UploadItem::FileAlbum { parts } if parts.len() == 2));
+        assert!(matches!(&out[1], UploadItem::SuffixParts { .. }));
+        assert!(matches!(&out[2], UploadItem::FileAlbum { parts } if parts.len() == 3));
+    }
+
+    #[test]
+    fn group_into_albums_single_item_run_stays_single() {
+        let plan = singles(1, "only one");
+        let out = group_into_albums(plan, AlbumSplitMode::Even);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], UploadItem::Single(_)));
     }
 }

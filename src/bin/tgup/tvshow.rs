@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context as _};
 use log::debug;
 
 use super::args::DirMode;
-use super::plan::{PartSource, UploadItem, UploadPart, ALBUM_MAX, PART_MAX};
+use super::plan::{split_album_sizes, PartSource, UploadItem, UploadPart, PART_MAX};
 use super::tvmaze::Tvmaze;
 
 /// Extensions tgup will accept as TV-show episodes in `--tvshow` mode.
@@ -67,16 +67,6 @@ fn parse_episode(abs: PathBuf, size: u64, hunch_input: &str) -> anyhow::Result<E
         bail!("file '{}' has an empty extension", abs.display());
     }
     Ok(Episode { abs_path: abs, size, title, season, episode, episode_title, ext })
-}
-
-/// Distribute `n` items across `ceil(n / ALBUM_MAX)` albums as evenly as
-/// possible. e.g. n=11 → [6,5]; n=13 → [7,6]; n=21 → [7,7,7].
-pub fn split_album_sizes(n: usize) -> Vec<usize> {
-    if n == 0 { return Vec::new(); }
-    let k = (n + ALBUM_MAX - 1) / ALBUM_MAX;
-    let base = n / k;
-    let extra = n % k;
-    (0..k).map(|i| if i < extra { base + 1 } else { base }).collect()
 }
 
 fn tv_filename(
